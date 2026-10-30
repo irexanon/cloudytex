@@ -13,6 +13,29 @@ All API routes are served under the root URL of your deployed Cloudyte server.
 - **Content Type:** JSON (`application/json`) is expected for POST/PATCH bodies, except for `/api/upload/:accountId` which requires `multipart/form-data`.
 - **Media Streaming:** Video, audio, and large file download endpoints support HTTP `Range` requests (`206 Partial Content`) for native media players (such as Android ExoPlayer / AVPlayer).
 
+Large Android uploads (8 MiB and above) use the resumable upload-session API. The client can safely retry session creation with the same `idempotencyKey`, resume from the server-reported `receivedBytes`, and finalize only after the complete file checksum matches.
+
+### 1.1 Resumable Upload Sessions
+
+Create a session:
+
+```http
+POST /api/upload-sessions/:accountId
+Authorization: Bearer <session_token>
+Content-Type: application/json
+
+{
+  "fileName": "video.mp4",
+  "mimeType": "video/mp4",
+  "size": 10485760,
+  "folderId": "root",
+  "checksum": "<sha256-hex>",
+  "idempotencyKey": "cloudyte-<transfer-id>"
+}
+```
+
+Upload each sequential chunk as multipart field `chunk` using `Content-Range: bytes <start>-<end>/<total>`. The server returns `nextOffset`; a retry must use that offset. When `receivedBytes` equals `totalBytes`, call `POST /api/upload-sessions/:sessionId/complete`. The server validates SHA-256 before sending the assembled file to the configured provider. Offset mismatches return `409 UPLOAD_OFFSET_CONFLICT`, and checksum mismatches return `422 CHECKSUM_MISMATCH`.
+
 ---
 
 ## 2. Authentication

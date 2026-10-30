@@ -888,6 +888,7 @@ const uploadLimiter = rateLimit({
 app.use('/api/login', authLimiter);
 app.use('/api/register', authLimiter);
 app.use('/api/upload', uploadLimiter);
+app.use('/api/upload-sessions', uploadLimiter);
 
 // ─── Auth routes ─────────────────────────────────────────────────────────────
 app.post('/api/register', async (req, res) => {
@@ -1753,6 +1754,128 @@ app.post('/api/folders', requireAuth, async (req: any, res: any) => {
     res.json({ success: true });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+type ProviderUploadFile = {
+  path: string;
+  size: number;
+  originalname: string;
+  mimetype: string;
+};
+
+async function uploadFileToProvider(account: any, accountId: string, file: ProviderUploadFile, folderId?: string) {
+  await providerLimit(`upload:${account.accountType}:${accountId}`, account.accountType === 'tgdrive' ? 2 : 3)(async () => {
+    if (account.accountType === 'tgdrive') {
+      const folder = (!folderId || folderId === 'root') ? '' : folderId;
+      await tgUploadFile(accountId, account.channelId, file.path, file.originalname, file.mimetype, folder);
+    } else if (account.accountType === 'onedrive') {
+      const c = await getOneDriveClient(account.tokens || account.credentials, accountId);
+      const parentPath = (!folderId || folderId === 'root') ? '/me/drive/root' : `/me/drive/items/${folderId}`;
+      const encodedName = encodeURIComponent(file.originalname);
+      if (file.size <= 4 * 1024 * 1024) {
+        await c.api(`${parentPath}:/${encodedName}:/content`).put(fs.createReadStream(file.path));
+      } else {
+        const session = await c.api(`${parentPath}:/${encodedName}:/createUploadSession`).post({ item: { '@microsoft.graph.conflictBehavior': 'replace', name: file.originalname } });
+        const chunkSize = 320 * 1024 * 10;
+        for (let start = 0; start < file.size; start += chunkSize) {
+          const end = Math.min(start + chunkSize, file.size);
+          await axios.put(session.uploadUrl, fs.createReadStream(file.path, { start, end: end - 1 }), {
+            headers: { 'Content-Range': `bytes ${start}-${end - 1}/${file.size}`, 'Content-Length': end - start }
+          });
+        }
+      }
+    } else {
+      const drive = await getDriveClient(account.tokens || account.credentials);
+      await drive.files.create({ requestBody: { name: file.originalname, parents: [folderId || 'root'] }, media: { mimeType: file.mimetype, body: fs.createReadStream(file.path) } });
+    }
+  });
+}
+
+function uploadSessionId() {
+  return `us_${Date.now()}_${nanoid(18)}`;
+}
+
+async function findUploadAccount(req: any, accountId: string) {
+  const query: any = { _id: new ObjectId(accountId) };
+  if (!req.isAdmin && req.userId) query.userId = String(req.userId);
+  return req.db.collection('accounts').findOne(query);
+}
+
+// ─── Resumable upload sessions ────────────────────────────────────────────────
+app.post('/api/upload-sessions/:accountId', requireAuth, async (req: any, res: any) => {
+  const { accountId } = req.params;
+  const { fileName, mimeType = 'application/octet-stream', size, folderId = 'root', checksum, idempotencyKey } = req.body || {};
+  if (!fileName || !Number.isFinite(Number(size)) || Number(size) < 0 || !idempotencyKey) {
+    return apiError(res, 400, 'INVALID_UPLOAD_SESSION', 'fileName, size, and idempotencyKey are required', req.requestId);
+  }
+  const account = await findUploadAccount(req, accountId);
+  if (!account) return apiError(res, 404, 'ACCOUNT_NOT_FOUND', 'Account not found', req.requestId);
+  const sessions = req.db.collection('upload_sessions');
+  const existing = await sessions.findOne({ userId: String(req.userId || ''), accountId, idempotencyKey, status: { $in: ['active', 'completed'] } });
+  if (existing) {
+    return res.json({ sessionId: existing.sessionId, status: existing.status, receivedBytes: existing.receivedBytes, totalBytes: existing.totalBytes, chunkSize: existing.chunkSize, checksum: existing.checksum });
+  }
+  const session = {
+    sessionId: uploadSessionId(), userId: String(req.userId || ''), accountId, folderId, fileName,
+    mimeType, totalBytes: Number(size), receivedBytes: 0, chunkSize: 8 * 1024 * 1024, checksum: checksum || null,
+    idempotencyKey, tempPath: path.join(os.tmpdir(), `transfer_${nanoid(18)}.part`), status: 'active', createdAt: new Date(), updatedAt: new Date()
+  };
+  await sessions.insertOne(session);
+  return res.status(201).json({ sessionId: session.sessionId, status: session.status, receivedBytes: 0, totalBytes: session.totalBytes, chunkSize: session.chunkSize, checksum: session.checksum });
+});
+
+app.get('/api/upload-sessions/:sessionId', requireAuth, async (req: any, res: any) => {
+  const session = await req.db.collection('upload_sessions').findOne({ sessionId: req.params.sessionId, userId: String(req.userId || '') });
+  if (!session) return apiError(res, 404, 'UPLOAD_SESSION_NOT_FOUND', 'Upload session not found', req.requestId);
+  return res.json({ sessionId: session.sessionId, status: session.status, receivedBytes: session.receivedBytes, totalBytes: session.totalBytes, chunkSize: session.chunkSize, checksum: session.checksum });
+});
+
+app.put('/api/upload-sessions/:sessionId/chunks', requireAuth, upload.single('chunk'), async (req: any, res: any) => {
+  const session = await req.db.collection('upload_sessions').findOne({ sessionId: req.params.sessionId, userId: String(req.userId || ''), status: 'active' });
+  const chunk = req.file;
+  if (!session) return apiError(res, 404, 'UPLOAD_SESSION_NOT_FOUND', 'Upload session not found', req.requestId);
+  if (!chunk) return apiError(res, 400, 'NO_CHUNK_UPLOADED', 'No chunk uploaded', req.requestId);
+  const range = String(req.header('Content-Range') || '').match(/^bytes (\d+)-(\d+)\/(\d+)$/);
+  const start = range ? Number(range[1]) : Number(req.header('X-Chunk-Offset'));
+  const end = range ? Number(range[2]) : start + chunk.size - 1;
+  const total = range ? Number(range[3]) : session.totalBytes;
+  try {
+    if (!Number.isFinite(start) || start !== session.receivedBytes || end < start || total !== session.totalBytes || end - start + 1 !== chunk.size) {
+      return apiError(res, 409, 'UPLOAD_OFFSET_CONFLICT', `Expected offset ${session.receivedBytes}`, req.requestId);
+    }
+    if (!hasTempDiskHeadroom(chunk.size)) return apiError(res, 507, 'INSUFFICIENT_STORAGE', 'Server temporary storage is too low', req.requestId);
+    fs.mkdirSync(path.dirname(session.tempPath), { recursive: true });
+    fs.appendFileSync(session.tempPath, fs.readFileSync(chunk.path));
+    const receivedBytes = session.receivedBytes + chunk.size;
+    await req.db.collection('upload_sessions').updateOne({ sessionId: session.sessionId }, { $set: { receivedBytes, updatedAt: new Date() } });
+    return res.json({ sessionId: session.sessionId, receivedBytes, totalBytes: session.totalBytes, nextOffset: receivedBytes, complete: receivedBytes === session.totalBytes });
+  } finally {
+    if (chunk.path && fs.existsSync(chunk.path)) { try { fs.unlinkSync(chunk.path); } catch { /* janitor will retry */ } }
+  }
+});
+
+app.post('/api/upload-sessions/:sessionId/complete', requireAuth, async (req: any, res: any) => {
+  const sessions = req.db.collection('upload_sessions');
+  const session = await sessions.findOne({ sessionId: req.params.sessionId, userId: String(req.userId || ''), status: 'active' });
+  if (!session) return apiError(res, 404, 'UPLOAD_SESSION_NOT_FOUND', 'Upload session not found', req.requestId);
+  if (session.receivedBytes !== session.totalBytes || !fs.existsSync(session.tempPath)) return apiError(res, 409, 'UPLOAD_INCOMPLETE', 'Upload is incomplete', req.requestId);
+  const account = await findUploadAccount(req, session.accountId);
+  if (!account) return apiError(res, 404, 'ACCOUNT_NOT_FOUND', 'Account not found', req.requestId);
+  try {
+    const digest = crypto.createHash('sha256');
+    digest.update(fs.readFileSync(session.tempPath));
+    const checksum = digest.digest('hex');
+    if (session.checksum && session.checksum.toLowerCase() !== checksum) return apiError(res, 422, 'CHECKSUM_MISMATCH', 'Upload checksum does not match', req.requestId);
+    await uploadFileToProvider(account, session.accountId, { path: session.tempPath, size: session.totalBytes, originalname: session.fileName, mimetype: session.mimeType }, session.folderId);
+    await sessions.updateOne({ sessionId: session.sessionId }, { $set: { status: 'completed', checksum, updatedAt: new Date() } });
+    invalidateDriveCache(session.accountId);
+    return res.json({ success: true, sessionId: session.sessionId, checksum });
+  } catch (err: any) {
+    console.error('Resumable upload completion error:', err);
+    return apiError(res, 502, 'PROVIDER_UPLOAD_FAILED', 'Provider upload failed', req.requestId);
+  } finally {
+    if (fs.existsSync(session.tempPath)) { try { fs.unlinkSync(session.tempPath); } catch { /* janitor will retry */ } }
   }
 });
 
