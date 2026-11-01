@@ -34,7 +34,7 @@ Content-Type: application/json
 }
 ```
 
-Upload each sequential chunk as multipart field `chunk` using `Content-Range: bytes <start>-<end>/<total>`. The server returns `nextOffset`; a retry must use that offset. When `receivedBytes` equals `totalBytes`, call `POST /api/upload-sessions/:sessionId/complete`. The server validates SHA-256 before sending the assembled file to the configured provider. Offset mismatches return `409 UPLOAD_OFFSET_CONFLICT`, and checksum mismatches return `422 CHECKSUM_MISMATCH`.
+Query a session with `GET /api/upload-sessions/:sessionId` to reconcile the server-confirmed `receivedBytes` offset after a retry or process restart. Upload each sequential chunk as multipart field `chunk` using `Content-Range: bytes <start>-<end>/<total>`. When `receivedBytes` equals `totalBytes`, call `POST /api/upload-sessions/:sessionId/complete`; repeating completion after success returns the same completed result. Sessions expire after 24 hours; a query returns `status: "expired"`, and chunk/complete requests return `410 UPLOAD_SESSION_EXPIRED`. Recreate an expired session with the original idempotency key. Cancel an active session with `DELETE /api/upload-sessions/:sessionId`; cancellation is idempotent for a missing session and deletes its staged temporary data. Completed or currently-finalizing sessions cannot be cancelled. The server validates SHA-256 before sending the assembled file to the configured provider. Offset mismatches return `409 UPLOAD_OFFSET_CONFLICT`, and checksum mismatches return `422 CHECKSUM_MISMATCH`.
 
 ---
 

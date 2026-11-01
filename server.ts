@@ -1803,6 +1803,21 @@ async function findUploadAccount(req: any, accountId: string) {
 }
 
 // ─── Resumable upload sessions ────────────────────────────────────────────────
+const UPLOAD_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+function publicUploadSession(session: any) {
+  return { sessionId: session.sessionId, status: session.status, receivedBytes: session.receivedBytes, totalBytes: session.totalBytes, chunkSize: session.chunkSize, checksum: session.checksum };
+}
+async function ownedUploadSession(req: any, sessionId: string) {
+  return req.db.collection('upload_sessions').findOne({ sessionId, userId: String(req.userId || '') });
+}
+async function expireUploadSessionIfNeeded(sessions: any, session: any) {
+  if (session.status === 'active' && session.createdAt && Date.now() - new Date(session.createdAt).getTime() > UPLOAD_SESSION_TTL_MS) {
+    await sessions.updateOne({ sessionId: session.sessionId, status: 'active' }, { $set: { status: 'expired', updatedAt: new Date() } });
+    session.status = 'expired';
+    if (session.tempPath && fs.existsSync(session.tempPath)) { try { fs.unlinkSync(session.tempPath); } catch { /* janitor will retry */ } }
+  }
+  return session;
+}
 app.post('/api/upload-sessions/:accountId', requireAuth, async (req: any, res: any) => {
   const { accountId } = req.params;
   const { fileName, mimeType = 'application/octet-stream', size, folderId = 'root', checksum, idempotencyKey } = req.body || {};
@@ -1812,9 +1827,10 @@ app.post('/api/upload-sessions/:accountId', requireAuth, async (req: any, res: a
   const account = await findUploadAccount(req, accountId);
   if (!account) return apiError(res, 404, 'ACCOUNT_NOT_FOUND', 'Account not found', req.requestId);
   const sessions = req.db.collection('upload_sessions');
-  const existing = await sessions.findOne({ userId: String(req.userId || ''), accountId, idempotencyKey, status: { $in: ['active', 'completed'] } });
+  const existing = await sessions.findOne({ userId: String(req.userId || ''), accountId, idempotencyKey, status: { $in: ['active', 'completed', 'completing'] } });
   if (existing) {
-    return res.json({ sessionId: existing.sessionId, status: existing.status, receivedBytes: existing.receivedBytes, totalBytes: existing.totalBytes, chunkSize: existing.chunkSize, checksum: existing.checksum });
+    await expireUploadSessionIfNeeded(sessions, existing);
+    if (existing.status !== 'expired') return res.json(publicUploadSession(existing));
   }
   const session = {
     sessionId: uploadSessionId(), userId: String(req.userId || ''), accountId, folderId, fileName,
@@ -1822,19 +1838,23 @@ app.post('/api/upload-sessions/:accountId', requireAuth, async (req: any, res: a
     idempotencyKey, tempPath: path.join(os.tmpdir(), `transfer_${nanoid(18)}.part`), status: 'active', createdAt: new Date(), updatedAt: new Date()
   };
   await sessions.insertOne(session);
-  return res.status(201).json({ sessionId: session.sessionId, status: session.status, receivedBytes: 0, totalBytes: session.totalBytes, chunkSize: session.chunkSize, checksum: session.checksum });
+  return res.status(201).json(publicUploadSession(session));
 });
-
 app.get('/api/upload-sessions/:sessionId', requireAuth, async (req: any, res: any) => {
-  const session = await req.db.collection('upload_sessions').findOne({ sessionId: req.params.sessionId, userId: String(req.userId || '') });
+  const sessions = req.db.collection('upload_sessions');
+  const session = await ownedUploadSession(req, req.params.sessionId);
   if (!session) return apiError(res, 404, 'UPLOAD_SESSION_NOT_FOUND', 'Upload session not found', req.requestId);
-  return res.json({ sessionId: session.sessionId, status: session.status, receivedBytes: session.receivedBytes, totalBytes: session.totalBytes, chunkSize: session.chunkSize, checksum: session.checksum });
+  await expireUploadSessionIfNeeded(sessions, session);
+  return res.json(publicUploadSession(session));
 });
-
 app.put('/api/upload-sessions/:sessionId/chunks', requireAuth, upload.single('chunk'), async (req: any, res: any) => {
-  const session = await req.db.collection('upload_sessions').findOne({ sessionId: req.params.sessionId, userId: String(req.userId || ''), status: 'active' });
+  const sessions = req.db.collection('upload_sessions');
+  const session = await ownedUploadSession(req, req.params.sessionId);
   const chunk = req.file;
   if (!session) return apiError(res, 404, 'UPLOAD_SESSION_NOT_FOUND', 'Upload session not found', req.requestId);
+  await expireUploadSessionIfNeeded(sessions, session);
+  if (session.status === 'expired') return apiError(res, 410, 'UPLOAD_SESSION_EXPIRED', 'Upload session expired', req.requestId);
+  if (session.status !== 'active') return apiError(res, 409, 'UPLOAD_SESSION_NOT_ACTIVE', `Upload session is ${session.status}`, req.requestId);
   if (!chunk) return apiError(res, 400, 'NO_CHUNK_UPLOADED', 'No chunk uploaded', req.requestId);
   const range = String(req.header('Content-Range') || '').match(/^bytes (\d+)-(\d+)\/(\d+)$/);
   const start = range ? Number(range[1]) : Number(req.header('X-Chunk-Offset'));
@@ -1848,37 +1868,60 @@ app.put('/api/upload-sessions/:sessionId/chunks', requireAuth, upload.single('ch
     fs.mkdirSync(path.dirname(session.tempPath), { recursive: true });
     fs.appendFileSync(session.tempPath, fs.readFileSync(chunk.path));
     const receivedBytes = session.receivedBytes + chunk.size;
-    await req.db.collection('upload_sessions').updateOne({ sessionId: session.sessionId }, { $set: { receivedBytes, updatedAt: new Date() } });
+    const updated = await sessions.updateOne({ sessionId: session.sessionId, userId: String(req.userId || ''), status: 'active', receivedBytes: session.receivedBytes }, { $set: { receivedBytes, updatedAt: new Date() } });
+    if (updated.modifiedCount !== 1) return apiError(res, 409, 'UPLOAD_OFFSET_CONFLICT', 'Upload session changed while writing this chunk', req.requestId);
     return res.json({ sessionId: session.sessionId, receivedBytes, totalBytes: session.totalBytes, nextOffset: receivedBytes, complete: receivedBytes === session.totalBytes });
   } finally {
     if (chunk.path && fs.existsSync(chunk.path)) { try { fs.unlinkSync(chunk.path); } catch { /* janitor will retry */ } }
   }
 });
-
 app.post('/api/upload-sessions/:sessionId/complete', requireAuth, async (req: any, res: any) => {
   const sessions = req.db.collection('upload_sessions');
-  const session = await sessions.findOne({ sessionId: req.params.sessionId, userId: String(req.userId || ''), status: 'active' });
+  let session = await ownedUploadSession(req, req.params.sessionId);
   if (!session) return apiError(res, 404, 'UPLOAD_SESSION_NOT_FOUND', 'Upload session not found', req.requestId);
+  await expireUploadSessionIfNeeded(sessions, session);
+  if (session.status === 'completed') return res.json({ success: true, sessionId: session.sessionId, checksum: session.checksum });
+  if (session.status === 'expired') return apiError(res, 410, 'UPLOAD_SESSION_EXPIRED', 'Upload session expired', req.requestId);
+  if (session.status !== 'active') return apiError(res, 409, 'UPLOAD_SESSION_NOT_ACTIVE', `Upload session is ${session.status}`, req.requestId);
   if (session.receivedBytes !== session.totalBytes || !fs.existsSync(session.tempPath)) return apiError(res, 409, 'UPLOAD_INCOMPLETE', 'Upload is incomplete', req.requestId);
   const account = await findUploadAccount(req, session.accountId);
   if (!account) return apiError(res, 404, 'ACCOUNT_NOT_FOUND', 'Account not found', req.requestId);
+  const claimed = await sessions.updateOne({ sessionId: session.sessionId, userId: String(req.userId || ''), status: 'active' }, { $set: { status: 'completing', updatedAt: new Date() } });
+  if (claimed.modifiedCount !== 1) {
+    session = await ownedUploadSession(req, session.sessionId);
+    if (session?.status === 'completed') return res.json({ success: true, sessionId: session.sessionId, checksum: session.checksum });
+    return apiError(res, 409, 'UPLOAD_SESSION_NOT_ACTIVE', 'Upload completion is already in progress', req.requestId);
+  }
   try {
     const digest = crypto.createHash('sha256');
     digest.update(fs.readFileSync(session.tempPath));
     const checksum = digest.digest('hex');
-    if (session.checksum && session.checksum.toLowerCase() !== checksum) return apiError(res, 422, 'CHECKSUM_MISMATCH', 'Upload checksum does not match', req.requestId);
+    if (session.checksum && session.checksum.toLowerCase() !== checksum) {
+      await sessions.updateOne({ sessionId: session.sessionId, status: 'completing' }, { $set: { status: 'active', updatedAt: new Date() } });
+      return apiError(res, 422, 'CHECKSUM_MISMATCH', 'Upload checksum does not match', req.requestId);
+    }
     await uploadFileToProvider(account, session.accountId, { path: session.tempPath, size: session.totalBytes, originalname: session.fileName, mimetype: session.mimeType }, session.folderId);
-    await sessions.updateOne({ sessionId: session.sessionId }, { $set: { status: 'completed', checksum, updatedAt: new Date() } });
+    await sessions.updateOne({ sessionId: session.sessionId, status: 'completing' }, { $set: { status: 'completed', checksum, updatedAt: new Date() } });
     invalidateDriveCache(session.accountId);
+    if (fs.existsSync(session.tempPath)) { try { fs.unlinkSync(session.tempPath); } catch { /* janitor will retry */ } }
     return res.json({ success: true, sessionId: session.sessionId, checksum });
   } catch (err: any) {
     console.error('Resumable upload completion error:', err);
+    await sessions.updateOne({ sessionId: session.sessionId, status: 'completing' }, { $set: { status: 'active', updatedAt: new Date() } });
     return apiError(res, 502, 'PROVIDER_UPLOAD_FAILED', 'Provider upload failed', req.requestId);
-  } finally {
-    if (fs.existsSync(session.tempPath)) { try { fs.unlinkSync(session.tempPath); } catch { /* janitor will retry */ } }
   }
 });
-
+app.delete('/api/upload-sessions/:sessionId', requireAuth, async (req: any, res: any) => {
+  const sessions = req.db.collection('upload_sessions');
+  const session = await ownedUploadSession(req, req.params.sessionId);
+  if (!session) return res.status(204).end();
+  if (session.status === 'completed') return apiError(res, 409, 'UPLOAD_ALREADY_COMPLETED', 'Completed upload cannot be cancelled', req.requestId);
+  if (session.status === 'completing') return apiError(res, 409, 'UPLOAD_COMPLETION_IN_PROGRESS', 'Upload completion cannot be cancelled while provider commit is in progress', req.requestId);
+  const cancelled = await sessions.updateOne({ sessionId: session.sessionId, userId: String(req.userId || ''), status: { $in: ['active', 'expired', 'cancelled'] } }, { $set: { status: 'cancelled', updatedAt: new Date() } });
+  if (cancelled.matchedCount !== 1) return apiError(res, 409, 'UPLOAD_COMPLETION_IN_PROGRESS', 'Upload state changed and cannot be cancelled', req.requestId);
+  if (session.tempPath && fs.existsSync(session.tempPath)) { try { fs.unlinkSync(session.tempPath); } catch { /* janitor will retry */ } }
+  return res.status(204).end();
+});
 // ─── 6. Upload ─────────────────────────────────────────────────────────────────
 app.post('/api/upload/:accountId', requireAuth, upload.single('file'), async (req: any, res: any) => {
   const { accountId } = req.params;
