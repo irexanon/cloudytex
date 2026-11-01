@@ -27,6 +27,7 @@ import { Api } from 'telegram/tl/index.js';
 import { createServer as createViteServer } from 'vite';
 
 import { initBot } from './telegram.ts';
+import { parseGoogleRangeOffset, parseOneDriveNextOffset } from './provider-transfer-protocol.ts';
 
 dotenv.config();
 
@@ -578,11 +579,20 @@ async function getOneDriveClient(tokens: any, accountId?: string) {
 // Upload a file from disk path to a Telegram channel via GramJS, save metadata, return record.
 async function tgUploadFile(
   accountId: string, channelId: string, filePath: string,
-  fileName: string, mimeType: string, folder: string, caption = ''
+  fileName: string, mimeType: string, folder: string, caption = '', idempotencyKey?: string
 ) {
   return providerLimit(`telegram:upload:${accountId}`, 2)(async () => {
     const database = db || await connectToMongo();
+    if (idempotencyKey) {
+      const existing = await database.collection('tg_files').findOne({ accountId: new ObjectId(accountId), idempotencyKey });
+      if (existing) return existing;
+    }
     const stat = fs.statSync(filePath);
+    if (stat.size === 0) {
+      const unsupported: any = new Error('Telegram does not accept zero-byte documents through the configured upload protocol');
+      unsupported.code = 'UNSUPPORTED_PROVIDER_OPERATION';
+      throw unsupported;
+    }
     const telegram   = await getTgClient();
     const peerEntity = await resolvePeer(telegram, channelId);
     const result     = await telegram.sendFile(peerEntity, {
@@ -602,6 +612,7 @@ async function tgUploadFile(
       mimeType,
       folder,
       caption,
+      ...(idempotencyKey ? { idempotencyKey } : {}),
       date:     Math.floor(Date.now() / 1000),
     };
     await database.collection('tg_files').insertOne(record);
@@ -1764,34 +1775,250 @@ type ProviderUploadFile = {
   mimetype: string;
 };
 
-async function uploadFileToProvider(account: any, accountId: string, file: ProviderUploadFile, folderId?: string) {
-  await providerLimit(`upload:${account.accountType}:${accountId}`, account.accountType === 'tgdrive' ? 2 : 3)(async () => {
-    if (account.accountType === 'tgdrive') {
+type PersistedProviderSession = { providerType?: string; uploadUrl?: string; nextOffset?: number; completed?: boolean };
+async function uploadOneDriveResumable(
+  account: any, accountId: string, file: ProviderUploadFile, folderId: string | undefined,
+  prior: PersistedProviderSession | undefined, persist: (state: PersistedProviderSession) => Promise<void>
+) {
+  const c = await getOneDriveClient(account.tokens || account.credentials, accountId);
+  const parentPath = (!folderId || folderId === 'root') ? '/me/drive/root' : `/me/drive/items/${folderId}`;
+  const encodedName = encodeURIComponent(file.originalname);
+  if (file.size === 0) {
+    await c.api(`${parentPath}:/${encodedName}:/content`).put(fs.createReadStream(file.path));
+    await persist({ providerType: 'onedrive', completed: true, nextOffset: 0 });
+    return;
+  }
+  const createSession = async () => {
+    const result = await c.api(`${parentPath}:/${encodedName}:/createUploadSession`).post({
+      item: { '@microsoft.graph.conflictBehavior': 'replace', name: file.originalname }
+    });
+    if (!result?.uploadUrl) throw new Error('OneDrive did not return an upload session URL');
+    const next = { providerType: 'onedrive', uploadUrl: result.uploadUrl, nextOffset: 0 };
+    await persist(next);
+    return next;
+  };
+  let state = prior?.providerType === 'onedrive' && prior.uploadUrl ? prior : await createSession();
+  const sessionStatus = async () => axios.get(state.uploadUrl!, { validateStatus: () => true });
+  let status = await sessionStatus();
+  if (status.status === 404 || status.status === 410) {
+    state = await createSession();
+    status = await sessionStatus();
+  }
+  if (status.status < 200 || status.status >= 300) throw new Error(`OneDrive upload session query failed (${status.status})`);
+  const expected = Array.isArray(status.data?.nextExpectedRanges) ? status.data.nextExpectedRanges : [];
+  let offset = parseOneDriveNextOffset(expected, file.size, Number(state.nextOffset || 0));
+  if (!Number.isFinite(offset) || offset < 0 || offset > file.size) throw new Error('OneDrive returned an invalid nextExpectedRanges offset');
+  const chunkSize = 320 * 1024 * 10; // Microsoft Graph requires non-final ranges in 320 KiB multiples.
+  await persist({ ...state, nextOffset: offset });
+  while (offset < file.size) {
+    const length = Math.min(chunkSize, file.size - offset);
+    const end = offset + length - 1;
+    const response = await axios.put(state.uploadUrl!, fs.createReadStream(file.path, { start: offset, end }), {
+      headers: { 'Content-Range': `bytes ${offset}-${end}/${file.size}`, 'Content-Length': length },
+      maxBodyLength: Infinity, maxContentLength: Infinity, validateStatus: () => true
+    });
+    if (response.status === 200 || response.status === 201) {
+      await persist({ providerType: 'onedrive', completed: true, nextOffset: file.size });
+      return response.data;
+    }
+    if (response.status !== 202) {
+      if (response.status === 404 || response.status === 410) {
+        state = await createSession();
+        status = await sessionStatus();
+        const nextRanges = Array.isArray(status.data?.nextExpectedRanges) ? status.data.nextExpectedRanges : [];
+        offset = parseOneDriveNextOffset(nextRanges, file.size, 0);
+        await persist({ ...state, nextOffset: offset });
+        continue;
+      }
+      throw new Error(`OneDrive chunk upload failed (${response.status}): ${JSON.stringify(response.data).slice(0, 500)}`);
+    }
+    const nextRanges = Array.isArray(response.data?.nextExpectedRanges) ? response.data.nextExpectedRanges : [];
+    const nextOffset = parseOneDriveNextOffset(nextRanges, file.size, end + 1);
+    if (!Number.isFinite(nextOffset) || nextOffset <= offset || nextOffset > file.size) throw new Error('OneDrive returned an invalid nextExpectedRanges offset');
+    offset = nextOffset;
+    await persist({ ...state, nextOffset: offset });
+  }
+  // A final 202 means the provider still has work; query once to confirm commit rather than
+  // treating all input bytes as proof that the remote item is durable.
+  status = await sessionStatus();
+  if (status.status === 200 && !Array.isArray(status.data?.nextExpectedRanges)) {
+    await persist({ providerType: 'onedrive', completed: true, nextOffset: file.size });
+    return status.data;
+  }
+  throw new Error('OneDrive upload session did not confirm completion');
+}
+async function uploadGoogleDriveResumable(
+  account: any, file: ProviderUploadFile, folderId: string | undefined, prior: PersistedProviderSession | undefined,
+  persist: (state: PersistedProviderSession) => Promise<void>, idempotencyKey?: string
+) {
+  const drive = await getDriveClient(account.tokens || account.credentials);
+  const auth: any = (drive as any).context?._options?.auth;
+  if (!auth?.getAccessToken) throw new Error('Google Drive auth client cannot provide a resumable-upload token');
+  const getToken = async () => {
+    const value = await auth.getAccessToken();
+    const token = typeof value === 'string' ? value : value?.token;
+    if (!token) throw new Error('Google Drive returned no access token');
+    return token as string;
+  };
+  const appProperties = idempotencyKey ? { cloudyteTransferKey: idempotencyKey } : undefined;
+  const findCompleted = async () => {
+    if (!idempotencyKey) return null;
+    const safeValue = idempotencyKey.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    const found = await drive.files.list({
+      q: `appProperties has { key='cloudyteTransferKey' and value='${safeValue}' } and trashed = false`,
+      fields: 'files(id,name)', pageSize: 1
+    });
+    return found.data.files?.[0] || null;
+  };
+  const existing = await findCompleted();
+  if (existing) return existing;
+  if (file.size === 0) {
+    const response = await drive.files.create({
+      requestBody: { name: file.originalname, parents: [folderId || 'root'], ...(appProperties ? { appProperties } : {}) },
+      media: { mimeType: file.mimetype, body: fs.createReadStream(file.path) }, fields: 'id,name'
+    });
+    await persist({ providerType: 'google', completed: true, nextOffset: 0 });
+    return response.data;
+  }
+  const createSession = async () => {
+    const token = await getToken();
+    const response = await axios.post(
+      'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name',
+      { name: file.originalname, parents: [folderId || 'root'], ...(appProperties ? { appProperties } : {}) },
+      { headers: {
+        Authorization: `Bearer ${token}`, 'Content-Type': 'application/json; charset=UTF-8',
+        'X-Upload-Content-Type': file.mimetype, 'X-Upload-Content-Length': String(file.size)
+      }, validateStatus: () => true }
+    );
+    if (response.status < 200 || response.status >= 300) throw new Error(`Google Drive session creation failed (${response.status}): ${JSON.stringify(response.data).slice(0, 500)}`);
+    const uploadUrl = response.headers.location || response.headers.Location;
+    if (!uploadUrl) throw new Error('Google Drive did not return a resumable session URI');
+    const state: PersistedProviderSession = { providerType: 'google', uploadUrl, nextOffset: 0 };
+    await persist(state);
+    return state;
+  };
+  let state = prior?.providerType === 'google' && prior.uploadUrl ? prior : await createSession();
+  const queryOffset = async () => {
+    const token = await getToken();
+    const response = await axios.put(state.uploadUrl!, Buffer.alloc(0), {
+      headers: { Authorization: `Bearer ${token}`, 'Content-Length': '0', 'Content-Range': `bytes */${file.size}` },
+      maxRedirects: 0, validateStatus: () => true
+    });
+    if (response.status === 200 || response.status === 201) return { done: true, offset: file.size, data: response.data };
+    if (response.status !== 308) {
+      if (response.status === 404 || response.status === 410) return { done: false, offset: -1, data: null };
+      throw new Error(`Google Drive offset query failed (${response.status})`);
+    }
+    const range = response.headers.range || response.headers.Range;
+    return { done: false, offset: parseGoogleRangeOffset(range, file.size), data: null };
+  };
+  let status = await queryOffset();
+  if (status.done) return status.data;
+  if (status.offset < 0) {
+    const completed = await findCompleted();
+    if (completed) return completed;
+    state = await createSession();
+    status = await queryOffset();
+  }
+  let offset = status.offset;
+  await persist({ ...state, nextOffset: offset });
+  const chunkSize = 8 * 1024 * 1024; // Google resumable chunks are 256 KiB multiples.
+  while (offset < file.size) {
+    const length = Math.min(chunkSize, file.size - offset);
+    const end = offset + length - 1;
+    const token = await getToken();
+    const response = await axios.put(state.uploadUrl!, fs.createReadStream(file.path, { start: offset, end }), {
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': file.mimetype, 'Content-Length': String(length), 'Content-Range': `bytes ${offset}-${end}/${file.size}` },
+      maxBodyLength: Infinity, maxContentLength: Infinity, maxRedirects: 0, validateStatus: () => true
+    });
+    if (response.status === 200 || response.status === 201) {
+      await persist({ providerType: 'google', completed: true, nextOffset: file.size });
+      return response.data;
+    }
+    if (response.status === 308) {
+      const range = response.headers.range || response.headers.Range;
+      const next = parseGoogleRangeOffset(range, file.size);
+      if (next <= offset || next > file.size) throw new Error('Google Drive returned an invalid Range acknowledgement');
+      offset = next;
+      await persist({ ...state, nextOffset: offset });
+      continue;
+    }
+    if (response.status === 404 || response.status === 410) {
+      const completed = await findCompleted();
+      if (completed) return completed;
+      state = await createSession();
+      const restarted = await queryOffset();
+      if (restarted.done) return restarted.data;
+      offset = restarted.offset;
+      continue;
+    }
+    throw new Error(`Google Drive chunk upload failed (${response.status}): ${JSON.stringify(response.data).slice(0, 500)}`);
+  }
+  const confirmed = await queryOffset();
+  if (confirmed.done) {
+    await persist({ providerType: 'google', completed: true, nextOffset: file.size });
+    return confirmed.data;
+  }
+  throw new Error('Google Drive resumable session did not confirm completion');
+}
+
+async function uploadFileToProvider(
+  account: any, accountId: string, file: ProviderUploadFile, folderId?: string,
+  providerSession?: PersistedProviderSession, persistProviderSession?: (state: PersistedProviderSession) => Promise<void>,
+  idempotencyKey?: string
+) {
+  const providerType = transferProviderType(account.accountType);
+  if (!providerType) {
+    const err: any = new Error(`Provider '${String(account.accountType || 'unknown')}' does not support upload`);
+    err.code = 'UNSUPPORTED_PROVIDER_OPERATION';
+    throw err;
+  }
+  await providerLimit(`upload:${providerType}:${accountId}`, providerType === 'telegram' ? 2 : 3)(async () => {
+    if (providerType === 'telegram') {
       const folder = (!folderId || folderId === 'root') ? '' : folderId;
-      await tgUploadFile(accountId, account.channelId, file.path, file.originalname, file.mimetype, folder);
-    } else if (account.accountType === 'onedrive') {
-      const c = await getOneDriveClient(account.tokens || account.credentials, accountId);
-      const parentPath = (!folderId || folderId === 'root') ? '/me/drive/root' : `/me/drive/items/${folderId}`;
-      const encodedName = encodeURIComponent(file.originalname);
-      if (file.size <= 4 * 1024 * 1024) {
-        await c.api(`${parentPath}:/${encodedName}:/content`).put(fs.createReadStream(file.path));
+      await tgUploadFile(accountId, account.channelId, file.path, file.originalname, file.mimetype, folder, '', idempotencyKey);
+    } else if (providerType === 'onedrive') {
+      if (persistProviderSession) {
+        await uploadOneDriveResumable(account, accountId, file, folderId, providerSession, persistProviderSession);
       } else {
-        const session = await c.api(`${parentPath}:/${encodedName}:/createUploadSession`).post({ item: { '@microsoft.graph.conflictBehavior': 'replace', name: file.originalname } });
-        const chunkSize = 320 * 1024 * 10;
-        for (let start = 0; start < file.size; start += chunkSize) {
-          const end = Math.min(start + chunkSize, file.size);
-          await axios.put(session.uploadUrl, fs.createReadStream(file.path, { start, end: end - 1 }), {
-            headers: { 'Content-Range': `bytes ${start}-${end - 1}/${file.size}`, 'Content-Length': end - start }
-          });
+        const c = await getOneDriveClient(account.tokens || account.credentials, accountId);
+        const parentPath = (!folderId || folderId === 'root') ? '/me/drive/root' : `/me/drive/items/${folderId}`;
+        const encodedName = encodeURIComponent(file.originalname);
+        if (file.size <= 4 * 1024 * 1024) {
+          await c.api(`${parentPath}:/${encodedName}:/content`).put(fs.createReadStream(file.path));
+        } else {
+          const session = await c.api(`${parentPath}:/${encodedName}:/createUploadSession`).post({ item: { '@microsoft.graph.conflictBehavior': 'replace', name: file.originalname } });
+          const chunkSize = 320 * 1024 * 10;
+          for (let start = 0; start < file.size; start += chunkSize) {
+            const end = Math.min(start + chunkSize, file.size);
+            await axios.put(session.uploadUrl, fs.createReadStream(file.path, { start, end: end - 1 }), {
+              headers: { 'Content-Range': `bytes ${start}-${end - 1}/${file.size}`, 'Content-Length': end - start }
+            });
+          }
         }
       }
+    } else if (providerType === 'google_drive') {
+      if (persistProviderSession) {
+        await uploadGoogleDriveResumable(account, file, folderId, providerSession, persistProviderSession, idempotencyKey);
+      } else {
+        const drive = await getDriveClient(account.tokens || account.credentials);
+        await drive.files.create({ requestBody: { name: file.originalname, parents: [folderId || 'root'] }, media: { mimeType: file.mimetype, body: fs.createReadStream(file.path) } });
+      }
     } else {
-      const drive = await getDriveClient(account.tokens || account.credentials);
-      await drive.files.create({ requestBody: { name: file.originalname, parents: [folderId || 'root'] }, media: { mimeType: file.mimetype, body: fs.createReadStream(file.path) } });
+      const err: any = new Error(`Provider '${String(account.accountType || 'unknown')}' does not support upload`);
+      err.code = 'UNSUPPORTED_PROVIDER_OPERATION';
+      throw err;
     }
   });
 }
 
+function transferProviderType(accountType: unknown): string | null {
+  const value = String(accountType || '').trim().toLowerCase().replace(/[ -]/g, '_');
+  if (['tgdrive', 'tg_drive', 'telegram', 'telegram_drive'].includes(value)) return 'telegram';
+  if (['google', 'gdrive', 'google_drive', 'googledrive'].includes(value)) return 'google_drive';
+  if (['onedrive', 'one_drive', 'microsoft_onedrive'].includes(value)) return 'onedrive';
+  return null;
+}
 function uploadSessionId() {
   return `us_${Date.now()}_${nanoid(18)}`;
 }
@@ -1804,8 +2031,9 @@ async function findUploadAccount(req: any, accountId: string) {
 
 // ─── Resumable upload sessions ────────────────────────────────────────────────
 const UPLOAD_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const PROVIDER_COMPLETION_LEASE_MS = 10 * 60 * 1000;
 function publicUploadSession(session: any) {
-  return { sessionId: session.sessionId, status: session.status, receivedBytes: session.receivedBytes, totalBytes: session.totalBytes, chunkSize: session.chunkSize, checksum: session.checksum };
+  return { sessionId: session.sessionId, status: session.status, receivedBytes: session.receivedBytes, totalBytes: session.totalBytes, chunkSize: session.chunkSize, checksum: session.checksum, providerType: session.providerType, providerResumable: session.providerResumable, providerCancellable: session.providerCancellable };
 }
 async function ownedUploadSession(req: any, sessionId: string) {
   return req.db.collection('upload_sessions').findOne({ sessionId, userId: String(req.userId || '') });
@@ -1820,24 +2048,43 @@ async function expireUploadSessionIfNeeded(sessions: any, session: any) {
 }
 app.post('/api/upload-sessions/:accountId', requireAuth, async (req: any, res: any) => {
   const { accountId } = req.params;
-  const { fileName, mimeType = 'application/octet-stream', size, folderId = 'root', checksum, idempotencyKey } = req.body || {};
+  const { fileName, mimeType = 'application/octet-stream', size, folderId = 'root', checksum, idempotencyKey, providerType: requestedProviderType, desiredChunkSize } = req.body || {};
   if (!fileName || !Number.isFinite(Number(size)) || Number(size) < 0 || !idempotencyKey) {
     return apiError(res, 400, 'INVALID_UPLOAD_SESSION', 'fileName, size, and idempotencyKey are required', req.requestId);
   }
   const account = await findUploadAccount(req, accountId);
   if (!account) return apiError(res, 404, 'ACCOUNT_NOT_FOUND', 'Account not found', req.requestId);
+  const resolvedProviderType = transferProviderType(account.accountType);
+  if (!resolvedProviderType) return apiError(res, 422, 'UNSUPPORTED_PROVIDER_OPERATION', `Provider '${String(account.accountType || 'unknown')}' cannot upload`, req.requestId);
+  if (requestedProviderType && transferProviderType(requestedProviderType) !== resolvedProviderType) {
+    return apiError(res, 409, 'ACCOUNT_PROVIDER_MISMATCH', 'Requested provider does not match the selected account', req.requestId);
+  }
   const sessions = req.db.collection('upload_sessions');
   const existing = await sessions.findOne({ userId: String(req.userId || ''), accountId, idempotencyKey, status: { $in: ['active', 'completed', 'completing'] } });
   if (existing) {
     await expireUploadSessionIfNeeded(sessions, existing);
-    if (existing.status !== 'expired') return res.json(publicUploadSession(existing));
+    if (existing.status !== 'expired') {
+      if (existing.totalBytes !== Number(size) || existing.fileName !== fileName || (existing.checksum && checksum && existing.checksum !== checksum)) {
+        return apiError(res, 409, 'IDEMPOTENCY_KEY_REUSED', 'Idempotency key is already bound to different upload metadata', req.requestId);
+      }
+      return res.json(publicUploadSession(existing));
+    }
   }
+  const requestedChunk = Number(desiredChunkSize);
+  const chunkSize = Number.isFinite(requestedChunk) && requestedChunk > 0 ? Math.max(256 * 1024, Math.min(16 * 1024 * 1024, requestedChunk)) : 8 * 1024 * 1024;
   const session = {
     sessionId: uploadSessionId(), userId: String(req.userId || ''), accountId, folderId, fileName,
-    mimeType, totalBytes: Number(size), receivedBytes: 0, chunkSize: 8 * 1024 * 1024, checksum: checksum || null,
-    idempotencyKey, tempPath: path.join(os.tmpdir(), `transfer_${nanoid(18)}.part`), status: 'active', createdAt: new Date(), updatedAt: new Date()
+    mimeType, totalBytes: Number(size), receivedBytes: 0, chunkSize, checksum: checksum || null,
+    idempotencyKey, providerType: resolvedProviderType,
+    providerResumable: resolvedProviderType !== 'telegram',
+    providerCancellable: resolvedProviderType === 'onedrive',
+    tempPath: path.join(os.tmpdir(), `transfer_${nanoid(18)}.part`), status: 'active', createdAt: new Date(), updatedAt: new Date()
   };
   await sessions.insertOne(session);
+  if (session.totalBytes === 0) {
+    fs.mkdirSync(path.dirname(session.tempPath), { recursive: true });
+    fs.writeFileSync(session.tempPath, Buffer.alloc(0));
+  }
   return res.status(201).json(publicUploadSession(session));
 });
 app.get('/api/upload-sessions/:sessionId', requireAuth, async (req: any, res: any) => {
@@ -1860,18 +2107,43 @@ app.put('/api/upload-sessions/:sessionId/chunks', requireAuth, upload.single('ch
   const start = range ? Number(range[1]) : Number(req.header('X-Chunk-Offset'));
   const end = range ? Number(range[2]) : start + chunk.size - 1;
   const total = range ? Number(range[3]) : session.totalBytes;
+  let chunkLockOwner: string | null = null;
   try {
-    if (!Number.isFinite(start) || start !== session.receivedBytes || end < start || total !== session.totalBytes || end - start + 1 !== chunk.size) {
-      return apiError(res, 409, 'UPLOAD_OFFSET_CONFLICT', `Expected offset ${session.receivedBytes}`, req.requestId);
+    if (!Number.isFinite(start) || end < start || total !== session.totalBytes || end - start + 1 !== chunk.size) {
+      return apiError(res, 400, 'INVALID_CONTENT_RANGE', 'Content-Range does not match the uploaded chunk', req.requestId);
     }
+    // Exact replay after a lost response is acknowledged only when bytes match the durable file.
+    if (start < session.receivedBytes) {
+      if (end >= session.receivedBytes || !fs.existsSync(session.tempPath) || fs.statSync(session.tempPath).size < end + 1) {
+        return apiError(res, 409, 'UPLOAD_OFFSET_CONFLICT', `Expected offset ${session.receivedBytes}`, req.requestId);
+      }
+      const existing = Buffer.alloc(chunk.size);
+      const fd = fs.openSync(session.tempPath, 'r');
+      try { fs.readSync(fd, existing, 0, existing.length, start); } finally { fs.closeSync(fd); }
+      const incoming = fs.readFileSync(chunk.path);
+      if (!existing.equals(incoming)) return apiError(res, 409, 'UPLOAD_OFFSET_CONFLICT', 'Repeated chunk bytes differ from the committed chunk', req.requestId);
+      return res.json({ sessionId: session.sessionId, receivedBytes: session.receivedBytes, totalBytes: session.totalBytes, nextOffset: session.receivedBytes, complete: session.receivedBytes === session.totalBytes });
+    }
+    if (start !== session.receivedBytes) return apiError(res, 409, 'UPLOAD_OFFSET_CONFLICT', `Expected offset ${session.receivedBytes}`, req.requestId);
     if (!hasTempDiskHeadroom(chunk.size)) return apiError(res, 507, 'INSUFFICIENT_STORAGE', 'Server temporary storage is too low', req.requestId);
+    chunkLockOwner = nanoid(16);
+    const acquired = await sessions.updateOne({
+      sessionId: session.sessionId, userId: String(req.userId || ''), status: 'active', receivedBytes: session.receivedBytes,
+      $or: [{ chunkLeaseExpiresAt: { $exists: false } }, { chunkLeaseExpiresAt: { $lte: Date.now() } }]
+    }, { $set: { chunkLeaseOwner: chunkLockOwner, chunkLeaseExpiresAt: Date.now() + 2 * 60 * 1000 } });
+    if (acquired.modifiedCount !== 1) return apiError(res, 409, 'UPLOAD_OFFSET_CONFLICT', 'Another chunk write is in progress', req.requestId);
     fs.mkdirSync(path.dirname(session.tempPath), { recursive: true });
+    const existingSize = fs.existsSync(session.tempPath) ? fs.statSync(session.tempPath).size : 0;
+    if (existingSize < session.receivedBytes) return apiError(res, 500, 'UPLOAD_STORAGE_CORRUPT', 'Staged file is shorter than its committed offset', req.requestId);
+    if (existingSize > session.receivedBytes) fs.truncateSync(session.tempPath, session.receivedBytes);
     fs.appendFileSync(session.tempPath, fs.readFileSync(chunk.path));
     const receivedBytes = session.receivedBytes + chunk.size;
-    const updated = await sessions.updateOne({ sessionId: session.sessionId, userId: String(req.userId || ''), status: 'active', receivedBytes: session.receivedBytes }, { $set: { receivedBytes, updatedAt: new Date() } });
+    const updated = await sessions.updateOne({ sessionId: session.sessionId, userId: String(req.userId || ''), status: 'active', receivedBytes: session.receivedBytes, chunkLeaseOwner: chunkLockOwner }, { $set: { receivedBytes, updatedAt: new Date() }, $unset: { chunkLeaseOwner: '', chunkLeaseExpiresAt: '' } });
     if (updated.modifiedCount !== 1) return apiError(res, 409, 'UPLOAD_OFFSET_CONFLICT', 'Upload session changed while writing this chunk', req.requestId);
+    chunkLockOwner = null;
     return res.json({ sessionId: session.sessionId, receivedBytes, totalBytes: session.totalBytes, nextOffset: receivedBytes, complete: receivedBytes === session.totalBytes });
   } finally {
+    if (chunkLockOwner) await sessions.updateOne({ sessionId: session.sessionId, chunkLeaseOwner: chunkLockOwner }, { $unset: { chunkLeaseOwner: '', chunkLeaseExpiresAt: '' } });
     if (chunk.path && fs.existsSync(chunk.path)) { try { fs.unlinkSync(chunk.path); } catch { /* janitor will retry */ } }
   }
 });
@@ -1882,32 +2154,55 @@ app.post('/api/upload-sessions/:sessionId/complete', requireAuth, async (req: an
   await expireUploadSessionIfNeeded(sessions, session);
   if (session.status === 'completed') return res.json({ success: true, sessionId: session.sessionId, checksum: session.checksum });
   if (session.status === 'expired') return apiError(res, 410, 'UPLOAD_SESSION_EXPIRED', 'Upload session expired', req.requestId);
-  if (session.status !== 'active') return apiError(res, 409, 'UPLOAD_SESSION_NOT_ACTIVE', `Upload session is ${session.status}`, req.requestId);
+  if (session.status !== 'active' && session.status !== 'completing') return apiError(res, 409, 'UPLOAD_SESSION_NOT_ACTIVE', `Upload session is ${session.status}`, req.requestId);
+  if (session.status === 'completing' && Number(session.completionLeaseExpiresAt || 0) > Date.now()) {
+    return apiError(res, 503, 'UPLOAD_COMPLETION_IN_PROGRESS', 'Provider upload is already in progress; retry after the lease expires', req.requestId);
+  }
   if (session.receivedBytes !== session.totalBytes || !fs.existsSync(session.tempPath)) return apiError(res, 409, 'UPLOAD_INCOMPLETE', 'Upload is incomplete', req.requestId);
   const account = await findUploadAccount(req, session.accountId);
   if (!account) return apiError(res, 404, 'ACCOUNT_NOT_FOUND', 'Account not found', req.requestId);
-  const claimed = await sessions.updateOne({ sessionId: session.sessionId, userId: String(req.userId || ''), status: 'active' }, { $set: { status: 'completing', updatedAt: new Date() } });
+  const claimNow = Date.now();
+  const claimed = await sessions.updateOne({
+    sessionId: session.sessionId, userId: String(req.userId || ''),
+    $or: [
+      { status: 'active' },
+      { status: 'completing', $or: [{ completionLeaseExpiresAt: { $lte: claimNow } }, { completionLeaseExpiresAt: { $exists: false } }] }
+    ]
+  }, { $set: { status: 'completing', completionLeaseExpiresAt: claimNow + PROVIDER_COMPLETION_LEASE_MS, updatedAt: new Date(claimNow) } });
   if (claimed.modifiedCount !== 1) {
     session = await ownedUploadSession(req, session.sessionId);
     if (session?.status === 'completed') return res.json({ success: true, sessionId: session.sessionId, checksum: session.checksum });
-    return apiError(res, 409, 'UPLOAD_SESSION_NOT_ACTIVE', 'Upload completion is already in progress', req.requestId);
+    return apiError(res, 503, 'UPLOAD_COMPLETION_IN_PROGRESS', 'Upload completion is already in progress; retry shortly', req.requestId);
   }
   try {
     const digest = crypto.createHash('sha256');
     digest.update(fs.readFileSync(session.tempPath));
     const checksum = digest.digest('hex');
     if (session.checksum && session.checksum.toLowerCase() !== checksum) {
-      await sessions.updateOne({ sessionId: session.sessionId, status: 'completing' }, { $set: { status: 'active', updatedAt: new Date() } });
+      await sessions.updateOne({ sessionId: session.sessionId, status: 'completing' }, { $set: { status: 'active', updatedAt: new Date() }, $unset: { completionLeaseExpiresAt: '' } });
       return apiError(res, 422, 'CHECKSUM_MISMATCH', 'Upload checksum does not match', req.requestId);
     }
-    await uploadFileToProvider(account, session.accountId, { path: session.tempPath, size: session.totalBytes, originalname: session.fileName, mimetype: session.mimeType }, session.folderId);
-    await sessions.updateOne({ sessionId: session.sessionId, status: 'completing' }, { $set: { status: 'completed', checksum, updatedAt: new Date() } });
+    await uploadFileToProvider(
+      account, session.accountId,
+      { path: session.tempPath, size: session.totalBytes, originalname: session.fileName, mimetype: session.mimeType },
+      session.folderId, session.providerSession,
+      async (providerSession) => {
+        const saved = await sessions.updateOne(
+          { sessionId: session.sessionId, userId: String(req.userId || ''), status: 'completing' },
+          { $set: { providerSession, providerType: session.providerType || transferProviderType(account.accountType), completionLeaseExpiresAt: Date.now() + PROVIDER_COMPLETION_LEASE_MS, updatedAt: new Date() } }
+        );
+        if (saved.modifiedCount !== 1) throw new Error('Upload session ownership/state changed while saving provider checkpoint');
+      },
+      session.idempotencyKey
+    );
+    await sessions.updateOne({ sessionId: session.sessionId, status: 'completing' }, { $set: { status: 'completed', checksum, updatedAt: new Date() }, $unset: { completionLeaseExpiresAt: '' } });
     invalidateDriveCache(session.accountId);
     if (fs.existsSync(session.tempPath)) { try { fs.unlinkSync(session.tempPath); } catch { /* janitor will retry */ } }
     return res.json({ success: true, sessionId: session.sessionId, checksum });
   } catch (err: any) {
     console.error('Resumable upload completion error:', err);
-    await sessions.updateOne({ sessionId: session.sessionId, status: 'completing' }, { $set: { status: 'active', updatedAt: new Date() } });
+    await sessions.updateOne({ sessionId: session.sessionId, status: 'completing' }, { $set: { status: 'active', updatedAt: new Date() }, $unset: { completionLeaseExpiresAt: '' } });
+    if (err?.code === 'UNSUPPORTED_PROVIDER_OPERATION') return apiError(res, 422, err.code, err.message, req.requestId);
     return apiError(res, 502, 'PROVIDER_UPLOAD_FAILED', 'Provider upload failed', req.requestId);
   }
 });
@@ -1916,9 +2211,30 @@ app.delete('/api/upload-sessions/:sessionId', requireAuth, async (req: any, res:
   const session = await ownedUploadSession(req, req.params.sessionId);
   if (!session) return res.status(204).end();
   if (session.status === 'completed') return apiError(res, 409, 'UPLOAD_ALREADY_COMPLETED', 'Completed upload cannot be cancelled', req.requestId);
-  if (session.status === 'completing') return apiError(res, 409, 'UPLOAD_COMPLETION_IN_PROGRESS', 'Upload completion cannot be cancelled while provider commit is in progress', req.requestId);
-  const cancelled = await sessions.updateOne({ sessionId: session.sessionId, userId: String(req.userId || ''), status: { $in: ['active', 'expired', 'cancelled'] } }, { $set: { status: 'cancelled', updatedAt: new Date() } });
-  if (cancelled.matchedCount !== 1) return apiError(res, 409, 'UPLOAD_COMPLETION_IN_PROGRESS', 'Upload state changed and cannot be cancelled', req.requestId);
+  const completing = session.status === 'completing';
+  const nativeOneDrive = session.providerSession?.providerType === 'onedrive' && session.providerSession.uploadUrl;
+  if (completing && !nativeOneDrive) {
+    return apiError(res, 409, 'PROVIDER_CANCELLATION_UNSUPPORTED', 'The active provider upload cannot be safely cancelled; it may finish or expire upstream', req.requestId);
+  }
+  const allowed = completing ? ['completing'] : ['active', 'expired', 'cancelled'];
+  const fenced = await sessions.updateOne({
+    sessionId: session.sessionId, userId: String(req.userId || ''), status: { $in: allowed },
+    $or: [{ chunkLeaseExpiresAt: { $exists: false } }, { chunkLeaseExpiresAt: { $lte: Date.now() } }]
+  }, { $set: { status: 'cancelling', updatedAt: new Date() }, $unset: { completionLeaseExpiresAt: '', chunkLeaseOwner: '', chunkLeaseExpiresAt: '' } });
+  if (fenced.matchedCount !== 1) return apiError(res, 409, 'UPLOAD_CANCELLATION_CONFLICT', 'Upload state changed before cancellation could be fenced', req.requestId);
+  if (nativeOneDrive) {
+    try {
+      const abort = await axios.delete(session.providerSession.uploadUrl, { validateStatus: () => true });
+      if (![200, 202, 204].includes(abort.status)) {
+        await sessions.updateOne({ sessionId: session.sessionId, status: 'cancelling' }, { $set: { status: completing ? 'completing' : 'active', updatedAt: new Date() } });
+        return apiError(res, 502, 'PROVIDER_CANCEL_FAILED', `OneDrive cancellation was not confirmed (${abort.status})`, req.requestId);
+      }
+    } catch (error: any) {
+      await sessions.updateOne({ sessionId: session.sessionId, status: 'cancelling' }, { $set: { status: completing ? 'completing' : 'active', updatedAt: new Date() } });
+      return apiError(res, 502, 'PROVIDER_CANCEL_FAILED', error?.message || 'OneDrive cancellation failed', req.requestId);
+    }
+  }
+  await sessions.updateOne({ sessionId: session.sessionId, status: 'cancelling' }, { $set: { status: 'cancelled', updatedAt: new Date() } });
   if (session.tempPath && fs.existsSync(session.tempPath)) { try { fs.unlinkSync(session.tempPath); } catch { /* janitor will retry */ } }
   return res.status(204).end();
 });
@@ -1948,38 +2264,14 @@ app.post('/api/upload/:accountId', requireAuth, upload.single('file'), async (re
   }
 
   try {
-    await providerLimit(`upload:${account.accountType}:${accountId}`, account.accountType === 'tgdrive' ? 2 : 3)(async () => {
-      if (account.accountType === 'tgdrive') {
-        const folder = (!folderId || folderId === 'root') ? '' : folderId;
-        await tgUploadFile(accountId, account.channelId, file.path, file.originalname, file.mimetype, folder);
-      } else if (account.accountType === 'onedrive') {
-        const c          = await getOneDriveClient(account.tokens || account.credentials, accountId);
-        const parentPath = (!folderId || folderId === 'root') ? '/me/drive/root' : `/me/drive/items/${folderId}`;
-        const encodedName = encodeURIComponent(file.originalname);
-        if (file.size <= 4 * 1024 * 1024) {
-          const streamUpload = fs.createReadStream(file.path);
-          await c.api(`${parentPath}:/${encodedName}:/content`).put(streamUpload);
-        } else {
-          const uploadSession = await c.api(`${parentPath}:/${encodedName}:/createUploadSession`).post({ item: { '@microsoft.graph.conflictBehavior': 'replace', name: file.originalname } });
-          const uploadUrl  = uploadSession.uploadUrl;
-          const chunkSize  = 320 * 1024 * 10;
-          for (let start = 0; start < file.size; start += chunkSize) {
-            const end         = Math.min(start + chunkSize, file.size);
-            const chunkLen    = end - start;
-            const chunkStream = fs.createReadStream(file.path, { start, end: end - 1 });
-            await axios.put(uploadUrl, chunkStream, { headers: { 'Content-Range': `bytes ${start}-${end - 1}/${file.size}`, 'Content-Length': chunkLen } });
-          }
-        }
-      } else {
-        const drive       = await getDriveClient(account.tokens || account.credentials);
-        const fileStream  = fs.createReadStream(file.path);
-        await drive.files.create({ requestBody: { name: file.originalname, parents: [folderId || 'root'] }, media: { mimeType: file.mimetype, body: fileStream } });
-      }
-    });
+    await uploadFileToProvider(account, accountId, {
+      path: file.path, size: file.size, originalname: file.originalname, mimetype: file.mimetype
+    }, folderId);
     invalidateDriveCache(accountId);
     res.json({ success: true });
   } catch (err: any) {
     console.error('Upload error:', err);
+    if (err?.code === 'UNSUPPORTED_PROVIDER_OPERATION') return apiError(res, 422, err.code, err.message, req.requestId);
     apiError(res, 502, 'PROVIDER_UPLOAD_FAILED', 'Provider upload failed', req.requestId);
   } finally {
     if (file?.path && fs.existsSync(file.path)) {

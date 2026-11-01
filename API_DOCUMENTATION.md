@@ -13,7 +13,7 @@ All API routes are served under the root URL of your deployed Cloudyte server.
 - **Content Type:** JSON (`application/json`) is expected for POST/PATCH bodies, except for `/api/upload/:accountId` which requires `multipart/form-data`.
 - **Media Streaming:** Video, audio, and large file download endpoints support HTTP `Range` requests (`206 Partial Content`) for native media players (such as Android ExoPlayer / AVPlayer).
 
-Large Android uploads (8 MiB and above) use the resumable upload-session API. The client can safely retry session creation with the same `idempotencyKey`, resume from the server-reported `receivedBytes`, and finalize only after the complete file checksum matches.
+Large Android uploads use the resumable upload-session API. The server stages sequential chunks, owns the authoritative client-to-server byte offset, validates SHA-256 before commit, and then uses the selected account's provider-native upload protocol where available.
 
 ### 1.1 Resumable Upload Sessions
 
@@ -30,12 +30,19 @@ Content-Type: application/json
   "size": 10485760,
   "folderId": "root",
   "checksum": "<sha256-hex>",
-  "idempotencyKey": "cloudyte-<transfer-id>"
+  "idempotencyKey": "cloudyte-<transfer-id>",
+  "providerType": "onedrive",
+  "desiredChunkSize": 8388608
 }
 ```
 
-Query a session with `GET /api/upload-sessions/:sessionId` to reconcile the server-confirmed `receivedBytes` offset after a retry or process restart. Upload each sequential chunk as multipart field `chunk` using `Content-Range: bytes <start>-<end>/<total>`. When `receivedBytes` equals `totalBytes`, call `POST /api/upload-sessions/:sessionId/complete`; repeating completion after success returns the same completed result. Sessions expire after 24 hours; a query returns `status: "expired"`, and chunk/complete requests return `410 UPLOAD_SESSION_EXPIRED`. Recreate an expired session with the original idempotency key. Cancel an active session with `DELETE /api/upload-sessions/:sessionId`; cancellation is idempotent for a missing session and deletes its staged temporary data. Completed or currently-finalizing sessions cannot be cancelled. The server validates SHA-256 before sending the assembled file to the configured provider. Offset mismatches return `409 UPLOAD_OFFSET_CONFLICT`, and checksum mismatches return `422 CHECKSUM_MISMATCH`.
+`accountId` is authoritative. `providerType` is optional for older clients; if supplied, it must match the selected account or the server returns `409 ACCOUNT_PROVIDER_MISMATCH`. The response includes `providerType`, `providerResumable` (whether the upstream provider's native session can be resumed), and `providerCancellable` (whether an upstream session can be safely aborted). Cloudyte's own staged upload remains resumable for Telegram, Google Drive, and OneDrive; Telegram reports `providerResumable: false` because GramJS's upstream `sendFile` operation does not expose a durable session/offset API.
 
+Query `GET /api/upload-sessions/:sessionId` to reconcile `receivedBytes` after a retry or process restart. Upload sequential multipart field `chunk` parts with `Content-Range: bytes <start>-<end>/<total>`. A byte-identical replay of a committed range is acknowledged idempotently; a different replay or offset conflict returns `409 UPLOAD_OFFSET_CONFLICT`. Server writes are fenced, and a crash-left trailing staged suffix is truncated to the last committed offset before the next write. When `receivedBytes == totalBytes`, call `POST /api/upload-sessions/:sessionId/complete`. Completion is idempotent; a stale provider-completion lease can be reclaimed after ten minutes. Busy completion returns retryable `503 UPLOAD_COMPLETION_IN_PROGRESS`.
+
+Google Drive uses a native resumable URI persisted server-side and reconciles it through the Google `308` / `Range` protocol. OneDrive persists its Graph `uploadUrl`, checks `nextExpectedRanges`, sends 320-KiB-aligned chunks, and can abort a persisted upload session. Expired provider sessions are recreated; OneDrive uses replace semantics and Google checks the transfer marker in `appProperties` to avoid duplicate completed files. Telegram uses GramJS `sendFile` and an idempotency marker in its metadata record; it cannot resume or abort a provider-native session after server restart. Zero-byte Google Drive and OneDrive files are supported; zero-byte Telegram documents return `422 UNSUPPORTED_PROVIDER_OPERATION`.
+
+Cloudyte staging sessions expire after 24 hours. A query returns `status: "expired"`; chunk/complete requests return `410 UPLOAD_SESSION_EXPIRED`. Recreate an expired session with the original idempotency key. `DELETE /api/upload-sessions/:sessionId` removes staged data and is idempotent for a missing session. A stored OneDrive native session can also be aborted. Completed uploads cannot be cancelled; Google Drive/Telegram provider finalization that is already running returns `409 PROVIDER_CANCELLATION_UNSUPPORTED` rather than claiming a cancellation that cannot be guaranteed. The server validates SHA-256 before provider commit; checksum mismatches return `422 CHECKSUM_MISMATCH`.
 ---
 
 ## 2. Authentication
