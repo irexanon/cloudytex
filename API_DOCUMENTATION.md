@@ -721,5 +721,106 @@ Permanently deletes the user and all their linked accounts and file references.
 | **Download/Stream** | `/api/download/:accId/:fileId`| GET | Bearer or `?token=` | Supports `Range`, RFC 5987, ETag 304, and `?preview=1` |
 | **Move File** | `/api/files/move` | POST | Bearer | Supports same-drive & cross-drive transfers |
 | **Copy File** | `/api/files/copy` | POST | Bearer | Supports same-drive & cross-drive cloning |
-| **Share Link** | `/api/share` | POST | Bearer | Returns public URL `/s/:shareId` |
-| **Public Download**| `/api/public/download/:shareId`| GET | None | Direct file download |
+| **Share Link** | `/api/share` | POST | Bearer | Returns public URL `/s/:shareId` (`409` for encrypted files) |
+| **Public Download**| `/api/public/download/:shareId`| GET | None | Direct file download (`409` for encrypted files) |
+| **Put Key Backup** | `/api/accounts/:id/encryption/key-backup` | PUT | Bearer | Store opaque PBKDF2-wrapped encryption key backup |
+| **Get Key Backup** | `/api/accounts/:id/encryption/key-backup` | GET | Bearer | Retrieve opaque wrapped encryption key backup |
+| **Delete Key Backup**| `/api/accounts/:id/encryption/key-backup` | DELETE | Bearer | Delete stored key backup (`204 No Content`) |
+
+---
+
+## 11. Client-Side End-to-End Encryption (E2EE / Zero-Knowledge Mode)
+
+Cloudyte supports full client-side end-to-end encryption (`CYTE1` binary format with `AES-256-GCM` chunked encryption) while preserving full backward compatibility with plaintext files.
+
+### 11.1 Privacy & Zero-Knowledge Guarantees
+- The server stores and streams encrypted `CYTE1` bytes unchanged and **never** decrypts file contents or metadata.
+- The server **never** receives, logs, or stores `CONTENT_KEY`, `recoveryPassphrase`, original plaintext filenames, original plaintext MIME types, or plaintext file hashes for encrypted files.
+- For encrypted files:
+  - Remote filename (`fileName` / `opaqueRemoteName`) must match `^cyte_[A-Za-z0-9_-]{4,120}\.(bin|cyte1|enc)$`.
+  - `mimeType` must be `"application/octet-stream"`.
+  - `encryptionFormatVersion` must be `1`.
+  - `checksum` is the lowercase 64-character hex SHA-256 digest of the **encrypted** bytes.
+  - Telegram channel messages use the opaque marker caption `"cloudyte:c1"`.
+
+### 11.2 Encrypted Metadata Envelope
+```json
+{
+  "metadataVersion": 1,
+  "algorithm": "AES-256-GCM",
+  "keyId": "key_primary_01",
+  "nonce": "<base64url-encoded-12-byte-iv>",
+  "ciphertext": "<base64url-encoded-ciphertext-and-auth-tag>"
+}
+```
+
+### 11.3 Direct Encrypted Upload (`POST /api/upload/:accountId`)
+In addition to the `file` multipart binary field, include the following form fields when `isEncrypted=true`:
+- `isEncrypted`: `"true"`
+- `fileName`: `"cyte_<random>.cyte1"`
+- `opaqueRemoteName`: `"cyte_<random>.cyte1"` (must equal `fileName`)
+- `mimeType`: `"application/octet-stream"`
+- `size` / `encryptedSizeBytes`: Exact encrypted byte length
+- `checksum`: SHA-256 hex digest of the encrypted file bytes
+- `encryptionFormatVersion`: `"1"`
+- `encryptionKeyId`: Opaque key identifier (`1..128` chars)
+- `encryptedMetadata`: JSON string of the encrypted metadata envelope (max 64 KiB)
+
+### 11.4 Resumable Encrypted Upload Sessions (`/api/upload-sessions/*`)
+- **`POST /api/upload-sessions/:accountId`**: Accepts `isEncrypted: true`, `fileName`, `opaqueRemoteName`, `mimeType: "application/octet-stream"`, `size`, `encryptedSizeBytes`, `checksum` (SHA-256 of full encrypted file), `encryptionFormatVersion: 1`, `encryptionKeyId`, `encryptedMetadata`, and `idempotencyKey`.
+- **`GET /api/upload-sessions/:sessionId`**: Returns session progress (`receivedBytes`, `totalBytes`) along with `isEncrypted`, `encryptionFormatVersion`, `encryptionKeyId`, `encryptedMetadata`, `opaqueRemoteName`, and `encryptedSizeBytes`.
+- **`PUT /api/upload-sessions/:sessionId/chunks`**: Streams encrypted byte chunks. Exact idempotent chunk replays are accepted; conflicting chunk replays or out-of-order offsets return `409 UPLOAD_SESSION_OFFSET_CONFLICT`.
+- **`POST /api/upload-sessions/:sessionId/complete`**: Verifies all encrypted bytes were received (`409 ENCRYPTED_UPLOAD_INCOMPLETE` if incomplete) and validates the full-file SHA-256 (`422 ENCRYPTED_CHECKSUM_MISMATCH` on mismatch) before committing to the storage provider.
+
+### 11.5 File Listing, Download, Thumbnail & Share Behavior for Encrypted Files
+- **`GET /api/files`**: Each item includes:
+  - `isEncrypted`: `boolean`
+  - `encryptionFormatVersion`: `1 | null`
+  - `encryptionKeyId`: `string | null`
+  - `encryptedChecksum`: `string | null`
+  - `encryptedMetadata`: `EncryptedMetadataEnvelope | null`
+  - `encryptedSizeBytes`: `number` (for encrypted files)
+  - `thumbUrl`: Always `null` for encrypted files
+  - `type`: Always `"other"` and `mimeType: "application/octet-stream"` for encrypted files
+- **`GET /api/download/:accountId/:fileId`**: Streams raw encrypted `CYTE1` bytes with `Content-Type: application/octet-stream`, opaque `Content-Disposition` filename, `ETag: "<encryptedChecksum>"`, and full support for HTTP `Range: bytes=start-end` (`206 Partial Content`).
+- **`GET /api/thumb/:accountId/:fileId`**: Immediately returns HTTP `409 Conflict` with `code: "ENCRYPTED_PREVIEW_UNAVAILABLE"` without invoking Sharp or upstream thumbnail APIs.
+- **`POST /api/share`**: Immediately returns HTTP `409 Conflict` with `code: "ENCRYPTED_SHARE_UNSUPPORTED"` and never creates a public `shareId`.
+
+### 11.6 Optional Zero-Knowledge Key Backup Endpoints
+Clients may store an opaque PBKDF2-wrapped key backup per account. The server never receives the recovery passphrase or unwrapped content key.
+- **`PUT /api/accounts/:accountId/encryption/key-backup`**
+  - Request Body:
+    ```json
+    {
+      "backupVersion": 1,
+      "keyId": "key_primary_01",
+      "kdfAlgorithm": "PBKDF2-HMAC-SHA256",
+      "kdfIterations": 310000,
+      "salt": "<base64url>",
+      "wrapAlgorithm": "AES-256-GCM",
+      "nonce": "<base64url>",
+      "wrappedKey": "<base64url>"
+    }
+    ```
+  - Validates `kdfIterations >= 100000` and max payload size `<= 16 KiB`.
+- **`GET /api/accounts/:accountId/encryption/key-backup`**: Returns the stored key backup or `404 KEY_BACKUP_NOT_FOUND`.
+- **`DELETE /api/accounts/:accountId/encryption/key-backup`**: Deletes the stored key backup and returns `204 No Content`.
+
+### 11.7 E2EE Error Codes
+| Error Code | HTTP Status | Description |
+| :--- | :--- | :--- |
+| `ENCRYPTED_METADATA_INVALID` | `400` | Missing or malformed `encryptedMetadata` envelope |
+| `ENCRYPTED_METADATA_TOO_LARGE` | `413` | `encryptedMetadata` exceeds 64 KiB |
+| `OPAQUE_FILENAME_REQUIRED` | `400` | Encrypted file name does not match `cyte_<id>.(bin\|cyte1\|enc)` |
+| `ENCRYPTED_MIME_INVALID` | `400` | Encrypted upload MIME type is not `application/octet-stream` |
+| `UNSUPPORTED_ENCRYPTION_VERSION` | `400` | `encryptionFormatVersion` is not `1` |
+| `ENCRYPTED_SIZE_MISMATCH` | `400` | `size` and `encryptedSizeBytes` do not match |
+| `ENCRYPTED_CHECKSUM_MISMATCH` | `422` | Uploaded encrypted bytes do not match expected SHA-256 |
+| `ENCRYPTED_UPLOAD_INCOMPLETE` | `409` | Attempted to complete an encrypted upload session with missing bytes |
+| `UPLOAD_SESSION_OFFSET_CONFLICT` | `409` | Chunk offset mismatch or conflicting chunk replay |
+| `ENCRYPTED_PREVIEW_UNAVAILABLE` | `409` | Server-side thumbnail/preview requested for an encrypted file |
+| `ENCRYPTED_SHARE_UNSUPPORTED` | `409` | Public share link requested for an encrypted file |
+| `KEY_BACKUP_NOT_FOUND` | `404` | No key backup exists for the requested account |
+| `KEY_BACKUP_INVALID` | `400` | Invalid key backup envelope or weak KDF iteration count |
+| `KEY_BACKUP_TOO_LARGE` | `413` | Key backup exceeds 16 KiB |
+| `ACCOUNT_ACCESS_DENIED` | `403` | Authenticated user does not own the target account, file, or session |
