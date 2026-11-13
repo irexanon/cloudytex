@@ -9,7 +9,8 @@
     "start": "node --experimental-strip-types server.ts",
     "preview": "vite preview",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "CLOUDYTE_TEST_MODE=1 node --experimental-strip-types --test --test-force-exit provider-transfer-protocol.test.ts"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",
