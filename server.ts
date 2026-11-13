@@ -27,7 +27,19 @@ import { Api } from 'telegram/tl/index.js';
 import { createServer as createViteServer } from 'vite';
 
 import { initBot } from './telegram.ts';
-import { parseGoogleRangeOffset, parseOneDriveNextOffset, withSessionLock } from './provider-transfer-protocol.ts';
+import {
+  parseGoogleRangeOffset,
+  parseOneDriveNextOffset,
+  withSessionLock,
+  validateUploadRequest,
+  validateKeyBackupInput,
+  validateOpaqueFilename,
+  validatePlaintextFilename,
+  validateSafeFolderId,
+  computeFileSha256,
+  TELEGRAM_ENCRYPTED_CAPTION_MARKER,
+  type ValidatedUploadSpec,
+} from './provider-transfer-protocol.ts';
 
 dotenv.config();
 
@@ -80,13 +92,19 @@ function providerLimit(key: string, concurrency = 3) {
 }
 
 function apiError(res: any, status: number, code: string, message: string, requestId?: string, retryable = status >= 500 || status === 429) {
-  return res.status(status).json({ error: { code, message, retryable, correlationId: requestId || null } });
+  return res.status(status).json({
+    error: message,
+    code,
+    requestId: requestId || null,
+    retryable,
+    correlationId: requestId || null,
+  });
 }
 
 function errorCode(status: number) {
   if (status === 400) return 'BAD_REQUEST';
   if (status === 401) return 'AUTH_REQUIRED';
-  if (status === 403) return 'FORBIDDEN';
+  if (status === 403) return 'ACCOUNT_ACCESS_DENIED';
   if (status === 404) return 'NOT_FOUND';
   if (status === 409) return 'CONFLICT';
   if (status === 429) return 'RATE_LIMITED';
@@ -215,7 +233,9 @@ function clearUserAuthCache(userId: string) {
 }
 
 // ─── GramJS peer resolver ────────────────────────────────────────────────────
+let testResolvePeer: ((telegram: any, id: string) => Promise<any>) | null = null;
 const resolvePeer = async (telegram: TelegramClient, id: string): Promise<any> => {
+  if (testResolvePeer) return testResolvePeer(telegram, id);
   if (!id || id === 'me') return 'me';
   const cleanId = id.trim();
   try {
@@ -282,7 +302,16 @@ async function connectToMongo() {
     try { await db.collection('tg_files').createIndex({ accountId: 1, folder: 1, date: -1, _id: -1 }); } catch { /* ignore */ }
     try { await db.collection('tg_files').createIndex({ accountId: 1, name: 1 }); } catch { /* ignore */ }
     try { await db.collection('tg_files').createIndex({ accountId: 1, folder: 1, name: 1 }); } catch { /* ignore */ }
+    try { await db.collection('tg_files').createIndex({ accountId: 1, isEncrypted: 1 }); } catch { /* ignore */ }
+    try { await db.collection('tg_files').createIndex({ userId: 1, isEncrypted: 1 }); } catch { /* ignore */ }
+    try { await db.collection('tg_files').createIndex({ encryptedChecksum: 1 }); } catch { /* ignore */ }
+    try { await db.collection('tg_files').createIndex({ accountId: 1, providerFileId: 1 }); } catch { /* ignore */ }
     try { await db.collection('tg_folders').createIndex({ accountId: 1, path: 1 }); } catch { /* ignore */ }
+
+    // Upload sessions & encryption key backups indexes
+    try { await db.collection('upload_sessions').createIndex({ status: 1, expiresAt: 1 }); } catch { /* ignore */ }
+    try { await db.collection('upload_sessions').createIndex({ userId: 1, accountId: 1, idempotencyKey: 1 }); } catch { /* ignore */ }
+    try { await db.collection('account_encryption_backups').createIndex({ accountId: 1, userId: 1 }, { unique: true }); } catch { /* ignore */ }
 
     // Additional collection indexes
     try { await db.collection('sessions').createIndex({ createdAt: 1 }, { expireAfterSeconds: 2592000 }); } catch { /* ignore */ }
@@ -303,6 +332,7 @@ async function connectToMongo() {
     try { await db.collection('jobs').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }); } catch { /* ignore */ }
 
     await runMigration(db);
+    await runEncryptionMigration(db);
     await checkAdmin(db);
     await ensureDefaultSettings(db);
     await runIndexDiagnostics(db);
@@ -311,6 +341,42 @@ async function connectToMongo() {
   } catch (err) {
     console.error('MongoDB error:', err);
     throw err;
+  }
+}
+
+export async function runEncryptionMigration(database: any) {
+  if (!database) return;
+  try {
+    await database.collection('tg_files').updateMany(
+      { isEncrypted: { $exists: false } },
+      {
+        $set: {
+          isEncrypted: false,
+          encryptionFormatVersion: null,
+          encryptionKeyId: null,
+          encryptedMetadata: null,
+          encryptedSizeBytes: null,
+          encryptedChecksum: null,
+          opaqueRemoteName: null,
+        },
+      }
+    );
+    await database.collection('upload_sessions').updateMany(
+      { isEncrypted: { $exists: false } },
+      {
+        $set: {
+          isEncrypted: false,
+          encryptionFormatVersion: null,
+          encryptionKeyId: null,
+          encryptedMetadata: null,
+          encryptedSizeBytes: null,
+          encryptedChecksum: null,
+          opaqueRemoteName: null,
+        },
+      }
+    );
+  } catch (err) {
+    console.error('[Migration] Encryption backfill failed:', err);
   }
 }
 
@@ -498,7 +564,9 @@ const requireAuthOrSignedMedia = async (req: any, res: any, next: any) => {
 
 // ─── GramJS singleton (bot-auth) ─────────────────────────────────────────────
 let tgClient: TelegramClient | null = null;
+let testTgClientFactory: (() => Promise<any>) | null = null;
 async function getTgClient() {
+  if (testTgClientFactory) return testTgClientFactory();
   if (tgClient && tgClient.connected) return tgClient;
 
   const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -541,13 +609,49 @@ async function getTgClient() {
 }
 
 // ─── Cloud clients ────────────────────────────────────────────────────────────
+let testDriveClientFactory: ((tokens: any) => Promise<any>) | null = null;
+let testOneDriveClientFactory: ((tokens: any, accountId?: string) => Promise<any>) | null = null;
+
+export function setTestDependencies(deps: {
+  db?: any;
+  tgClient?: any;
+  getTgClient?: (() => Promise<any>) | null;
+  resolvePeer?: ((telegram: any, id: string) => Promise<any>) | null;
+  driveClientFactory?: ((tokens: any) => Promise<any>) | null;
+  getDriveClient?: ((tokens: any) => Promise<any>) | null;
+  oneDriveClientFactory?: ((tokens: any, accountId?: string) => Promise<any>) | null;
+  getOneDriveClient?: ((tokens: any, accountId?: string) => Promise<any>) | null;
+} | null) {
+  if (!deps) {
+    testTgClientFactory = null;
+    testResolvePeer = null;
+    testDriveClientFactory = null;
+    testOneDriveClientFactory = null;
+    authCache.flushAll();
+    driveCache.flushAll();
+    return;
+  }
+  if ('db' in deps) db = deps.db;
+  if ('tgClient' in deps) tgClient = deps.tgClient;
+  if ('getTgClient' in deps) testTgClientFactory = deps.getTgClient ?? null;
+  if ('resolvePeer' in deps) testResolvePeer = deps.resolvePeer ?? null;
+  if ('driveClientFactory' in deps) testDriveClientFactory = deps.driveClientFactory ?? null;
+  if ('getDriveClient' in deps) testDriveClientFactory = deps.getDriveClient ?? null;
+  if ('oneDriveClientFactory' in deps) testOneDriveClientFactory = deps.oneDriveClientFactory ?? null;
+  if ('getOneDriveClient' in deps) testOneDriveClientFactory = deps.getOneDriveClient ?? null;
+  authCache.flushAll();
+  driveCache.flushAll();
+}
+
 async function getDriveClient(tokens: any) {
+  if (testDriveClientFactory) return testDriveClientFactory(tokens);
   const auth = new google.auth.OAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET);
   auth.setCredentials(tokens);
   return google.drive({ version: 'v3', auth });
 }
 
 async function getOneDriveClient(tokens: any, accountId?: string) {
+  if (testOneDriveClientFactory) return testOneDriveClientFactory(tokens, accountId);
   if (!tokens.expiry_date && tokens.expires_in)
     tokens = { ...tokens, expiry_date: Date.now() + Number(tokens.expires_in) * 1000 };
 
@@ -575,11 +679,62 @@ async function getOneDriveClient(tokens: any, accountId?: string) {
   return c;
 }
 
+// ─── Authorization helpers ────────────────────────────────────────────────────
+async function resolveAuthorizedAccount(
+  database: any,
+  accountId: unknown,
+  userId?: string | ObjectId | null,
+  isAdmin?: boolean
+): Promise<{ account: any | null; accessDenied: boolean; invalidId: boolean }> {
+  const d = database || db || await connectToMongo();
+  if (!accountId || typeof accountId !== 'string' || !ObjectId.isValid(accountId)) {
+    return { account: null, accessDenied: false, invalidId: true };
+  }
+  const account = await d.collection('accounts').findOne({ _id: new ObjectId(accountId) });
+  if (!account) {
+    return { account: null, accessDenied: false, invalidId: false };
+  }
+  if (!isAdmin && account.userId !== undefined && String(account.userId) !== String(userId || '')) {
+    return { account: null, accessDenied: true, invalidId: false };
+  }
+  return { account, accessDenied: false, invalidId: false };
+}
+
+async function resolveFileMetadataForAccount(
+  database: any,
+  account: any,
+  fileId: string,
+  userId?: string | ObjectId | null,
+  isAdmin?: boolean
+): Promise<{ meta: any | null; accessDenied: boolean }> {
+  const d = database || db || await connectToMongo();
+  if (account.accountType === 'tgdrive') {
+    if (!ObjectId.isValid(fileId)) return { meta: null, accessDenied: false };
+    const meta = await d.collection('tg_files').findOne({ _id: new ObjectId(fileId) });
+    if (!meta) return { meta: null, accessDenied: false };
+    if (String(meta.accountId) !== String(account._id)) return { meta: null, accessDenied: true };
+    if (!isAdmin && meta.userId && userId && String(meta.userId) !== String(userId)) {
+      return { meta: null, accessDenied: true };
+    }
+    return { meta, accessDenied: false };
+  }
+  const orClauses: any[] = [{ providerFileId: fileId }];
+  if (ObjectId.isValid(fileId)) orClauses.push({ _id: new ObjectId(fileId) });
+  const meta = await d.collection('tg_files').findOne({ $or: orClauses });
+  if (!meta) return { meta: null, accessDenied: false };
+  if (String(meta.accountId) !== String(account._id)) return { meta: null, accessDenied: true };
+  if (!isAdmin && meta.userId && userId && String(meta.userId) !== String(userId)) {
+    return { meta: null, accessDenied: true };
+  }
+  return { meta, accessDenied: false };
+}
+
 // ─── TG Drive helpers ─────────────────────────────────────────────────────────
 // Upload a file from disk path to a Telegram channel via GramJS, save metadata, return record.
 async function tgUploadFile(
   accountId: string, channelId: string, filePath: string,
-  fileName: string, mimeType: string, folder: string, caption = '', idempotencyKey?: string
+  fileName: string, mimeType: string, folder: string, caption = '', idempotencyKey?: string,
+  encryptionSpec?: ValidatedUploadSpec, userId?: string
 ) {
   return providerLimit(`telegram:upload:${accountId}`, 2)(async () => {
     const database = db || await connectToMongo();
@@ -593,34 +748,81 @@ async function tgUploadFile(
       unsupported.code = 'UNSUPPORTED_PROVIDER_OPERATION';
       throw unsupported;
     }
+    const isEncrypted = Boolean(encryptionSpec?.isEncrypted);
+    const effectiveName = isEncrypted ? (encryptionSpec!.opaqueRemoteName || fileName) : fileName;
+    if (isEncrypted) {
+      const check = validateOpaqueFilename(effectiveName);
+      if (!check.ok) {
+        const err: any = new Error(check.message);
+        err.code = check.code;
+        throw err;
+      }
+    }
+    const effectiveCaption = isEncrypted ? TELEGRAM_ENCRYPTED_CAPTION_MARKER : caption;
     const telegram   = await getTgClient();
     const peerEntity = await resolvePeer(telegram, channelId);
     const result     = await telegram.sendFile(peerEntity, {
       file: filePath,
-      caption,
+      caption: effectiveCaption,
       forceDocument: true,
-      attributes: [new Api.DocumentAttributeFilename({ fileName })],
+      attributes: [new Api.DocumentAttributeFilename({ fileName: effectiveName })],
     }) as any;
     const messageId = result.id as number;
-    const shareId   = nanoid(6);
-    const record    = {
-      accountId: new ObjectId(accountId),
+    const nowSec    = Math.floor(Date.now() / 1000);
+    const nowMs     = Date.now();
+
+    if (isEncrypted && encryptionSpec) {
+      const encSize = encryptionSpec.encryptedSizeBytes ?? stat.size;
+      const record: any = {
+        accountId: new ObjectId(accountId),
+        ...(userId ? { userId: String(userId) } : {}),
+        messageId,
+        shareId:                    null,
+        name:                      effectiveName,
+        mimeType:                  'application/octet-stream',
+        size:                      encSize,
+        folder:                    folder || '',
+        caption:                   TELEGRAM_ENCRYPTED_CAPTION_MARKER,
+        isEncrypted:               true,
+        encryptionFormatVersion:   encryptionSpec.encryptionFormatVersion ?? 1,
+        encryptionKeyId:           encryptionSpec.encryptionKeyId,
+        encryptedMetadata:         encryptionSpec.encryptedMetadata,
+        encryptedSizeBytes:        encSize,
+        encryptedChecksum:         encryptionSpec.encryptedChecksum,
+        opaqueRemoteName:          effectiveName,
+        plaintextSizeBytes:        null,
+        plaintextChecksum:         null,
+        encryptedThumbnailObjectId: null,
+        ...(idempotencyKey ? { idempotencyKey } : {}),
+        date:                      nowSec,
+        updatedAt:                 nowMs,
+      };
+      await database.collection('tg_files').insertOne(record);
+      return record;
+    }
+
+    const shareId = nanoid(6);
+    const record: any = {
+      accountId:   new ObjectId(accountId),
+      ...(userId ? { userId: String(userId) } : {}),
       messageId,
       shareId,
-      name:     fileName,
-      size:     stat.size,
+      name:        effectiveName,
+      size:        stat.size,
       mimeType,
       folder,
-      caption,
+      caption:     effectiveCaption,
+      isEncrypted: false,
       ...(idempotencyKey ? { idempotencyKey } : {}),
-      date:     Math.floor(Date.now() / 1000),
+      date:        nowSec,
+      updatedAt:   nowMs,
     };
     await database.collection('tg_files').insertOne(record);
     return record;
   });
 }
 
-// Stream a TG file to an HTTP response (supports Range headers for video/audio).
+// Stream a TG file to an HTTP response (supports Range headers for video/audio and encrypted files).
 async function tgStreamFile(messageId: number, channelId: string, req: any, res: any, meta: any) {
   let clientAborted = false;
   const onClose = () => { clientAborted = true; };
@@ -633,24 +835,33 @@ async function tgStreamFile(messageId: number, channelId: string, req: any, res:
     if (!messages || !messages[0] || !messages[0].media) throw new Error('Message not found');
     const media    = messages[0].media as any;
 
-    let totalSize: number = meta?.size || 0;
+    const isEncrypted = meta?.isEncrypted === true;
+    let totalSize: number = isEncrypted ? Number(meta?.encryptedSizeBytes ?? meta?.size ?? 0) : Number(meta?.size || 0);
     if (!totalSize && media?.document?.size) totalSize = Number(media.document.size);
+    const contentType = isEncrypted ? 'application/octet-stream' : (meta?.mimeType || 'application/octet-stream');
 
     const rangeHeader = req.headers['range'];
     if (rangeHeader && totalSize) {
       const [startStr, endStr] = rangeHeader.replace(/bytes=/, '').split('-');
       const start = parseInt(startStr, 10);
-      const end   = endStr ? parseInt(endStr, 10) : totalSize - 1;
+      const end   = endStr ? Math.min(parseInt(endStr, 10), totalSize - 1) : totalSize - 1;
+      if (isNaN(start) || isNaN(end) || start < 0 || start > end || start >= totalSize) {
+        res.status(416).setHeader('Content-Range', `bytes */${totalSize}`).end();
+        return;
+      }
       const chunkSize = end - start + 1;
       res.writeHead(206, {
         'Content-Range':  `bytes ${start}-${end}/${totalSize}`,
         'Accept-Ranges':  'bytes',
         'Content-Length': chunkSize,
-        'Content-Type':   meta?.mimeType || 'application/octet-stream',
+        'Content-Type':   contentType,
       });
       let downloaded = 0;
-      for await (const chunk of telegram.iterDownload({ file: media, requestSize: 512 * 1024, offset: BigInt(start) as any })) {
+      for await (const rawChunk of telegram.iterDownload({ file: media, requestSize: 512 * 1024, offset: BigInt(start) as any })) {
         if (clientAborted) break;
+        const remaining = chunkSize - downloaded;
+        if (remaining <= 0) break;
+        const chunk = rawChunk.length > remaining ? rawChunk.subarray(0, remaining) : rawChunk;
         downloaded += chunk.length;
         const canContinue = res.write(chunk);
         if (!canContinue) {
@@ -660,7 +871,7 @@ async function tgStreamFile(messageId: number, channelId: string, req: any, res:
       }
       if (!clientAborted) res.end();
     } else {
-      res.setHeader('Content-Type', meta?.mimeType || 'application/octet-stream');
+      res.setHeader('Content-Type', contentType);
       res.setHeader('Accept-Ranges', 'bytes');
       if (totalSize) res.setHeader('Content-Length', totalSize);
       for await (const chunk of telegram.iterDownload({ file: media, requestSize: 512 * 1024 })) {
@@ -683,7 +894,38 @@ async function tgStreamFile(messageId: number, channelId: string, req: any, res:
 }
 
 // Normalise a raw tg_files doc to the standard file shape the frontend expects.
-function normaliseTgFile(f: any, accountId?: string) {
+export function normaliseTgFile(f: any, accountId?: string) {
+  const idStr = String(f.providerFileId || f._id);
+  const updatedAt = typeof f.updatedAt === 'number'
+    ? f.updatedAt
+    : (f.date ? f.date * 1000 : (f.updatedAt ? new Date(f.updatedAt).getTime() : Date.now()));
+
+  if (f.isEncrypted === true) {
+    const encSize = Number(f.encryptedSizeBytes ?? f.size ?? 0);
+    const opaqueName = f.opaqueRemoteName || f.name;
+    return {
+      id:                      idStr,
+      ...(f.messageId !== undefined ? { messageId: f.messageId } : {}),
+      name:                    opaqueName,
+      type:                    'other',
+      mimeType:                'application/octet-stream',
+      size:                    encSize ? (encSize / (1024 ** 2)).toFixed(1) + ' MB' : '0.0 MB',
+      sizeBytes:               encSize,
+      encryptedSizeBytes:      encSize,
+      isEncrypted:             true,
+      encryptionFormatVersion: f.encryptionFormatVersion ?? 1,
+      encryptionKeyId:         f.encryptionKeyId ?? null,
+      encryptedChecksum:       f.encryptedChecksum ?? null,
+      encryptedMetadata:       f.encryptedMetadata ?? null,
+      modified:                f.date ? new Date(f.date * 1000).toLocaleDateString() : '-',
+      createdAt:               f.date ? new Date(f.date * 1000).toLocaleDateString() : '-',
+      folder:                  f.folder || '',
+      isTgDrive:               !f.providerFileId,
+      updatedAt,
+      thumbUrl:                null,
+    };
+  }
+
   const mime = f.mimeType || '';
   let type   = 'other';
   if (mime.includes('image'))        type = 'image';
@@ -697,24 +939,28 @@ function normaliseTgFile(f: any, accountId?: string) {
 
   const isMedia = type === 'image' || type === 'video';
   const accIdStr = accountId || (f.accountId ? String(f.accountId) : '');
-  const idStr = String(f._id);
-  const updatedAt = f.date ? f.date * 1000 : (f.updatedAt ? new Date(f.updatedAt).getTime() : Date.now());
 
   return {
-    id:         idStr,
-    messageId:  f.messageId,
-    name:       f.name,
+    id:                      idStr,
+    messageId:               f.messageId,
+    name:                    f.name,
     type,
-    mimeType:   f.mimeType,
-    size:       f.size ? (Number(f.size) / (1024 ** 2)).toFixed(1) + ' MB' : '-',
-    sizeBytes:  f.size ? Number(f.size) : 0,
-    modified:   f.date ? new Date(f.date * 1000).toLocaleDateString() : '-',
-    createdAt:  f.date ? new Date(f.date * 1000).toLocaleDateString() : '-',
-    folder:     f.folder || '',
-    shareId:    f.shareId,
-    isTgDrive:  true,
+    mimeType:                f.mimeType,
+    size:                    f.size ? (Number(f.size) / (1024 ** 2)).toFixed(1) + ' MB' : '-',
+    sizeBytes:               f.size ? Number(f.size) : 0,
+    isEncrypted:             false,
+    encryptionFormatVersion: null,
+    encryptionKeyId:         null,
+    encryptedSizeBytes:      null,
+    encryptedChecksum:       null,
+    encryptedMetadata:       null,
+    modified:                f.date ? new Date(f.date * 1000).toLocaleDateString() : '-',
+    createdAt:               f.date ? new Date(f.date * 1000).toLocaleDateString() : '-',
+    folder:                  f.folder || '',
+    shareId:                 f.shareId,
+    isTgDrive:               true,
     updatedAt,
-    thumbUrl:   isMedia && accIdStr ? `/api/thumb/${accIdStr}/${idStr}?s=256` : null,
+    thumbUrl:                isMedia && accIdStr ? `/api/thumb/${accIdStr}/${idStr}?s=256` : null,
   };
 }
 
@@ -734,8 +980,12 @@ function sendJsonWithEtag(req: any, res: any, data: any) {
 async function generateThumbnail(account: any, fileId: string, s: number, thumbPath: string): Promise<string | null> {
   const database = db || await connectToMongo();
 
+  const { meta } = await resolveFileMetadataForAccount(database, account, fileId);
+  if (meta?.isEncrypted === true) {
+    return null;
+  }
+
   if (account.accountType === 'tgdrive') {
-    const meta = await database.collection('tg_files').findOne({ _id: new ObjectId(fileId) });
     if (!meta) return null;
 
     const telegram = await getTgClient();
@@ -1032,10 +1282,12 @@ app.delete('/api/admin/users/:id', requireAuth, async (req: any, res: any) => {
     deleteThumbFiles(String(f._id));
   }
 
-  // Cleanup: delete accounts, files, sessions and user
+  // Cleanup: delete accounts, files, sessions, key backups, upload sessions, and user
   await database.collection('accounts').deleteMany({ userId: req.params.id });
   await database.collection('tg_files').deleteMany({ userId: req.params.id });
   await database.collection('tg_folders').deleteMany({ userId: req.params.id });
+  await database.collection('account_encryption_backups').deleteMany({ userId: String(req.params.id) });
+  await database.collection('upload_sessions').deleteMany({ userId: String(req.params.id) });
   await database.collection('sessions').deleteMany({ userId: req.params.id });
   await database.collection('users').deleteOne({ _id: req.params.id });
 
@@ -1248,7 +1500,7 @@ app.get('/api/accounts', requireAuth, async (req: any, res: any) => {
       try {
         const pipeline = [
           { $match: { accountId: acc._id } },
-          { $group: { _id: null, total: { $sum: '$size' }, count: { $sum: 1 } } },
+          { $group: { _id: null, total: { $sum: { $ifNull: ['$encryptedSizeBytes', '$size'] } }, count: { $sum: 1 } } },
         ];
         const [agg] = await database.collection('tg_files').aggregate(pipeline).toArray();
         const usedBytes = agg?.total || 0;
@@ -1282,23 +1534,15 @@ app.get('/api/accounts', requireAuth, async (req: any, res: any) => {
 // ─── /api/storage/summary ─────────────────────────────────────────────────────
 app.get('/api/storage/summary', requireAuth, async (req: any, res: any) => {
   const { accountId } = req.query;
-  const userId        = req.userId;
   const database      = req.db;
 
   if (!accountId || typeof accountId !== 'string') {
     return res.status(400).json({ error: 'accountId is required' });
   }
 
-  let accObjId: ObjectId;
-  try {
-    accObjId = new ObjectId(accountId);
-  } catch {
-    return res.status(400).json({ error: 'Invalid accountId' });
-  }
-
-  const query: any = { _id: accObjId };
-  if (!req.isAdmin && userId) query.userId = String(userId);
-  const account = await database.collection('accounts').findOne(query);
+  const { account, accessDenied, invalidId } = await resolveAuthorizedAccount(database, accountId, req.userId, req.isAdmin);
+  if (invalidId) return res.status(400).json({ error: 'Invalid accountId' });
+  if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
   if (!account) return res.status(404).json({ error: 'Account not found' });
 
   const cacheKey = `storage_summary:${accountId}`;
@@ -1307,18 +1551,25 @@ app.get('/api/storage/summary', requireAuth, async (req: any, res: any) => {
 
   try {
     if (account.accountType === 'tgdrive') {
-      const sizeExpr = { $ifNull: ['$size', 0] };
+      const sizeExpr = { $ifNull: ['$encryptedSizeBytes', { $ifNull: ['$size', 0] }] };
       const mimeExpr = { $ifNull: ['$mimeType', ''] };
       const nameExpr = { $ifNull: ['$name', ''] };
+      const isEncryptedExpr = { $eq: ['$isEncrypted', true] };
 
       const isImage = {
-        $or: [
-          { $regexMatch: { input: mimeExpr, regex: '^image/', options: 'i' } },
-          { $regexMatch: { input: nameExpr, regex: '\\.(jpe?g|png|gif|webp|bmp|svg|heic|ico|tiff?|avif)$', options: 'i' } },
+        $and: [
+          { $not: [isEncryptedExpr] },
+          {
+            $or: [
+              { $regexMatch: { input: mimeExpr, regex: '^image/', options: 'i' } },
+              { $regexMatch: { input: nameExpr, regex: '\\.(jpe?g|png|gif|webp|bmp|svg|heic|ico|tiff?|avif)$', options: 'i' } },
+            ],
+          },
         ],
       };
       const isVideo = {
         $and: [
+          { $not: [isEncryptedExpr] },
           { $not: [isImage] },
           {
             $or: [
@@ -1330,6 +1581,7 @@ app.get('/api/storage/summary', requireAuth, async (req: any, res: any) => {
       };
       const isAudio = {
         $and: [
+          { $not: [isEncryptedExpr] },
           { $not: [{ $or: [isImage, isVideo] }] },
           {
             $or: [
@@ -1341,6 +1593,7 @@ app.get('/api/storage/summary', requireAuth, async (req: any, res: any) => {
       };
       const isArchive = {
         $and: [
+          { $not: [isEncryptedExpr] },
           { $not: [{ $or: [isImage, isVideo, isAudio] }] },
           {
             $or: [
@@ -1352,6 +1605,7 @@ app.get('/api/storage/summary', requireAuth, async (req: any, res: any) => {
       };
       const isDocument = {
         $and: [
+          { $not: [isEncryptedExpr] },
           { $not: [{ $or: [isImage, isVideo, isAudio, isArchive] }] },
           {
             $or: [
@@ -1362,7 +1616,10 @@ app.get('/api/storage/summary', requireAuth, async (req: any, res: any) => {
         ],
       };
       const isOther = {
-        $not: [{ $or: [isImage, isVideo, isAudio, isArchive, isDocument] }],
+        $or: [
+          isEncryptedExpr,
+          { $not: [{ $or: [isImage, isVideo, isAudio, isArchive, isDocument] }] },
+        ],
       };
 
       const pipeline = [
@@ -1422,14 +1679,101 @@ app.get('/api/storage/summary', requireAuth, async (req: any, res: any) => {
 app.delete('/api/accounts/:id', requireAuth, async (req: any, res: any) => {
   const { id }   = req.params;
   const database = req.db;
-  const query: any = { _id: new ObjectId(id) };
-  if (!req.isAdmin) { 
-    if (!req.userId) return res.status(401).json({ error: 'Auth context missing' }); 
-    query.userId = String(req.userId); 
-  }
-  await database.collection('accounts').deleteOne(query);
+  if (!req.isAdmin && !req.userId) return res.status(401).json({ error: 'Auth context missing' });
+  const { account, accessDenied } = await resolveAuthorizedAccount(database, id, req.userId, req.isAdmin);
+  if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
+  if (!account) return apiError(res, 404, 'ACCOUNT_NOT_FOUND', 'Account not found', req.requestId);
+
+  await database.collection('accounts').deleteOne({ _id: account._id });
+  await database.collection('account_encryption_backups').deleteMany({ accountId: String(account._id) });
+  await database.collection('upload_sessions').deleteMany({ accountId: String(account._id) });
   invalidateDriveCache(id);
   res.json({ success: true });
+});
+
+// ─── Key Backup Endpoints (Zero-Knowledge E2EE) ──────────────────────────────
+app.put('/api/accounts/:accountId/encryption/key-backup', requireAuth, async (req: any, res: any) => {
+  const { accountId } = req.params;
+  const database = req.db;
+  const { account, accessDenied } = await resolveAuthorizedAccount(database, accountId, req.userId, req.isAdmin);
+  if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
+  if (!account) return apiError(res, 404, 'ACCOUNT_NOT_FOUND', 'Account not found', req.requestId);
+
+  const validation = validateKeyBackupInput(req.body);
+  if (!validation.ok) {
+    return apiError(res, validation.error.status, validation.error.code, validation.error.message, req.requestId);
+  }
+
+  const now = new Date();
+  const userIdStr = String(account.userId || req.userId || '');
+  const accountIdStr = String(account._id);
+  const existing = await database.collection('account_encryption_backups').findOne({ accountId: accountIdStr, userId: userIdStr });
+  const createdAt = existing?.createdAt || now;
+
+  await database.collection('account_encryption_backups').updateOne(
+    { accountId: accountIdStr, userId: userIdStr },
+    {
+      $set: {
+        userId: userIdStr,
+        accountId: accountIdStr,
+        ...validation.backup,
+        updatedAt: now,
+      },
+      $setOnInsert: {
+        createdAt,
+      },
+    },
+    { upsert: true }
+  );
+
+  return res.json({
+    accountId: accountIdStr,
+    ...validation.backup,
+    createdAt: createdAt instanceof Date ? createdAt.toISOString() : String(createdAt),
+    updatedAt: now.toISOString(),
+  });
+});
+
+app.get('/api/accounts/:accountId/encryption/key-backup', requireAuth, async (req: any, res: any) => {
+  const { accountId } = req.params;
+  const database = req.db;
+  const { account, accessDenied } = await resolveAuthorizedAccount(database, accountId, req.userId, req.isAdmin);
+  if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
+  if (!account) return apiError(res, 404, 'ACCOUNT_NOT_FOUND', 'Account not found', req.requestId);
+
+  const userIdStr = String(account.userId || req.userId || '');
+  const accountIdStr = String(account._id);
+  const doc = await database.collection('account_encryption_backups').findOne({ accountId: accountIdStr, userId: userIdStr });
+  if (!doc) {
+    return apiError(res, 404, 'KEY_BACKUP_NOT_FOUND', 'Encryption key backup not found for this account', req.requestId);
+  }
+
+  return res.json({
+    accountId: doc.accountId,
+    backupVersion: doc.backupVersion,
+    keyId: doc.keyId,
+    kdfAlgorithm: doc.kdfAlgorithm,
+    kdfIterations: doc.kdfIterations,
+    salt: doc.salt,
+    wrapAlgorithm: doc.wrapAlgorithm,
+    nonce: doc.nonce,
+    wrappedKey: doc.wrappedKey,
+    createdAt: doc.createdAt instanceof Date ? doc.createdAt.toISOString() : String(doc.createdAt),
+    updatedAt: doc.updatedAt instanceof Date ? doc.updatedAt.toISOString() : String(doc.updatedAt),
+  });
+});
+
+app.delete('/api/accounts/:accountId/encryption/key-backup', requireAuth, async (req: any, res: any) => {
+  const { accountId } = req.params;
+  const database = req.db;
+  const { account, accessDenied } = await resolveAuthorizedAccount(database, accountId, req.userId, req.isAdmin);
+  if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
+  if (!account) return apiError(res, 404, 'ACCOUNT_NOT_FOUND', 'Account not found', req.requestId);
+
+  const userIdStr = String(account.userId || req.userId || '');
+  const accountIdStr = String(account._id);
+  await database.collection('account_encryption_backups').deleteOne({ accountId: accountIdStr, userId: userIdStr });
+  return res.status(204).end();
 });
 
 // ─── 3. NEW THUMBNAIL ENDPOINT ────────────────────────────────────────────────
@@ -1443,12 +1787,24 @@ app.get('/api/thumb/:accountId/:fileId', requireAuth, async (req: any, res: any)
   s = Math.max(64, Math.min(512, s));
 
   try {
-    const query: any = { _id: new ObjectId(accountId) };
-    if (!req.isAdmin && userId) query.userId = String(userId);
-    const account = await database.collection('accounts').findOne(query);
+    const { account, accessDenied } = await resolveAuthorizedAccount(database, accountId, userId, req.isAdmin);
+    if (accessDenied) {
+      res.setHeader('Cache-Control', 'private, max-age=300');
+      return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
+    }
     if (!account) {
       res.setHeader('Cache-Control', 'private, max-age=300');
       return res.status(404).json({ error: 'Account not found' });
+    }
+
+    const { meta, accessDenied: fileDenied } = await resolveFileMetadataForAccount(database, account, fileId, userId, req.isAdmin);
+    if (fileDenied) {
+      res.setHeader('Cache-Control', 'private, max-age=300');
+      return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this file', req.requestId);
+    }
+    if (meta?.isEncrypted === true) {
+      res.setHeader('Cache-Control', 'no-store');
+      return apiError(res, 409, 'ENCRYPTED_PREVIEW_UNAVAILABLE', 'Encrypted file preview is not available on the server', req.requestId);
     }
 
     const etag = `"${fileId}_${s}"`;
@@ -1509,15 +1865,19 @@ app.get('/api/files', requireAuth, async (req: any, res: any) => {
   const database      = req.db;
   if (!accountId || !database) return res.json([]);
 
-  const query: any = { _id: new ObjectId(accountId as string) };
-  if (!req.isAdmin && userId) query.userId = String(userId);
-  const account = await database.collection('accounts').findOne(query);
+  const { account, accessDenied } = await resolveAuthorizedAccount(database, accountId as string, userId, req.isAdmin);
+  if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
   if (!account) return res.status(404).json({ error: 'Account not found' });
+
+  const folderCheck = validateSafeFolderId(folderId);
+  if (!folderCheck.ok) {
+    return apiError(res, folderCheck.error.status, folderCheck.error.code, folderCheck.error.message, req.requestId);
+  }
 
   try {
     // ── TG Drive ──────────────────────────────────────────────────────────────
     if (account.accountType === 'tgdrive') {
-      const currentFolder = (!folderId || folderId === 'root') ? '' : (folderId as string);
+      const currentFolder = folderCheck.folderId === 'root' ? '' : folderCheck.folderId;
 
       let limit = parseInt(req.query.limit as string, 10);
       if (isNaN(limit) || limit < 1) limit = 100;
@@ -1537,9 +1897,10 @@ app.get('/api/files', requireAuth, async (req: any, res: any) => {
         } catch { /* ignore invalid cursor */ }
       }
 
-      const fileFilter: any = { accountId: new ObjectId(accountId as string) };
+      const fileFilter: any = { accountId: account._id };
       if (search) {
         const escaped = escapeRegex(search as string);
+        // Never search inside encryptedMetadata; only match on name (which is opaque for encrypted files)
         fileFilter.name = new RegExp(escaped, 'i');
       } else {
         fileFilter.folder = currentFolder;
@@ -1572,7 +1933,7 @@ app.get('/api/files', requireAuth, async (req: any, res: any) => {
         const escapedFolder = currentFolder ? escapeRegex(currentFolder) + '/' : '';
         const folderDocs = await database.collection('tg_folders')
           .find({
-            accountId: new ObjectId(accountId as string),
+            accountId: account._id,
             path: { $regex: `^${escapedFolder}[^/]+$` }
           })
           .toArray();
@@ -1623,7 +1984,43 @@ app.get('/api/files', requireAuth, async (req: any, res: any) => {
       rawFiles = list.data.files || [];
     }
 
+    const encryptedRecords = await database.collection('tg_files')
+      .find({ accountId: account._id, isEncrypted: true })
+      .toArray();
+    const encryptedByProviderId = new Map<string, any>();
+    const encryptedByOpaqueName = new Map<string, any>();
+    for (const rec of encryptedRecords) {
+      if (rec.providerFileId) encryptedByProviderId.set(String(rec.providerFileId), rec);
+      if (rec.opaqueRemoteName) encryptedByOpaqueName.set(String(rec.opaqueRemoteName), rec);
+      if (rec.name) encryptedByOpaqueName.set(String(rec.name), rec);
+    }
+
     const files = rawFiles.map((f: any) => {
+      const encMeta = encryptedByProviderId.get(String(f.id)) || encryptedByOpaqueName.get(String(f.name));
+      const updatedAt = f.modifiedTime ? new Date(f.modifiedTime).getTime() : Date.now();
+      if (encMeta && encMeta.isEncrypted === true) {
+        const encSize = Number(encMeta.encryptedSizeBytes ?? f.size ?? encMeta.size ?? 0);
+        return {
+          id: f.id,
+          name: encMeta.opaqueRemoteName || f.name,
+          type: 'other',
+          mimeType: 'application/octet-stream',
+          size: encSize ? (encSize / (1024 ** 2)).toFixed(1) + ' MB' : '0.0 MB',
+          sizeBytes: encSize,
+          encryptedSizeBytes: encSize,
+          modified: f.modifiedTime ? new Date(f.modifiedTime).toLocaleDateString() : '-',
+          createdAt: f.createdTime ? new Date(f.createdTime).toLocaleDateString() : '-',
+          webViewLink: f.webViewLink,
+          updatedAt,
+          thumbUrl: null,
+          isEncrypted: true,
+          encryptionFormatVersion: encMeta.encryptionFormatVersion ?? 1,
+          encryptionKeyId: encMeta.encryptionKeyId ?? null,
+          encryptedChecksum: encMeta.encryptedChecksum ?? null,
+          encryptedMetadata: encMeta.encryptedMetadata ?? null,
+        };
+      }
+
       const mime = f.mimeType || '';
       let type   = 'other';
       if (mime.includes('folder') || mime === 'folder') type = 'folder';
@@ -1637,12 +2034,12 @@ app.get('/api/files', requireAuth, async (req: any, res: any) => {
       else if (mime.includes('zip') || mime.includes('rar') || mime.includes('7z')) type = 'zip';
 
       const isMedia = type === 'image' || type === 'video';
-      const updatedAt = f.modifiedTime ? new Date(f.modifiedTime).getTime() : Date.now();
 
       return {
         id: f.id,
         name: f.name,
         type,
+        mimeType: mime || 'application/octet-stream',
         size: f.size ? (Number(f.size) / (1024 ** 2)).toFixed(1) + ' MB' : '-',
         sizeBytes: f.size ? Number(f.size) : 0,
         modified: f.modifiedTime ? new Date(f.modifiedTime).toLocaleDateString() : '-',
@@ -1650,6 +2047,7 @@ app.get('/api/files', requireAuth, async (req: any, res: any) => {
         webViewLink: f.webViewLink,
         updatedAt,
         thumbUrl: isMedia ? `/api/thumb/${accountId}/${f.id}?s=256` : null,
+        isEncrypted: false,
       };
     });
 
@@ -1668,14 +2066,14 @@ app.delete('/api/files/:fileId', requireAuth, async (req: any, res: any) => {
   const userId        = req.userId;
   const database      = req.db;
 
-  const query: any = { _id: new ObjectId(accountId as string) };
-  if (!req.isAdmin && userId) query.userId = String(userId);
-  const account = await database.collection('accounts').findOne(query);
+  const { account, accessDenied } = await resolveAuthorizedAccount(database, accountId as string, userId, req.isAdmin);
+  if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
   if (!account) return res.status(404).json({ error: 'Account not found' });
 
   try {
     if (account.accountType === 'tgdrive') {
-      const meta = await database.collection('tg_files').findOne({ _id: new ObjectId(fileId) });
+      const { meta, accessDenied: fileDenied } = await resolveFileMetadataForAccount(database, account, fileId, userId, req.isAdmin);
+      if (fileDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this file', req.requestId);
       if (!meta) return res.status(404).json({ error: 'File not found' });
       
       const referenceCount = await database.collection('tg_files').countDocuments({ messageId: meta.messageId, accountId: meta.accountId });
@@ -1686,13 +2084,15 @@ app.delete('/api/files/:fileId', requireAuth, async (req: any, res: any) => {
         try { await telegram.deleteMessages(peer, [meta.messageId], { revoke: true }); } catch { /* message may already be gone */ }
       }
       
-      await database.collection('tg_files').deleteOne({ _id: new ObjectId(fileId) });
+      await database.collection('tg_files').deleteOne({ _id: meta._id });
     } else if (account.accountType === 'onedrive') {
       const c = await getOneDriveClient(account.tokens || account.credentials, account._id.toString());
       await c.api(`/me/drive/items/${fileId}`).delete();
+      await database.collection('tg_files').deleteMany({ accountId: account._id, providerFileId: String(fileId) });
     } else {
       const drive = await getDriveClient(account.tokens || account.credentials);
       await drive.files.delete({ fileId });
+      await database.collection('tg_files').deleteMany({ accountId: account._id, providerFileId: String(fileId) });
     }
 
     deleteThumbFiles(fileId);
@@ -1711,20 +2111,39 @@ app.patch('/api/files/:fileId', requireAuth, async (req: any, res: any) => {
   const userId        = req.userId;
   const database      = req.db;
 
-  const query: any = { _id: new ObjectId(accountId as string) };
-  if (!req.isAdmin && userId) query.userId = String(userId);
-  const account = await database.collection('accounts').findOne(query);
+  const { account, accessDenied } = await resolveAuthorizedAccount(database, accountId as string, userId, req.isAdmin);
+  if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
   if (!account) return res.status(404).json({ error: 'Account not found' });
+
+  const { meta, accessDenied: fileDenied } = await resolveFileMetadataForAccount(database, account, fileId, userId, req.isAdmin);
+  if (fileDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this file', req.requestId);
+
+  if (meta?.isEncrypted === true) {
+    const opaqueErr = validateOpaqueFilename(name);
+    if (opaqueErr) return apiError(res, opaqueErr.status, opaqueErr.code, opaqueErr.message, req.requestId);
+  } else {
+    const plainErr = validatePlaintextFilename(name);
+    if (plainErr) return apiError(res, plainErr.status, plainErr.code, plainErr.message, req.requestId);
+  }
 
   try {
     if (account.accountType === 'tgdrive') {
-      await database.collection('tg_files').updateOne({ _id: new ObjectId(fileId) }, { $set: { name } });
+      if (!meta) return res.status(404).json({ error: 'File not found' });
+      const updateFields: any = { name, updatedAt: new Date() };
+      if (meta.isEncrypted === true) updateFields.opaqueRemoteName = name;
+      await database.collection('tg_files').updateOne({ _id: meta._id }, { $set: updateFields });
     } else if (account.accountType === 'onedrive') {
       const c = await getOneDriveClient(account.tokens || account.credentials, account._id.toString());
       await c.api(`/me/drive/items/${fileId}`).patch({ name });
+      if (meta) {
+        await database.collection('tg_files').updateOne({ _id: meta._id }, { $set: { name, opaqueRemoteName: name, updatedAt: new Date() } });
+      }
     } else {
       const drive = await getDriveClient(account.tokens || account.credentials);
       await drive.files.update({ fileId, requestBody: { name } });
+      if (meta) {
+        await database.collection('tg_files').updateOne({ _id: meta._id }, { $set: { name, opaqueRemoteName: name, updatedAt: new Date() } });
+      }
     }
     invalidateDriveCache(accountId as string);
     res.json({ success: true });
@@ -1740,18 +2159,22 @@ app.post('/api/folders', requireAuth, async (req: any, res: any) => {
   const userId        = req.userId;
   const database      = req.db;
 
-  const query: any = { _id: new ObjectId(accountId as string) };
-  if (!req.isAdmin && userId) query.userId = String(userId);
-  const account = await database.collection('accounts').findOne(query);
+  const { account, accessDenied } = await resolveAuthorizedAccount(database, accountId as string, userId, req.isAdmin);
+  if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
   if (!account) return res.status(404).json({ error: 'Account not found' });
+
+  const nameErr = validatePlaintextFilename(name);
+  if (nameErr) return apiError(res, nameErr.status, nameErr.code, nameErr.message, req.requestId);
+  const folderCheck = validateSafeFolderId(parentId);
+  if (!folderCheck.ok) return apiError(res, folderCheck.error.status, folderCheck.error.code, folderCheck.error.message, req.requestId);
 
   try {
     if (account.accountType === 'tgdrive') {
-      const parentPath = (!parentId || parentId === 'root') ? '' : parentId;
+      const parentPath = folderCheck.folderId === 'root' ? '' : folderCheck.folderId;
       const folderPath = parentPath ? `${parentPath}/${name}` : name;
       await database.collection('tg_folders').updateOne(
-        { accountId: new ObjectId(accountId as string), path: folderPath },
-        { $set: { accountId: new ObjectId(accountId as string), name, path: folderPath, createdAt: Math.floor(Date.now() / 1000) } },
+        { accountId: account._id, path: folderPath },
+        { $set: { accountId: account._id, name, path: folderPath, createdAt: Math.floor(Date.now() / 1000) } },
         { upsert: true }
       );
     } else if (account.accountType === 'onedrive') {
@@ -1785,9 +2208,9 @@ async function uploadOneDriveResumable(
   const parentPath = (!folderId || folderId === 'root') ? '/me/drive/root' : `/me/drive/items/${folderId}`;
   const encodedName = encodeURIComponent(file.originalname);
   if (file.size === 0) {
-    await c.api(`${parentPath}:/${encodedName}:/content`).put(fs.createReadStream(file.path));
+    const resZero = await c.api(`${parentPath}:/${encodedName}:/content`).put(fs.createReadStream(file.path));
     await persist({ providerType: 'onedrive', completed: true, nextOffset: 0 });
-    return;
+    return resZero;
   }
   const createSession = async () => {
     const result = await c.api(`${parentPath}:/${encodedName}:/createUploadSession`).post({
@@ -1966,7 +2389,7 @@ async function uploadGoogleDriveResumable(
 async function uploadFileToProvider(
   account: any, accountId: string, file: ProviderUploadFile, folderId?: string,
   providerSession?: PersistedProviderSession, persistProviderSession?: (state: PersistedProviderSession) => Promise<void>,
-  idempotencyKey?: string
+  idempotencyKey?: string, encryptionSpec?: ValidatedUploadSpec, userId?: string
 ) {
   const providerType = transferProviderType(account.accountType);
   if (!providerType) {
@@ -1974,37 +2397,112 @@ async function uploadFileToProvider(
     err.code = 'UNSUPPORTED_PROVIDER_OPERATION';
     throw err;
   }
-  await providerLimit(`upload:${providerType}:${accountId}`, providerType === 'telegram' ? 2 : 3)(async () => {
+  return providerLimit(`upload:${providerType}:${accountId}`, providerType === 'telegram' ? 2 : 3)(async () => {
+    const database = db || await connectToMongo();
     if (providerType === 'telegram') {
       const folder = (!folderId || folderId === 'root') ? '' : folderId;
-      await tgUploadFile(accountId, account.channelId, file.path, file.originalname, file.mimetype, folder, '', idempotencyKey);
+      return await tgUploadFile(accountId, account.channelId, file.path, file.originalname, file.mimetype, folder, '', idempotencyKey, encryptionSpec, userId || account.userId);
     } else if (providerType === 'onedrive') {
+      let result: any;
       if (persistProviderSession) {
-        await uploadOneDriveResumable(account, accountId, file, folderId, providerSession, persistProviderSession);
+        result = await uploadOneDriveResumable(account, accountId, file, folderId, providerSession, persistProviderSession);
       } else {
         const c = await getOneDriveClient(account.tokens || account.credentials, accountId);
         const parentPath = (!folderId || folderId === 'root') ? '/me/drive/root' : `/me/drive/items/${folderId}`;
         const encodedName = encodeURIComponent(file.originalname);
         if (file.size <= 4 * 1024 * 1024) {
-          await c.api(`${parentPath}:/${encodedName}:/content`).put(fs.createReadStream(file.path));
+          result = await c.api(`${parentPath}:/${encodedName}:/content`).put(fs.createReadStream(file.path));
         } else {
           const session = await c.api(`${parentPath}:/${encodedName}:/createUploadSession`).post({ item: { '@microsoft.graph.conflictBehavior': 'replace', name: file.originalname } });
           const chunkSize = 320 * 1024 * 10;
           for (let start = 0; start < file.size; start += chunkSize) {
             const end = Math.min(start + chunkSize, file.size);
-            await axios.put(session.uploadUrl, fs.createReadStream(file.path, { start, end: end - 1 }), {
+            const r = await axios.put(session.uploadUrl, fs.createReadStream(file.path, { start, end: end - 1 }), {
               headers: { 'Content-Range': `bytes ${start}-${end - 1}/${file.size}`, 'Content-Length': end - start }
             });
+            if (r.data) result = r.data;
           }
         }
       }
+      if (encryptionSpec?.isEncrypted) {
+        const remoteId = String(result?.id || file.originalname);
+        const now = new Date();
+        await database.collection('tg_files').updateOne(
+          { accountId: account._id, providerFileId: remoteId },
+          {
+            $set: {
+              accountId: account._id,
+              userId: String(userId || account.userId || ''),
+              providerType: 'onedrive',
+              providerFileId: remoteId,
+              name: encryptionSpec.fileName,
+              opaqueRemoteName: encryptionSpec.opaqueRemoteName,
+              mimeType: 'application/octet-stream',
+              size: file.size,
+              folder: (!folderId || folderId === 'root') ? '' : folderId,
+              date: Math.floor(Date.now() / 1000),
+              isEncrypted: true,
+              encryptionFormatVersion: encryptionSpec.encryptionFormatVersion,
+              encryptionKeyId: encryptionSpec.encryptionKeyId,
+              encryptedMetadata: encryptionSpec.encryptedMetadata,
+              encryptedSizeBytes: file.size,
+              encryptedChecksum: encryptionSpec.checksum,
+              plaintextSizeBytes: null,
+              plaintextChecksum: null,
+              encryptedThumbnailObjectId: null,
+              shareId: null,
+              updatedAt: now,
+            },
+            $setOnInsert: { createdAt: now },
+          },
+          { upsert: true }
+        );
+      }
+      return result;
     } else if (providerType === 'google_drive') {
+      let result: any;
       if (persistProviderSession) {
-        await uploadGoogleDriveResumable(account, file, folderId, providerSession, persistProviderSession, idempotencyKey);
+        result = await uploadGoogleDriveResumable(account, file, folderId, providerSession, persistProviderSession, idempotencyKey);
       } else {
         const drive = await getDriveClient(account.tokens || account.credentials);
-        await drive.files.create({ requestBody: { name: file.originalname, parents: [folderId || 'root'] }, media: { mimeType: file.mimetype, body: fs.createReadStream(file.path) } });
+        const r = await drive.files.create({ requestBody: { name: file.originalname, parents: [folderId || 'root'] }, media: { mimeType: file.mimetype, body: fs.createReadStream(file.path) }, fields: 'id,name' });
+        result = r.data;
       }
+      if (encryptionSpec?.isEncrypted) {
+        const remoteId = String(result?.id || file.originalname);
+        const now = new Date();
+        await database.collection('tg_files').updateOne(
+          { accountId: account._id, providerFileId: remoteId },
+          {
+            $set: {
+              accountId: account._id,
+              userId: String(userId || account.userId || ''),
+              providerType: 'google_drive',
+              providerFileId: remoteId,
+              name: encryptionSpec.fileName,
+              opaqueRemoteName: encryptionSpec.opaqueRemoteName,
+              mimeType: 'application/octet-stream',
+              size: file.size,
+              folder: (!folderId || folderId === 'root') ? '' : folderId,
+              date: Math.floor(Date.now() / 1000),
+              isEncrypted: true,
+              encryptionFormatVersion: encryptionSpec.encryptionFormatVersion,
+              encryptionKeyId: encryptionSpec.encryptionKeyId,
+              encryptedMetadata: encryptionSpec.encryptedMetadata,
+              encryptedSizeBytes: file.size,
+              encryptedChecksum: encryptionSpec.checksum,
+              plaintextSizeBytes: null,
+              plaintextChecksum: null,
+              encryptedThumbnailObjectId: null,
+              shareId: null,
+              updatedAt: now,
+            },
+            $setOnInsert: { createdAt: now },
+          },
+          { upsert: true }
+        );
+      }
+      return result;
     } else {
       const err: any = new Error(`Provider '${String(account.accountType || 'unknown')}' does not support upload`);
       err.code = 'UNSUPPORTED_PROVIDER_OPERATION';
@@ -2025,9 +2523,7 @@ function uploadSessionId() {
 }
 
 async function findUploadAccount(req: any, accountId: string) {
-  const query: any = { _id: new ObjectId(accountId) };
-  if (!req.isAdmin && req.userId) query.userId = String(req.userId);
-  return req.db.collection('accounts').findOne(query);
+  return resolveAuthorizedAccount(req.db, accountId, req.userId, req.isAdmin);
 }
 
 // ─── Resumable upload sessions ────────────────────────────────────────────────
@@ -2049,10 +2545,35 @@ async function sweepUploadSessions() {
 }
 
 function publicUploadSession(session: any) {
-  return { sessionId: session.sessionId, status: session.status, receivedBytes: session.receivedBytes, totalBytes: session.totalBytes, chunkSize: session.chunkSize, checksum: session.checksum, providerType: session.providerType, providerResumable: session.providerResumable, providerCancellable: session.providerCancellable, accountId: session.accountId, parentFolderId: session.folderId, providerMetadata: session.providerSession || null, expiresAt: session.expiresAt };
+  return {
+    sessionId: session.sessionId,
+    status: session.status,
+    receivedBytes: session.receivedBytes,
+    totalBytes: session.totalBytes,
+    chunkSize: session.chunkSize,
+    checksum: session.checksum,
+    providerType: session.providerType,
+    providerResumable: session.providerResumable,
+    providerCancellable: session.providerCancellable,
+    accountId: session.accountId,
+    parentFolderId: session.folderId,
+    providerMetadata: session.providerSession || null,
+    expiresAt: session.expiresAt,
+    isEncrypted: Boolean(session.isEncrypted),
+    encryptionFormatVersion: session.isEncrypted ? (session.encryptionFormatVersion ?? 1) : null,
+    encryptionKeyId: session.isEncrypted ? (session.encryptionKeyId ?? null) : null,
+    encryptedMetadata: session.isEncrypted ? (session.encryptedMetadata ?? null) : null,
+    opaqueRemoteName: session.isEncrypted ? (session.opaqueRemoteName ?? session.fileName) : null,
+    encryptedSizeBytes: session.isEncrypted ? (session.encryptedSizeBytes ?? session.totalBytes) : null,
+  };
 }
-async function ownedUploadSession(req: any, sessionId: string) {
-  return req.db.collection('upload_sessions').findOne({ sessionId, userId: String(req.userId || '') });
+async function resolveUploadSessionForRequest(req: any, sessionId: string): Promise<{ session: any | null; accessDenied: boolean }> {
+  const session = await req.db.collection('upload_sessions').findOne({ sessionId });
+  if (!session) return { session: null, accessDenied: false };
+  if (!req.isAdmin && String(session.userId || '') !== String(req.userId || '')) {
+    return { session: null, accessDenied: true };
+  }
+  return { session, accessDenied: false };
 }
 async function expireUploadSessionIfNeeded(sessions: any, session: any) {
   if (session.status === 'completed' && session.completedAt && Date.now() - new Date(session.completedAt).getTime() > COMPLETED_SESSION_TTL_MS) { await sessions.deleteOne({ sessionId: session.sessionId, status: 'completed' }); session.status = 'retained-expired'; }
@@ -2065,23 +2586,67 @@ async function expireUploadSessionIfNeeded(sessions: any, session: any) {
 }
 app.post('/api/upload-sessions/:accountId', requireAuth, async (req: any, res: any) => {
   const { accountId } = req.params;
-  const { fileName, mimeType = 'application/octet-stream', size, folderId = 'root', checksum, idempotencyKey, providerType: requestedProviderType, desiredChunkSize } = req.body || {};
-  if (!fileName || !Number.isFinite(Number(size)) || Number(size) < 0 || !idempotencyKey) {
+  const {
+    fileName,
+    mimeType = 'application/octet-stream',
+    size,
+    folderId = 'root',
+    checksum,
+    idempotencyKey,
+    providerType: requestedProviderType,
+    desiredChunkSize,
+    isEncrypted,
+    encryptionFormatVersion,
+    encryptionKeyId,
+    encryptedMetadata,
+    opaqueRemoteName,
+    encryptedSizeBytes,
+  } = req.body || {};
+
+  if (!idempotencyKey || typeof idempotencyKey !== 'string' || !idempotencyKey.trim()) {
     return apiError(res, 400, 'INVALID_UPLOAD_SESSION', 'fileName, size, and idempotencyKey are required', req.requestId);
   }
-  const account = await findUploadAccount(req, accountId);
+
+  const { account, accessDenied } = await findUploadAccount(req, accountId);
+  if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
   if (!account) return apiError(res, 404, 'ACCOUNT_NOT_FOUND', 'Account not found', req.requestId);
+
   const resolvedProviderType = transferProviderType(account.accountType);
   if (!resolvedProviderType) return apiError(res, 422, 'UNSUPPORTED_PROVIDER_OPERATION', `Provider '${String(account.accountType || 'unknown')}' cannot upload`, req.requestId);
   if (requestedProviderType && transferProviderType(requestedProviderType) !== resolvedProviderType) {
     return apiError(res, 409, 'ACCOUNT_PROVIDER_MISMATCH', 'Requested provider does not match the selected account', req.requestId);
   }
+
+  const validation = validateUploadRequest({
+    fileName,
+    mimeType,
+    size,
+    folderId,
+    checksum,
+    isEncrypted,
+    encryptionFormatVersion,
+    encryptionKeyId,
+    encryptedMetadata,
+    opaqueRemoteName,
+    encryptedSizeBytes,
+  });
+  if (!validation.ok) {
+    return apiError(res, validation.error.status, validation.error.code, validation.error.message, req.requestId);
+  }
+  const spec = validation.spec;
+
   const sessions = req.db.collection('upload_sessions');
   const existing = await sessions.findOne({ userId: String(req.userId || ''), accountId, idempotencyKey, status: { $in: ['active', 'completed', 'completing'] } });
   if (existing) {
     await expireUploadSessionIfNeeded(sessions, existing);
     if (existing.status !== 'expired' && existing.status !== 'retained-expired') {
-      if (existing.totalBytes !== Number(size) || existing.fileName !== fileName || (existing.checksum && checksum && existing.checksum !== checksum)) {
+      if (
+        existing.totalBytes !== spec.size ||
+        existing.fileName !== spec.fileName ||
+        Boolean(existing.isEncrypted) !== spec.isEncrypted ||
+        (existing.checksum && spec.checksum && existing.checksum !== spec.checksum) ||
+        (spec.isEncrypted && existing.encryptionKeyId !== spec.encryptionKeyId)
+      ) {
         return apiError(res, 409, 'IDEMPOTENCY_KEY_REUSED', 'Idempotency key is already bound to different upload metadata', req.requestId);
       }
       return res.json(publicUploadSession(existing));
@@ -2090,12 +2655,34 @@ app.post('/api/upload-sessions/:accountId', requireAuth, async (req: any, res: a
   const requestedChunk = Number(desiredChunkSize);
   const chunkSize = Number.isFinite(requestedChunk) && requestedChunk > 0 ? Math.max(256 * 1024, Math.min(16 * 1024 * 1024, requestedChunk)) : 8 * 1024 * 1024;
   const session = {
-    sessionId: uploadSessionId(), userId: String(req.userId || ''), accountId, folderId, fileName,
-    mimeType, totalBytes: Number(size), receivedBytes: 0, chunkSize, checksum: checksum || null,
-    idempotencyKey, providerType: resolvedProviderType, providerSession: null, providerMetadata: req.body.providerMetadata || null, expiresAt: new Date(Date.now() + UPLOAD_SESSION_TTL_MS),
+    sessionId: uploadSessionId(),
+    userId: String(req.userId || ''),
+    accountId,
+    folderId: spec.folderId,
+    fileName: spec.fileName,
+    mimeType: spec.mimeType,
+    totalBytes: spec.size,
+    receivedBytes: 0,
+    chunkSize,
+    checksum: spec.checksum,
+    idempotencyKey,
+    providerType: resolvedProviderType,
+    providerSession: null,
+    providerMetadata: req.body.providerMetadata || null,
+    isEncrypted: spec.isEncrypted,
+    encryptionFormatVersion: spec.encryptionFormatVersion,
+    encryptionKeyId: spec.encryptionKeyId,
+    encryptedMetadata: spec.encryptedMetadata,
+    opaqueRemoteName: spec.opaqueRemoteName,
+    encryptedSizeBytes: spec.encryptedSizeBytes,
+    committedChunks: [],
+    expiresAt: new Date(Date.now() + UPLOAD_SESSION_TTL_MS),
     providerResumable: resolvedProviderType !== 'telegram',
     providerCancellable: resolvedProviderType === 'onedrive',
-    tempPath: path.join(os.tmpdir(), `transfer_${nanoid(18)}.part`), status: 'active', createdAt: new Date(), updatedAt: new Date()
+    tempPath: path.join(os.tmpdir(), `transfer_${nanoid(18)}.part`),
+    status: 'active',
+    createdAt: new Date(),
+    updatedAt: new Date(),
   };
   await sessions.insertOne(session);
   if (session.totalBytes === 0) {
@@ -2106,16 +2693,24 @@ app.post('/api/upload-sessions/:accountId', requireAuth, async (req: any, res: a
 });
 app.get('/api/upload-sessions/:sessionId', requireAuth, async (req: any, res: any) => {
   const sessions = req.db.collection('upload_sessions');
-  const session = await ownedUploadSession(req, req.params.sessionId);
+  const { session, accessDenied } = await resolveUploadSessionForRequest(req, req.params.sessionId);
+  if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this upload session', req.requestId);
   if (!session) return apiError(res, 404, 'UPLOAD_SESSION_NOT_FOUND', 'Upload session not found', req.requestId);
   await expireUploadSessionIfNeeded(sessions, session);
   return res.json(publicUploadSession(session));
 });
 app.put('/api/upload-sessions/:sessionId/chunks', requireAuth, upload.single('chunk'), async (req: any, res: any) => withSessionLock(req.params.sessionId, async () => {
   const sessions = req.db.collection('upload_sessions');
-  const session = await ownedUploadSession(req, req.params.sessionId);
+  const { session, accessDenied } = await resolveUploadSessionForRequest(req, req.params.sessionId);
   const chunk = req.file;
-  if (!session) return apiError(res, 404, 'UPLOAD_SESSION_NOT_FOUND', 'Upload session not found', req.requestId);
+  if (accessDenied) {
+    if (chunk?.path && fs.existsSync(chunk.path)) { try { fs.unlinkSync(chunk.path); } catch { /* ignore */ } }
+    return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this upload session', req.requestId);
+  }
+  if (!session) {
+    if (chunk?.path && fs.existsSync(chunk.path)) { try { fs.unlinkSync(chunk.path); } catch { /* ignore */ } }
+    return apiError(res, 404, 'UPLOAD_SESSION_NOT_FOUND', 'Upload session not found', req.requestId);
+  }
   await expireUploadSessionIfNeeded(sessions, session);
   if (session.status === 'expired') return apiError(res, 410, 'UPLOAD_SESSION_EXPIRED', 'Upload session expired', req.requestId, true);
   if (session.status !== 'active') return apiError(res, 409, 'UPLOAD_SESSION_NOT_ACTIVE', `Upload session is ${session.status}`, req.requestId);
@@ -2132,7 +2727,7 @@ app.put('/api/upload-sessions/:sessionId/chunks', requireAuth, upload.single('ch
     // Exact replay after a lost response is acknowledged only when bytes match the durable file.
     if (start < session.receivedBytes) {
       if (end >= session.receivedBytes || !fs.existsSync(session.tempPath) || fs.statSync(session.tempPath).size < end + 1) {
-        return apiError(res, 409, 'UPLOAD_OFFSET_CONFLICT', `Expected offset ${session.receivedBytes}`, req.requestId);
+        return apiError(res, 409, 'UPLOAD_SESSION_OFFSET_CONFLICT', `Expected offset ${session.receivedBytes}`, req.requestId);
       }
       const existing = Buffer.alloc(chunk.size);
       const fd = fs.openSync(session.tempPath, 'r');
@@ -2140,17 +2735,17 @@ app.put('/api/upload-sessions/:sessionId/chunks', requireAuth, upload.single('ch
       const incoming = fs.readFileSync(chunk.path);
       const committed = (session.committedChunks || []).find((item: any) => item.offset === start && item.length === chunk.size);
       const incomingDigest = crypto.createHash('sha256').update(incoming).digest('hex');
-      if (!committed || committed.checksum !== incomingDigest || !existing.equals(incoming)) return apiError(res, 409, 'UPLOAD_OFFSET_CONFLICT', 'Repeated chunk bytes differ from the committed chunk', req.requestId);
+      if (!committed || committed.checksum !== incomingDigest || !existing.equals(incoming)) return apiError(res, 409, 'UPLOAD_SESSION_OFFSET_CONFLICT', 'Repeated chunk bytes differ from the committed chunk', req.requestId);
       return res.json({ sessionId: session.sessionId, receivedBytes: session.receivedBytes, totalBytes: session.totalBytes, nextOffset: session.receivedBytes, complete: session.receivedBytes === session.totalBytes });
     }
-    if (start !== session.receivedBytes) return apiError(res, 409, 'UPLOAD_OFFSET_CONFLICT', `Expected offset ${session.receivedBytes}`, req.requestId);
+    if (start !== session.receivedBytes) return apiError(res, 409, 'UPLOAD_SESSION_OFFSET_CONFLICT', `Expected offset ${session.receivedBytes}`, req.requestId);
     if (!hasTempDiskHeadroom(chunk.size)) return apiError(res, 507, 'INSUFFICIENT_STORAGE', 'Server temporary storage is too low', req.requestId);
     chunkLockOwner = nanoid(16);
     const acquired = await sessions.updateOne({
-      sessionId: session.sessionId, userId: String(req.userId || ''), status: 'active', receivedBytes: session.receivedBytes,
+      sessionId: session.sessionId, userId: String(session.userId || ''), status: 'active', receivedBytes: session.receivedBytes,
       $or: [{ chunkLeaseExpiresAt: { $exists: false } }, { chunkLeaseExpiresAt: { $lte: Date.now() } }]
     }, { $set: { chunkLeaseOwner: chunkLockOwner, chunkLeaseExpiresAt: Date.now() + 2 * 60 * 1000 } });
-    if (acquired.modifiedCount !== 1) return apiError(res, 409, 'UPLOAD_OFFSET_CONFLICT', 'Another chunk write is in progress', req.requestId);
+    if (acquired.modifiedCount !== 1) return apiError(res, 409, 'UPLOAD_SESSION_OFFSET_CONFLICT', 'Another chunk write is in progress', req.requestId);
     fs.mkdirSync(path.dirname(session.tempPath), { recursive: true });
     const existingSize = fs.existsSync(session.tempPath) ? fs.statSync(session.tempPath).size : 0;
     if (existingSize < session.receivedBytes) return apiError(res, 500, 'UPLOAD_STORAGE_CORRUPT', 'Staged file is shorter than its committed offset', req.requestId);
@@ -2159,8 +2754,8 @@ app.put('/api/upload-sessions/:sessionId/chunks', requireAuth, upload.single('ch
     const receivedBytes = session.receivedBytes + chunk.size;
     const chunkChecksum = crypto.createHash('sha256').update(fs.readFileSync(chunk.path)).digest('hex');
     const committedChunks = [...(session.committedChunks || []), { offset: start, length: chunk.size, checksum: chunkChecksum }];
-    const updated = await sessions.updateOne({ sessionId: session.sessionId, userId: String(req.userId || ''), status: 'active', receivedBytes: session.receivedBytes, chunkLeaseOwner: chunkLockOwner }, { $set: { receivedBytes, committedChunks, updatedAt: new Date() }, $unset: { chunkLeaseOwner: '', chunkLeaseExpiresAt: '' } });
-    if (updated.modifiedCount !== 1) return apiError(res, 409, 'UPLOAD_OFFSET_CONFLICT', 'Upload session changed while writing this chunk', req.requestId);
+    const updated = await sessions.updateOne({ sessionId: session.sessionId, userId: String(session.userId || ''), status: 'active', receivedBytes: session.receivedBytes, chunkLeaseOwner: chunkLockOwner }, { $set: { receivedBytes, committedChunks, updatedAt: new Date() }, $unset: { chunkLeaseOwner: '', chunkLeaseExpiresAt: '' } });
+    if (updated.modifiedCount !== 1) return apiError(res, 409, 'UPLOAD_SESSION_OFFSET_CONFLICT', 'Upload session changed while writing this chunk', req.requestId);
     chunkLockOwner = null;
     return res.json({ sessionId: session.sessionId, receivedBytes, totalBytes: session.totalBytes, nextOffset: receivedBytes, complete: receivedBytes === session.totalBytes });
   } finally {
@@ -2168,12 +2763,14 @@ app.put('/api/upload-sessions/:sessionId/chunks', requireAuth, upload.single('ch
       try { if (session.tempPath && fs.existsSync(session.tempPath)) fs.truncateSync(session.tempPath, session.receivedBytes); } catch (rollbackError) { console.error(JSON.stringify({ event: 'upload_chunk_rollback_failed', sessionId: session.sessionId, correlationId: req.requestId, error: String(rollbackError) })); }
       await sessions.updateOne({ sessionId: session.sessionId, chunkLeaseOwner: chunkLockOwner }, { $unset: { chunkLeaseOwner: '', chunkLeaseExpiresAt: '' } });
     }
-    if (chunk.path && fs.existsSync(chunk.path)) { try { fs.unlinkSync(chunk.path); } catch { /* janitor will retry */ } }
+    if (chunk?.path && fs.existsSync(chunk.path)) { try { fs.unlinkSync(chunk.path); } catch { /* janitor will retry */ } }
   }
 }));
 app.post('/api/upload-sessions/:sessionId/complete', requireAuth, async (req: any, res: any) => withSessionLock(req.params.sessionId, async () => {
   const sessions = req.db.collection('upload_sessions');
-  let session = await ownedUploadSession(req, req.params.sessionId);
+  const resolved = await resolveUploadSessionForRequest(req, req.params.sessionId);
+  if (resolved.accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this upload session', req.requestId);
+  let session = resolved.session;
   if (!session) return apiError(res, 404, 'UPLOAD_SESSION_NOT_FOUND', 'Upload session not found', req.requestId);
   await expireUploadSessionIfNeeded(sessions, session);
   if (session.status === 'completed') return res.json(session.finalResult || { success: true, sessionId: session.sessionId, checksum: session.checksum });
@@ -2182,47 +2779,75 @@ app.post('/api/upload-sessions/:sessionId/complete', requireAuth, async (req: an
   if (session.status === 'completing' && Number(session.completionLeaseExpiresAt || 0) > Date.now()) {
     return apiError(res, 503, 'UPLOAD_COMPLETION_IN_PROGRESS', 'Provider upload is already in progress; retry after the lease expires', req.requestId);
   }
-  if (session.receivedBytes !== session.totalBytes || !fs.existsSync(session.tempPath)) return apiError(res, 409, 'UPLOAD_INCOMPLETE', 'Upload is incomplete', req.requestId);
-  const account = await findUploadAccount(req, session.accountId);
+  if (session.receivedBytes !== session.totalBytes || !fs.existsSync(session.tempPath) || fs.statSync(session.tempPath).size !== session.totalBytes) {
+    const incompleteCode = session.isEncrypted ? 'ENCRYPTED_UPLOAD_INCOMPLETE' : 'UPLOAD_INCOMPLETE';
+    return apiError(res, 409, incompleteCode, 'Upload is incomplete', req.requestId);
+  }
+  const { account, accessDenied } = await findUploadAccount(req, session.accountId);
+  if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
   if (!account) return apiError(res, 404, 'ACCOUNT_NOT_FOUND', 'Account not found', req.requestId);
   const claimNow = Date.now();
   const claimed = await sessions.updateOne({
-    sessionId: session.sessionId, userId: String(req.userId || ''),
+    sessionId: session.sessionId, userId: String(session.userId || ''),
     $or: [
       { status: 'active' },
       { status: 'completing', $or: [{ completionLeaseExpiresAt: { $lte: claimNow } }, { completionLeaseExpiresAt: { $exists: false } }] }
     ]
   }, { $set: { status: 'completing', completionLeaseExpiresAt: claimNow + PROVIDER_COMPLETION_LEASE_MS, updatedAt: new Date(claimNow) } });
   if (claimed.modifiedCount !== 1) {
-    session = await ownedUploadSession(req, session.sessionId);
+    const rechecked = await resolveUploadSessionForRequest(req, session.sessionId);
+    session = rechecked.session;
     if (session?.status === 'completed') return res.json(session.finalResult || { success: true, sessionId: session.sessionId, checksum: session.checksum });
     return apiError(res, 503, 'UPLOAD_COMPLETION_IN_PROGRESS', 'Upload completion is already in progress; retry shortly', req.requestId);
   }
   try {
-    const digest = crypto.createHash('sha256');
-    digest.update(fs.readFileSync(session.tempPath));
-    const checksum = digest.digest('hex');
+    const checksum = await computeFileSha256(session.tempPath);
     if (session.checksum && session.checksum.toLowerCase() !== checksum) {
       await sessions.updateOne({ sessionId: session.sessionId, status: 'completing' }, { $set: { status: 'active', updatedAt: new Date() }, $unset: { completionLeaseExpiresAt: '' } });
-      return apiError(res, 422, 'CHECKSUM_MISMATCH', 'Upload checksum does not match', req.requestId);
+      const mismatchCode = session.isEncrypted ? 'ENCRYPTED_CHECKSUM_MISMATCH' : 'CHECKSUM_MISMATCH';
+      return apiError(res, 422, mismatchCode, 'Upload checksum does not match', req.requestId);
     }
+    const encryptionSpec: ValidatedUploadSpec = {
+      isEncrypted: Boolean(session.isEncrypted),
+      fileName: session.fileName,
+      mimeType: session.isEncrypted ? 'application/octet-stream' : session.mimeType,
+      size: session.totalBytes,
+      folderId: session.folderId || 'root',
+      checksum: session.checksum || checksum,
+      encryptionFormatVersion: session.isEncrypted ? (session.encryptionFormatVersion ?? 1) : null,
+      encryptionKeyId: session.isEncrypted ? (session.encryptionKeyId ?? null) : null,
+      encryptedMetadata: session.isEncrypted ? (session.encryptedMetadata ?? null) : null,
+      opaqueRemoteName: session.isEncrypted ? (session.opaqueRemoteName ?? session.fileName) : null,
+      encryptedSizeBytes: session.isEncrypted ? (session.encryptedSizeBytes ?? session.totalBytes) : null,
+    };
     await uploadFileToProvider(
       account, session.accountId,
-      { path: session.tempPath, size: session.totalBytes, originalname: session.fileName, mimetype: session.mimeType },
+      { path: session.tempPath, size: session.totalBytes, originalname: session.fileName, mimetype: encryptionSpec.mimeType },
       session.folderId, session.providerSession,
       async (providerSession) => {
         const saved = await sessions.updateOne(
-          { sessionId: session.sessionId, userId: String(req.userId || ''), status: 'completing' },
+          { sessionId: session.sessionId, userId: String(session.userId || ''), status: 'completing' },
           { $set: { providerSession, providerType: session.providerType || transferProviderType(account.accountType), completionLeaseExpiresAt: Date.now() + PROVIDER_COMPLETION_LEASE_MS, updatedAt: new Date() } }
         );
         if (saved.modifiedCount !== 1) throw new Error('Upload session ownership/state changed while saving provider checkpoint');
       },
-      session.idempotencyKey
+      session.idempotencyKey,
+      encryptionSpec,
+      String(session.userId || req.userId || '')
     );
-    await sessions.updateOne({ sessionId: session.sessionId, status: 'completing' }, { $set: { status: 'completed', checksum, completedAt: new Date(), finalResult: { success: true, sessionId: session.sessionId, checksum }, updatedAt: new Date() }, $unset: { completionLeaseExpiresAt: '' } });
+    const finalPayload = {
+      success: true,
+      sessionId: session.sessionId,
+      checksum,
+      isEncrypted: Boolean(session.isEncrypted),
+      encryptionFormatVersion: session.isEncrypted ? (session.encryptionFormatVersion ?? 1) : null,
+      encryptionKeyId: session.isEncrypted ? (session.encryptionKeyId ?? null) : null,
+      encryptedSizeBytes: session.isEncrypted ? session.totalBytes : null,
+    };
+    await sessions.updateOne({ sessionId: session.sessionId, status: 'completing' }, { $set: { status: 'completed', checksum, completedAt: new Date(), finalResult: finalPayload, updatedAt: new Date() }, $unset: { completionLeaseExpiresAt: '' } });
     invalidateDriveCache(session.accountId);
     if (fs.existsSync(session.tempPath)) { try { fs.unlinkSync(session.tempPath); } catch { /* janitor will retry */ } }
-    return res.json({ success: true, sessionId: session.sessionId, checksum });
+    return res.json(finalPayload);
   } catch (err: any) {
     console.error('Resumable upload completion error:', err);
     await sessions.updateOne({ sessionId: session.sessionId, status: 'completing' }, { $set: { status: 'active', updatedAt: new Date() }, $unset: { completionLeaseExpiresAt: '' } });
@@ -2237,7 +2862,8 @@ app.post('/api/upload-sessions/:sessionId/cancel', requireAuth, (req: any, _res:
 });
 app.delete('/api/upload-sessions/:sessionId', requireAuth, async (req: any, res: any) => withSessionLock(req.params.sessionId, async () => {
   const sessions = req.db.collection('upload_sessions');
-  const session = await ownedUploadSession(req, req.params.sessionId);
+  const { session, accessDenied } = await resolveUploadSessionForRequest(req, req.params.sessionId);
+  if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this upload session', req.requestId);
   if (!session) return res.status(204).end();
   if (session.status === 'completed') return apiError(res, 409, 'UPLOAD_ALREADY_COMPLETED', 'Completed upload cannot be cancelled', req.requestId);
   const completing = session.status === 'completing';
@@ -2247,7 +2873,7 @@ app.delete('/api/upload-sessions/:sessionId', requireAuth, async (req: any, res:
   }
   const allowed = completing ? ['completing'] : ['active', 'expired', 'cancelled'];
   const fenced = await sessions.updateOne({
-    sessionId: session.sessionId, userId: String(req.userId || ''), status: { $in: allowed },
+    sessionId: session.sessionId, userId: String(session.userId || ''), status: { $in: allowed },
     $or: [{ chunkLeaseExpiresAt: { $exists: false } }, { chunkLeaseExpiresAt: { $lte: Date.now() } }]
   }, { $set: { status: 'cancelling', updatedAt: new Date() }, $unset: { completionLeaseExpiresAt: '', chunkLeaseOwner: '', chunkLeaseExpiresAt: '' } });
   if (fenced.matchedCount !== 1) return apiError(res, 409, 'UPLOAD_CANCELLATION_CONFLICT', 'Upload state changed before cancellation could be fenced', req.requestId);
@@ -2270,51 +2896,102 @@ app.delete('/api/upload-sessions/:sessionId', requireAuth, async (req: any, res:
 // ─── 6. Upload ─────────────────────────────────────────────────────────────────
 app.post('/api/upload/:accountId', requireAuth, upload.single('file'), async (req: any, res: any) => {
   const { accountId } = req.params;
-  const { folderId }  = req.body;
+  const body          = req.body || {};
   const file          = req.file;
   const userId        = req.userId;
   const database      = req.db;
 
   if (!file) return apiError(res, 400, 'NO_FILE_UPLOADED', 'No file uploaded', req.requestId);
 
+  const cleanupTemp = () => {
+    if (file?.path && fs.existsSync(file.path)) {
+      try { fs.unlinkSync(file.path); } catch { /* ignore */ }
+    }
+  };
+
   if (!hasTempDiskHeadroom(file.size)) {
-    try { fs.unlinkSync(file.path); } catch { /* cleanup is retried by the periodic janitor */ }
+    cleanupTemp();
     return apiError(res, 507, 'INSUFFICIENT_STORAGE', 'Server temporary storage is too low for this upload', req.requestId);
   }
 
-  const query: any = { _id: new ObjectId(accountId) };
-  if (!req.isAdmin && userId) query.userId = String(userId);
-  const account = await database.collection('accounts').findOne(query);
+  const { account, accessDenied } = await resolveAuthorizedAccount(database, accountId, userId, req.isAdmin);
+  if (accessDenied) {
+    cleanupTemp();
+    return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
+  }
   if (!account) {
-    if (file.path && fs.existsSync(file.path)) {
-      try { fs.unlinkSync(file.path); } catch { /* ignore */ }
-    }
+    cleanupTemp();
     return apiError(res, 404, 'ACCOUNT_NOT_FOUND', 'Account not found', req.requestId);
   }
 
+  const validation = validateUploadRequest({
+    fileName: body.fileName || file.originalname,
+    mimeType: body.mimeType || file.mimetype,
+    size: file.size,
+    folderId: body.folderId || 'root',
+    checksum: body.checksum || body.encryptedChecksum,
+    isEncrypted: body.isEncrypted,
+    encryptionFormatVersion: body.encryptionFormatVersion,
+    encryptionKeyId: body.encryptionKeyId,
+    encryptedMetadata: body.encryptedMetadata,
+    opaqueRemoteName: body.opaqueRemoteName,
+    encryptedSizeBytes: body.encryptedSizeBytes !== undefined ? body.encryptedSizeBytes : (body.size !== undefined ? body.size : undefined),
+  });
+  if (!validation.ok) {
+    cleanupTemp();
+    return apiError(res, validation.error.status, validation.error.code, validation.error.message, req.requestId);
+  }
+  const spec = validation.spec;
+
   try {
-    await uploadFileToProvider(account, accountId, {
-      path: file.path, size: file.size, originalname: file.originalname, mimetype: file.mimetype
-    }, folderId);
+    if (spec.checksum) {
+      const actualHash = await computeFileSha256(file.path);
+      if (actualHash !== spec.checksum.toLowerCase()) {
+        cleanupTemp();
+        const mismatchCode = spec.isEncrypted ? 'ENCRYPTED_CHECKSUM_MISMATCH' : 'CHECKSUM_MISMATCH';
+        return apiError(res, 422, mismatchCode, 'Uploaded file SHA-256 checksum does not match', req.requestId);
+      }
+    }
+
+    await uploadFileToProvider(
+      account,
+      accountId,
+      {
+        path: file.path,
+        size: file.size,
+        originalname: spec.fileName,
+        mimetype: spec.mimeType,
+      },
+      spec.folderId,
+      undefined,
+      undefined,
+      body.idempotencyKey,
+      spec,
+      String(userId || account.userId || '')
+    );
     invalidateDriveCache(accountId);
-    res.json({ success: true });
+    res.json({
+      success: true,
+      isEncrypted: spec.isEncrypted,
+      encryptionFormatVersion: spec.encryptionFormatVersion,
+      encryptionKeyId: spec.encryptionKeyId,
+      encryptedChecksum: spec.isEncrypted ? spec.checksum : null,
+      encryptedSizeBytes: spec.isEncrypted ? spec.size : null,
+    });
   } catch (err: any) {
     console.error('Upload error:', err);
     if (err?.code === 'UNSUPPORTED_PROVIDER_OPERATION') return apiError(res, 422, err.code, err.message, req.requestId);
     apiError(res, 502, 'PROVIDER_UPLOAD_FAILED', 'Provider upload failed', req.requestId);
   } finally {
-    if (file?.path && fs.existsSync(file.path)) {
-      try { fs.unlinkSync(file.path); } catch { /* ignore */ }
-    }
+    cleanupTemp();
   }
 });
 
 app.get('/api/media-link/:accountId/:fileId', requireAuth, async (req: any, res: any) => {
   const { accountId, fileId } = req.params;
   const database = req.db;
-  const query: any = { _id: new ObjectId(accountId) };
-  if (!req.isAdmin && req.userId) query.userId = String(req.userId);
-  const account = await database.collection('accounts').findOne(query);
+  const { account, accessDenied } = await resolveAuthorizedAccount(database, accountId, req.userId, req.isAdmin);
+  if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
   if (!account) return apiError(res, 404, 'ACCOUNT_NOT_FOUND', 'Account not found', req.requestId);
   const expiresAt = Date.now() + 10 * 60 * 1000;
   const sig = signMediaRequest(accountId, fileId, expiresAt);
@@ -2329,28 +3006,38 @@ app.get('/api/download/:accountId/:fileId', requireAuthOrSignedMedia, async (req
   const database              = req.db;
 
   try {
-    const query: any = { _id: new ObjectId(accountId) };
-    if (!req.isAdmin && userId) query.userId = String(userId);
-    const account = await database.collection('accounts').findOne(query);
+    let account: any = null;
+    if (req.mediaSigned) {
+      account = await database.collection('accounts').findOne({ _id: new ObjectId(accountId) });
+    } else {
+      const resolved = await resolveAuthorizedAccount(database, accountId, userId, req.isAdmin);
+      if (resolved.accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
+      account = resolved.account;
+    }
     if (!account) return res.status(404).send('Account not found');
 
+    const { meta, accessDenied: fileDenied } = await resolveFileMetadataForAccount(database, account, fileId, userId, req.isAdmin || Boolean(req.mediaSigned));
+    if (fileDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this file', req.requestId);
+
     res.setHeader('Accept-Ranges', 'bytes');
-    const dispositionType = req.query.preview === '1' ? 'inline' : 'attachment';
+    const dispositionType = (meta?.isEncrypted === true) ? 'attachment' : (req.query.preview === '1' ? 'inline' : 'attachment');
 
     if (account.accountType === 'tgdrive') {
-      const meta = await database.collection('tg_files').findOne({ _id: new ObjectId(fileId) });
       if (!meta) return res.status(404).send('File not found');
 
-      const etag = `"${meta._id}-${meta.size}"`;
+      const etag = meta.isEncrypted && meta.encryptedChecksum
+        ? `"${meta.encryptedChecksum}"`
+        : `"${meta._id}-${meta.size}"`;
       res.setHeader('ETag', etag);
-      if (req.query.preview === '1') {
+      if (req.query.preview === '1' && !meta.isEncrypted) {
         res.setHeader('Cache-Control', 'private, max-age=86400');
       }
       if (req.headers['if-none-match'] === etag) {
         return res.status(304).end();
       }
 
-      res.setHeader('Content-Disposition', `${dispositionType}; filename*=UTF-8''${encodeURIComponent(meta.name)}`);
+      const downloadName = meta.isEncrypted ? (meta.opaqueRemoteName || meta.name) : meta.name;
+      res.setHeader('Content-Disposition', `${dispositionType}; filename*=UTF-8''${encodeURIComponent(downloadName)}`);
       await tgStreamFile(meta.messageId, account.channelId, req, res, meta);
       return;
     }
@@ -2361,8 +3048,13 @@ app.get('/api/download/:accountId/:fileId', requireAuthOrSignedMedia, async (req
       const dlUrl = item['@microsoft.graph.downloadUrl'];
       if (!dlUrl) return res.status(404).send('Download link not available');
 
-      res.setHeader('Content-Disposition', `${dispositionType}; filename*=UTF-8''${encodeURIComponent(item.name)}`);
-      res.setHeader('Content-Type', item.file?.mimeType || 'application/octet-stream');
+      const isEncrypted = meta?.isEncrypted === true;
+      const downloadName = isEncrypted ? (meta.opaqueRemoteName || item.name) : item.name;
+      if (isEncrypted && meta?.encryptedChecksum) {
+        res.setHeader('ETag', `"${meta.encryptedChecksum}"`);
+      }
+      res.setHeader('Content-Disposition', `${dispositionType}; filename*=UTF-8''${encodeURIComponent(downloadName)}`);
+      res.setHeader('Content-Type', isEncrypted ? 'application/octet-stream' : (item.file?.mimeType || 'application/octet-stream'));
       const response = await axios.get(dlUrl, { responseType: 'stream', headers: req.headers.range ? { Range: req.headers.range } : undefined, validateStatus: (status: number) => status === 200 || status === 206 });
       if (response.status === 206) res.status(206);
       for (const header of ['content-range', 'content-length', 'accept-ranges']) if (response.headers[header]) res.setHeader(header, response.headers[header]);
@@ -2371,9 +3063,13 @@ app.get('/api/download/:accountId/:fileId', requireAuthOrSignedMedia, async (req
 
     const drive    = await getDriveClient(account.tokens || account.credentials);
     const file     = await drive.files.get({ fileId, fields: 'name,mimeType' });
-    const fileName = file.data.name || 'file';
+    const isEncrypted = meta?.isEncrypted === true;
+    const fileName = isEncrypted ? (meta.opaqueRemoteName || file.data.name || 'file') : (file.data.name || 'file');
+    if (isEncrypted && meta?.encryptedChecksum) {
+      res.setHeader('ETag', `"${meta.encryptedChecksum}"`);
+    }
     res.setHeader('Content-Disposition', `${dispositionType}; filename*=UTF-8''${encodeURIComponent(fileName)}`);
-    res.setHeader('Content-Type', file.data.mimeType || 'application/octet-stream');
+    res.setHeader('Content-Type', isEncrypted ? 'application/octet-stream' : (file.data.mimeType || 'application/octet-stream'));
     const response = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream', headers: req.headers.range ? { Range: req.headers.range } : undefined });
     if (response.status === 206) res.status(206);
     for (const header of ['content-range', 'content-length', 'accept-ranges']) { const value = response.headers?.[header]; if (value) res.setHeader(header, value); }
@@ -2390,14 +3086,18 @@ app.post('/api/share', requireAuth, async (req: any, res: any) => {
   const userId                = req.userId;
   const database              = req.db;
 
-  const query: any = { _id: new ObjectId(accountId) };
-  if (!req.isAdmin && userId) query.userId = String(userId);
-  const account = await database.collection('accounts').findOne(query);
+  const { account, accessDenied } = await resolveAuthorizedAccount(database, accountId, userId, req.isAdmin);
+  if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
   if (!account) return res.status(404).json({ error: 'Account not found' });
 
   try {
+    const { meta, accessDenied: fileDenied } = await resolveFileMetadataForAccount(database, account, fileId, userId, req.isAdmin);
+    if (fileDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this file', req.requestId);
+    if (meta?.isEncrypted === true) {
+      return apiError(res, 409, 'ENCRYPTED_SHARE_UNSUPPORTED', 'Encrypted file sharing is not supported', req.requestId);
+    }
+
     if (account.accountType === 'tgdrive') {
-      const meta = await database.collection('tg_files').findOne({ _id: new ObjectId(fileId) });
       if (!meta) return res.status(404).json({ error: 'File not found' });
       let { shareId } = meta;
       if (!shareId) {
@@ -2408,7 +3108,7 @@ app.post('/api/share', requireAuth, async (req: any, res: any) => {
     }
 
     const shareId = nanoid(6);
-    await database.collection('shares').insertOne({ shareId, accountId: new ObjectId(accountId), fileId, createdAt: new Date().toISOString() });
+    await database.collection('shares').insertOne({ shareId, accountId: account._id, fileId, createdAt: new Date().toISOString() });
     res.json({ success: true, shareUrl: `${process.env.APP_URL}/s/${shareId}` });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -2421,14 +3121,30 @@ app.post('/api/files/move', requireAuth, async (req: any, res: any) => {
   const userId = req.userId;
   const database = req.db;
 
+  const folderCheck = validateSafeFolderId(targetFolderId);
+  if (!folderCheck.ok) {
+    return apiError(res, folderCheck.error.status, folderCheck.error.code, folderCheck.error.message, req.requestId);
+  }
+
+  const { account: sourceAccount, accessDenied: sourceDenied } = await resolveAuthorizedAccount(database, sourceAccountId, userId, req.isAdmin);
+  if (sourceDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to source account', req.requestId);
+  if (!sourceAccount) return res.status(404).json({ error: 'Account not found' });
+
+  const { meta, accessDenied: fileDenied } = await resolveFileMetadataForAccount(database, sourceAccount, fileId, userId, req.isAdmin);
+  if (fileDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this file', req.requestId);
+
   if (sourceAccountId !== targetAccountId) {
+    const { account: targetAccount, accessDenied: targetDenied } = await resolveAuthorizedAccount(database, targetAccountId, userId, req.isAdmin);
+    if (targetDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to target account', req.requestId);
+    if (!targetAccount) return res.status(404).json({ error: 'Target account not found' });
+
     if (req.query.async === 'true' || req.query.async === '1') {
-      const job = await enqueueTransferJob(database, { sourceAccountId, fileId, targetAccountId, targetFolderId, userId: userId ? String(userId) : null, isAdmin: !!req.isAdmin, isMove: true });
+      const job = await enqueueTransferJob(database, { sourceAccountId, fileId, targetAccountId, targetFolderId: folderCheck.folderId, userId: userId ? String(userId) : null, isAdmin: !!req.isAdmin, isMove: true });
       return res.status(202).json({ success: true, async: true, jobId: String(job._id), status: job.status });
     }
     try {
       await providerLimit(`transfer:${sourceAccountId}:${targetAccountId}`, 1)(() =>
-        crossAccountTransfer(sourceAccountId, fileId, targetAccountId, targetFolderId, userId, req.isAdmin, database, true)
+        crossAccountTransfer(sourceAccountId, fileId, targetAccountId, folderCheck.folderId, userId, req.isAdmin, database, true)
       );
       invalidateDriveCache(sourceAccountId);
       invalidateDriveCache(targetAccountId);
@@ -2438,17 +3154,15 @@ app.post('/api/files/move', requireAuth, async (req: any, res: any) => {
     }
   }
 
-  const query: any = { _id: new ObjectId(sourceAccountId) };
-  if (!req.isAdmin && userId) query.userId = String(userId);
-  const account = await database.collection('accounts').findOne(query);
-  if (!account) return res.status(404).json({ error: 'Account not found' });
+  const account = sourceAccount;
 
   try {
     if (account.accountType === 'tgdrive') {
-      const realTargetId = targetFolderId === 'root' ? '' : targetFolderId;
+      if (!meta) return res.status(404).json({ error: 'File not found' });
+      const realTargetId = folderCheck.folderId === 'root' ? '' : folderCheck.folderId;
       await database.collection('tg_files').updateOne(
-        { _id: new ObjectId(fileId) },
-        { $set: { folder: realTargetId } }
+        { _id: meta._id },
+        { $set: { folder: realTargetId, updatedAt: new Date() } }
       );
       invalidateDriveCache(sourceAccountId);
       return res.json({ success: true });
@@ -2456,7 +3170,7 @@ app.post('/api/files/move', requireAuth, async (req: any, res: any) => {
       const drive = await getDriveClient(account.tokens || account.credentials);
       const file = await drive.files.get({ fileId, fields: 'parents' });
       const previousParents = file.data.parents?.join(',') || '';
-      const realTargetId = targetFolderId === 'root' ? 'root' : targetFolderId;
+      const realTargetId = folderCheck.folderId === 'root' ? 'root' : folderCheck.folderId;
       
       await drive.files.update({
         fileId,
@@ -2464,11 +3178,17 @@ app.post('/api/files/move', requireAuth, async (req: any, res: any) => {
         removeParents: previousParents,
         fields: 'id, parents'
       });
+      if (meta) {
+        await database.collection('tg_files').updateOne(
+          { _id: meta._id },
+          { $set: { folder: realTargetId === 'root' ? '' : realTargetId, updatedAt: new Date() } }
+        );
+      }
       invalidateDriveCache(sourceAccountId);
       return res.json({ success: true });
     } else if (account.accountType === 'onedrive') {
       const token = account.tokens?.access_token || account.credentials?.access_token;
-      const realTargetId = targetFolderId === 'root' ? 'root' : targetFolderId;
+      const realTargetId = folderCheck.folderId === 'root' ? 'root' : folderCheck.folderId;
       const url = `https://graph.microsoft.com/v1.0/me/drive/items/${fileId}`;
       await axios.patch(url, {
         parentReference: {
@@ -2477,6 +3197,12 @@ app.post('/api/files/move', requireAuth, async (req: any, res: any) => {
       }, {
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }
       });
+      if (meta) {
+        await database.collection('tg_files').updateOne(
+          { _id: meta._id },
+          { $set: { folder: realTargetId === 'root' ? '' : realTargetId, updatedAt: new Date() } }
+        );
+      }
       invalidateDriveCache(sourceAccountId);
       return res.json({ success: true });
     }
@@ -2492,14 +3218,30 @@ app.post('/api/files/copy', requireAuth, async (req: any, res: any) => {
   const userId = req.userId;
   const database = req.db;
 
+  const folderCheck = validateSafeFolderId(targetFolderId);
+  if (!folderCheck.ok) {
+    return apiError(res, folderCheck.error.status, folderCheck.error.code, folderCheck.error.message, req.requestId);
+  }
+
+  const { account: sourceAccount, accessDenied: sourceDenied } = await resolveAuthorizedAccount(database, sourceAccountId, userId, req.isAdmin);
+  if (sourceDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to source account', req.requestId);
+  if (!sourceAccount) return res.status(404).json({ error: 'Account not found' });
+
+  const { meta, accessDenied: fileDenied } = await resolveFileMetadataForAccount(database, sourceAccount, fileId, userId, req.isAdmin);
+  if (fileDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this file', req.requestId);
+
   if (sourceAccountId !== targetAccountId) {
+    const { account: targetAccount, accessDenied: targetDenied } = await resolveAuthorizedAccount(database, targetAccountId, userId, req.isAdmin);
+    if (targetDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to target account', req.requestId);
+    if (!targetAccount) return res.status(404).json({ error: 'Target account not found' });
+
     if (req.query.async === 'true' || req.query.async === '1') {
-      const job = await enqueueTransferJob(database, { sourceAccountId, fileId, targetAccountId, targetFolderId, userId: userId ? String(userId) : null, isAdmin: !!req.isAdmin, isMove: false });
+      const job = await enqueueTransferJob(database, { sourceAccountId, fileId, targetAccountId, targetFolderId: folderCheck.folderId, userId: userId ? String(userId) : null, isAdmin: !!req.isAdmin, isMove: false });
       return res.status(202).json({ success: true, async: true, jobId: String(job._id), status: job.status });
     }
     try {
       await providerLimit(`transfer:${sourceAccountId}:${targetAccountId}`, 1)(() =>
-        crossAccountTransfer(sourceAccountId, fileId, targetAccountId, targetFolderId, userId, req.isAdmin, database, false)
+        crossAccountTransfer(sourceAccountId, fileId, targetAccountId, folderCheck.folderId, userId, req.isAdmin, database, false)
       );
       invalidateDriveCache(sourceAccountId);
       invalidateDriveCache(targetAccountId);
@@ -2509,24 +3251,23 @@ app.post('/api/files/copy', requireAuth, async (req: any, res: any) => {
     }
   }
 
-  const query: any = { _id: new ObjectId(sourceAccountId) };
-  if (!req.isAdmin && userId) query.userId = String(userId);
-  const account = await database.collection('accounts').findOne(query);
-  if (!account) return res.status(404).json({ error: 'Account not found' });
+  const account = sourceAccount;
 
   try {
     if (account.accountType === 'tgdrive') {
-      const meta = await database.collection('tg_files').findOne({ _id: new ObjectId(fileId) });
       if (!meta) return res.status(404).json({ error: 'File not found' });
       
-      const realTargetId = targetFolderId === 'root' ? '' : targetFolderId;
+      const realTargetId = folderCheck.folderId === 'root' ? '' : folderCheck.folderId;
+      const now = new Date();
       const newMeta = { ...meta };
       delete newMeta._id;
       newMeta.folder = realTargetId;
       newMeta.date = Math.floor(Date.now() / 1000);
-      newMeta.shareId = nanoid(6);
+      newMeta.createdAt = now;
+      newMeta.updatedAt = now;
+      newMeta.shareId = meta.isEncrypted ? null : nanoid(6);
       
-      if (meta.folder === realTargetId) {
+      if (!meta.isEncrypted && meta.folder === realTargetId) {
         newMeta.name = newMeta.name.replace(/(\.[^.]+)$|$/, ' - Copy$1');
       }
 
@@ -2535,31 +3276,58 @@ app.post('/api/files/copy', requireAuth, async (req: any, res: any) => {
       return res.json({ success: true });
     } else if (account.accountType === 'google') {
       const drive = await getDriveClient(account.tokens || account.credentials);
-      const realTargetId = targetFolderId === 'root' ? 'root' : targetFolderId;
+      const realTargetId = folderCheck.folderId === 'root' ? 'root' : folderCheck.folderId;
       
-      await drive.files.copy({
+      const copied = await drive.files.copy({
         fileId,
         requestBody: {
-          parents: [realTargetId]
-        }
+          parents: [realTargetId],
+          ...(meta?.isEncrypted ? { name: meta.opaqueRemoteName || meta.name } : {})
+        },
+        fields: 'id,name'
       });
+      if (meta?.isEncrypted && copied?.data?.id) {
+        const now = new Date();
+        const clonedMeta = { ...meta };
+        delete clonedMeta._id;
+        clonedMeta.providerFileId = String(copied.data.id);
+        clonedMeta.folder = realTargetId === 'root' ? '' : realTargetId;
+        clonedMeta.date = Math.floor(Date.now() / 1000);
+        clonedMeta.createdAt = now;
+        clonedMeta.updatedAt = now;
+        clonedMeta.shareId = null;
+        await database.collection('tg_files').insertOne(clonedMeta);
+      }
       invalidateDriveCache(sourceAccountId);
       return res.json({ success: true });
     } else if (account.accountType === 'onedrive') {
       const token = account.tokens?.access_token || account.credentials?.access_token;
-      let realTargetId = targetFolderId;
-      if (targetFolderId === 'root') {
+      let realTargetId = folderCheck.folderId;
+      if (folderCheck.folderId === 'root') {
          const rootRes = await axios.get('https://graph.microsoft.com/v1.0/me/drive/root', { headers: { Authorization: `Bearer ${token}` } });
          realTargetId = rootRes.data.id;
       }
       const url = `https://graph.microsoft.com/v1.0/me/drive/items/${fileId}/copy`;
-      await axios.post(url, {
+      const copyRes = await axios.post(url, {
         parentReference: {
           id: realTargetId
-        }
+        },
+        ...(meta?.isEncrypted ? { name: meta.opaqueRemoteName || meta.name } : {})
       }, {
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }
       });
+      if (meta?.isEncrypted) {
+        const now = new Date();
+        const clonedMeta = { ...meta };
+        delete clonedMeta._id;
+        if (copyRes?.data?.id) clonedMeta.providerFileId = String(copyRes.data.id);
+        clonedMeta.folder = folderCheck.folderId === 'root' ? '' : folderCheck.folderId;
+        clonedMeta.date = Math.floor(Date.now() / 1000);
+        clonedMeta.createdAt = now;
+        clonedMeta.updatedAt = now;
+        clonedMeta.shareId = null;
+        await database.collection('tg_files').insertOne(clonedMeta);
+      }
       invalidateDriveCache(sourceAccountId);
       return res.json({ success: true });
     }
@@ -2570,7 +3338,7 @@ app.post('/api/files/copy', requireAuth, async (req: any, res: any) => {
 });
 
 // ─── Public download (no auth) ────────────────────────────────────────────────
-app.get('/api/public/download/:shareId', async (req, res) => {
+app.get('/api/public/download/:shareId', async (req: any, res: any) => {
   const { shareId } = req.params;
   const database    = db || await connectToMongo();
 
@@ -2580,6 +3348,9 @@ app.get('/api/public/download/:shareId', async (req, res) => {
     // Check TG Drive files first
     const tgMeta = await database.collection('tg_files').findOne({ shareId });
     if (tgMeta) {
+      if (tgMeta.isEncrypted === true) {
+        return apiError(res, 409, 'ENCRYPTED_SHARE_UNSUPPORTED', 'Encrypted file sharing is not supported', req.requestId);
+      }
       const account = await database.collection('accounts').findOne({ _id: tgMeta.accountId });
       if (!account) return res.status(404).send('Account disconnected');
       res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(tgMeta.name)}`);
@@ -2593,6 +3364,11 @@ app.get('/api/public/download/:shareId', async (req, res) => {
     if (!share) return res.status(404).send('Share link expired');
     const account = await database.collection('accounts').findOne({ _id: share.accountId });
     if (!account) return res.status(404).send('Account disconnected');
+
+    const { meta } = await resolveFileMetadataForAccount(database, account, String(share.fileId), null, true);
+    if (meta?.isEncrypted === true) {
+      return apiError(res, 409, 'ENCRYPTED_SHARE_UNSUPPORTED', 'Encrypted file sharing is not supported', req.requestId);
+    }
 
     if (account.accountType === 'onedrive') {
       const c    = await getOneDriveClient(account.tokens || account.credentials, account._id.toString());
@@ -2622,13 +3398,16 @@ app.get('/api/public/download/:shareId', async (req, res) => {
 });
 
 // ─── Public share page ────────────────────────────────────────────────────────
-app.get('/s/:shareId', async (req, res) => {
+app.get('/s/:shareId', async (req: any, res: any) => {
   const { shareId } = req.params;
   const database    = db || await connectToMongo();
 
   try {
     const tgMeta = await database.collection('tg_files').findOne({ shareId });
     if (tgMeta) {
+      if (tgMeta.isEncrypted === true) {
+        return apiError(res, 409, 'ENCRYPTED_SHARE_UNSUPPORTED', 'Encrypted file sharing is not supported', req.requestId);
+      }
       const sizeMB = tgMeta.size ? (Number(tgMeta.size) / (1024 ** 2)).toFixed(2) + ' MB' : 'Unknown size';
       const isMedia = tgMeta.mimeType?.startsWith('image/') || tgMeta.mimeType?.startsWith('video/');
       const thumb = isMedia ? `/api/thumb/${tgMeta.accountId}/${tgMeta._id}?s=256` : null;
@@ -2639,6 +3418,11 @@ app.get('/s/:shareId', async (req, res) => {
     if (!share) return res.status(404).send('Share link expired or invalid');
     const account = await database.collection('accounts').findOne({ _id: share.accountId });
     if (!account) return res.status(404).send('Account disconnected');
+
+    const { meta } = await resolveFileMetadataForAccount(database, account, String(share.fileId), null, true);
+    if (meta?.isEncrypted === true) {
+      return apiError(res, 409, 'ENCRYPTED_SHARE_UNSUPPORTED', 'Encrypted file sharing is not supported', req.requestId);
+    }
 
     if (account.accountType === 'onedrive') {
       const c    = await getOneDriveClient(account.tokens || account.credentials, account._id.toString());
@@ -2822,28 +3606,29 @@ async function crossAccountTransfer(
   database: any,
   isMove: boolean
 ) {
-  const querySource: any = { _id: new ObjectId(sourceAccountId) };
-  if (!isAdmin && userId) querySource.userId = String(userId);
-  const sourceAccount = await database.collection('accounts').findOne(querySource);
+  const { account: sourceAccount, accessDenied: srcDenied } = await resolveAuthorizedAccount(database, sourceAccountId, userId, isAdmin);
+  if (srcDenied) throw new Error('Access denied to source account');
   if (!sourceAccount) throw new Error('Source account not found');
 
-  const queryTarget: any = { _id: new ObjectId(targetAccountId) };
-  if (!isAdmin && userId) queryTarget.userId = String(userId);
-  const targetAccount = await database.collection('accounts').findOne(queryTarget);
+  const { account: targetAccount, accessDenied: tgtDenied } = await resolveAuthorizedAccount(database, targetAccountId, userId, isAdmin);
+  if (tgtDenied) throw new Error('Access denied to target account');
   if (!targetAccount) throw new Error('Target account not found');
+
+  const { meta: sourceMeta, accessDenied: fileDenied } = await resolveFileMetadataForAccount(database, sourceAccount, fileId, userId, isAdmin);
+  if (fileDenied) throw new Error('Access denied to source file');
 
   const tmpPath = path.join(os.tmpdir(), `transfer_${Date.now()}_${nanoid(6)}`);
   const writeStream = fs.createWriteStream(tmpPath);
   
-  let fileName = 'unknown';
-  let mimeType = 'application/octet-stream';
+  let fileName = sourceMeta?.isEncrypted ? (sourceMeta.opaqueRemoteName || sourceMeta.name) : 'unknown';
+  let mimeType = sourceMeta?.isEncrypted ? 'application/octet-stream' : 'application/octet-stream';
 
   try {
     if (sourceAccount.accountType === 'tgdrive') {
-      const meta = await database.collection('tg_files').findOne({ _id: new ObjectId(fileId) });
+      const meta = sourceMeta;
       if (!meta) throw new Error('File not found in TG');
-      fileName = meta.name;
-      mimeType = meta.mimeType;
+      fileName = meta.isEncrypted ? (meta.opaqueRemoteName || meta.name) : meta.name;
+      mimeType = meta.isEncrypted ? 'application/octet-stream' : meta.mimeType;
       
       const telegram = await getTgClient();
       const peer = await resolvePeer(telegram, sourceAccount.channelId);
@@ -2858,8 +3643,10 @@ async function crossAccountTransfer(
     } else if (sourceAccount.accountType === 'onedrive') {
       const c = await getOneDriveClient(sourceAccount.tokens || sourceAccount.credentials, sourceAccount._id.toString());
       const item = await c.api(`/me/drive/items/${fileId}`).get();
-      fileName = item.name;
-      mimeType = item.file?.mimeType || mimeType;
+      if (!sourceMeta?.isEncrypted) {
+        fileName = item.name;
+        mimeType = item.file?.mimeType || mimeType;
+      }
 
       const dlUrl = item['@microsoft.graph.downloadUrl'];
       if (!dlUrl) throw new Error('Download link not available');
@@ -2869,8 +3656,10 @@ async function crossAccountTransfer(
     } else if (sourceAccount.accountType === 'google') {
       const drive = await getDriveClient(sourceAccount.tokens || sourceAccount.credentials);
       const file = await drive.files.get({ fileId, fields: 'name,mimeType' });
-      fileName = file.data.name || 'unknown';
-      mimeType = file.data.mimeType || mimeType;
+      if (!sourceMeta?.isEncrypted) {
+        fileName = file.data.name || 'unknown';
+        mimeType = file.data.mimeType || mimeType;
+      }
       
       const response = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
       response.data.pipe(writeStream);
@@ -2878,72 +3667,49 @@ async function crossAccountTransfer(
     }
 
     const stat = fs.statSync(tmpPath);
-    
-    if (targetAccount.accountType === 'tgdrive') {
-      const folder = (!targetFolderId || targetFolderId === 'root') ? '' : targetFolderId;
-      const telegram = await getTgClient();
-      const peerEntity = await resolvePeer(telegram, targetAccount.channelId);
-      const result = await telegram.sendFile(peerEntity, {
-        file: tmpPath,
-        forceDocument: true,
-        attributes: [new Api.DocumentAttributeFilename({ fileName })],
-      });
-      
-      const record = {
-        accountId: targetAccount._id,
-        messageId: result.id,
-        shareId: nanoid(6),
-        name: fileName,
-        size: stat.size,
-        mimeType,
-        folder,
-        date: Math.floor(Date.now() / 1000),
-      };
-      await database.collection('tg_files').insertOne(record);
-    } else if (targetAccount.accountType === 'onedrive') {
-      const c = await getOneDriveClient(targetAccount.tokens || targetAccount.credentials, targetAccount._id.toString());
-      const parentPath = (!targetFolderId || targetFolderId === 'root') ? '/me/drive/root' : `/me/drive/items/${targetFolderId}`;
-      const encodedName = encodeURIComponent(fileName);
-      
-      if (stat.size <= 4 * 1024 * 1024) {
-        const streamUpload = fs.createReadStream(tmpPath);
-        await c.api(`${parentPath}:/${encodedName}:/content`).put(streamUpload);
-      } else {
-        const uploadSession = await c.api(`${parentPath}:/${encodedName}:/createUploadSession`).post({ item: { '@microsoft.graph.conflictBehavior': 'replace', name: fileName } });
-        const uploadUrl = uploadSession.uploadUrl;
-        const chunkSize = 320 * 1024 * 10;
-        for (let start = 0; start < stat.size; start += chunkSize) {
-          const end = Math.min(start + chunkSize, stat.size);
-          const chunkLen = end - start;
-          const chunkStream = fs.createReadStream(tmpPath, { start, end: end - 1 });
-          await axios.put(uploadUrl, chunkStream, { headers: { 'Content-Range': `bytes ${start}-${end - 1}/${stat.size}`, 'Content-Length': chunkLen } });
-        }
-      }
-    } else if (targetAccount.accountType === 'google') {
-      const drive = await getDriveClient(targetAccount.tokens || targetAccount.credentials);
-      const readStream = fs.createReadStream(tmpPath);
-      await drive.files.create({
-        requestBody: { name: fileName, parents: [targetFolderId || 'root'] },
-        media: { mimeType, body: readStream }
-      });
-    }
+    const encryptionSpec: ValidatedUploadSpec | undefined = sourceMeta?.isEncrypted ? {
+      isEncrypted: true,
+      fileName: sourceMeta.opaqueRemoteName || sourceMeta.name,
+      mimeType: 'application/octet-stream',
+      size: stat.size,
+      folderId: (!targetFolderId || targetFolderId === 'root') ? 'root' : targetFolderId,
+      checksum: sourceMeta.encryptedChecksum || await computeFileSha256(tmpPath),
+      encryptionFormatVersion: sourceMeta.encryptionFormatVersion ?? 1,
+      encryptionKeyId: sourceMeta.encryptionKeyId ?? null,
+      encryptedMetadata: sourceMeta.encryptedMetadata ?? null,
+      opaqueRemoteName: sourceMeta.opaqueRemoteName || sourceMeta.name,
+      encryptedSizeBytes: stat.size,
+    } : undefined;
+
+    await uploadFileToProvider(
+      targetAccount,
+      String(targetAccount._id),
+      { path: tmpPath, size: stat.size, originalname: fileName, mimetype: mimeType },
+      targetFolderId,
+      undefined,
+      undefined,
+      undefined,
+      encryptionSpec,
+      String(userId || targetAccount.userId || '')
+    );
 
     if (isMove) {
       deleteThumbFiles(fileId);
       if (sourceAccount.accountType === 'tgdrive') {
-        const meta = await database.collection('tg_files').findOne({ _id: new ObjectId(fileId) });
-        if (meta) {
-           const telegram = await getTgClient();
-           const peer = await resolvePeer(telegram, sourceAccount.channelId);
-           await telegram.deleteMessages(peer, [meta.messageId], { revoke: true });
-           await database.collection('tg_files').deleteOne({ _id: meta._id });
+        if (sourceMeta) {
+          const telegram = await getTgClient();
+          const peer = await resolvePeer(telegram, sourceAccount.channelId);
+          try { await telegram.deleteMessages(peer, [sourceMeta.messageId], { revoke: true }); } catch { /* ignore */ }
+          await database.collection('tg_files').deleteOne({ _id: sourceMeta._id });
         }
       } else if (sourceAccount.accountType === 'onedrive') {
         const c = await getOneDriveClient(sourceAccount.tokens || sourceAccount.credentials, sourceAccount._id.toString());
         await c.api(`/me/drive/items/${fileId}`).delete();
+        if (sourceMeta) await database.collection('tg_files').deleteOne({ _id: sourceMeta._id });
       } else if (sourceAccount.accountType === 'google') {
         const drive = await getDriveClient(sourceAccount.tokens || sourceAccount.credentials);
         await drive.files.delete({ fileId });
+        if (sourceMeta) await database.collection('tg_files').deleteOne({ _id: sourceMeta._id });
       }
     }
   } finally {
@@ -3058,7 +3824,7 @@ app.post('/api/jobs/:jobId/retry', requireAuth, async (req: any, res: any) => {
 });
 
 // ─── Telegram Bot Initialization ──────────────────────────────────────────────
-const bot = initBot({
+const bot = process.env.CLOUDYTE_TEST_MODE === '1' ? null : initBot({
   connectToMongo,
   getUserIdByTg,
   getDriveClient,
@@ -3076,18 +3842,20 @@ const bot = initBot({
 });
 
 // ─── Vite / Static Middleware ────────────────────────────────────────────────
-if (process.env.NODE_ENV !== 'production') {
-  const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
-  app.use(vite.middlewares);
-} else {
-  const distPath = path.join(process.cwd(), 'dist');
-  app.use(express.static(distPath));
-  app.get('*', (req, res, next) => {
-    if (req.path.startsWith('/api') || req.path.startsWith('/auth') || req.path.startsWith('/s/')) {
-      return next();
-    }
-    res.sendFile(path.join(distPath, 'index.html'));
-  });
+if (process.env.CLOUDYTE_TEST_MODE !== '1') {
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req, res, next) => {
+      if (req.path.startsWith('/api') || req.path.startsWith('/auth') || req.path.startsWith('/s/')) {
+        return next();
+      }
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
 }
 
 // ─── 7. ROBUSTNESS: Final Express Error Handler ───────────────────────────────
@@ -3136,18 +3904,22 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 // ─── Startup ──────────────────────────────────────────────────────────────────
-try {
-  await connectToMongo();
-} catch (err) {
-  console.error('[Startup] Initial MongoDB connection failed:', err);
+if (process.env.CLOUDYTE_TEST_MODE !== '1') {
+  try {
+    await connectToMongo();
+  } catch (err) {
+    console.error('[Startup] Initial MongoDB connection failed:', err);
+  }
+  pruneThumbDir(THUMB_DIR);
+  pruneTempFiles();
+  setInterval(() => pruneThumbDir(THUMB_DIR), 3600000);
+  setInterval(() => pruneTempFiles(), 3600000);
+  setInterval(() => sweepUploadSessions().catch(err => console.error('[UploadSessions] Sweep failed:', err)), 5 * 60 * 1000);
+  runJobWorker();
+  setInterval(() => runJobWorker(), 2000);
+  server = app.listen(Number(PORT), '0.0.0.0', () => console.log(`Cloudyte running at http://localhost:${PORT}`));
 }
-pruneThumbDir(THUMB_DIR);
-pruneTempFiles();
-setInterval(() => pruneThumbDir(THUMB_DIR), 3600000);
-setInterval(() => pruneTempFiles(), 3600000);
-setInterval(() => sweepUploadSessions().catch(err => console.error('[UploadSessions] Sweep failed:', err)), 5 *  60 * 1000);
-runJobWorker();
-setInterval(() => runJobWorker(), 2000);
-server = app.listen(Number(PORT), '0.0.0.0', () => console.log(`Cloudyte running at http://localhost:${PORT}`));
 
+export { sweepUploadSessions, pruneTempFiles, pruneThumbDir };
 export default app;
+
