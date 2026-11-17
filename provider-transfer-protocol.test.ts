@@ -1,0 +1,1972 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { Readable } from 'node:stream';
+import { ObjectId } from 'mongodb';
+import {
+  parseGoogleRangeOffset,
+  parseOneDriveNextOffset,
+  withSessionLock,
+  validateUploadRequest,
+  validateKeyBackupInput,
+  validateOpaqueFilename,
+  computeFileSha256,
+} from './provider-transfer-protocol.ts';
+
+process.env.CLOUDYTE_TEST_MODE = '1';
+
+const {
+  app,
+  setTestDependencies,
+  sweepUploadSessions,
+  sweepExpiredTrash,
+  runJobWorker,
+  runEncryptionMigration,
+  TEMP_DIR,
+} = await import('./server.ts');
+
+// ─── In-memory MongoDB Mock for Integration Tests ───────────────────────────
+function matchesQuery(doc: any, query: any): boolean {
+  if (!query || Object.keys(query).length === 0) return true;
+  for (const [k, v] of Object.entries(query)) {
+    if (k === '$or' && Array.isArray(v)) {
+      if (!v.some((sub) => matchesQuery(doc, sub))) return false;
+      continue;
+    }
+    if (k === '$and' && Array.isArray(v)) {
+      if (!v.every((sub) => matchesQuery(doc, sub))) return false;
+      continue;
+    }
+    const fieldVal = k.includes('.')
+      ? k.split('.').reduce((acc, part) => (acc ? acc[part] : undefined), doc)
+      : doc[k];
+
+    if (v instanceof RegExp) {
+      if (!v.test(String(fieldVal ?? ''))) return false;
+      continue;
+    }
+    if (v instanceof ObjectId || fieldVal instanceof ObjectId) {
+      if (String(fieldVal) !== String(v)) return false;
+      continue;
+    }
+    if (v && typeof v === 'object' && !Array.isArray(v) && !(v instanceof Date)) {
+      const cond = v as Record<string, any>;
+      if ('$exists' in cond) {
+        const exists = fieldVal !== undefined;
+        if ( Boolean(cond.$exists) !== exists) return false;
+      }
+      if ('$in' in cond && Array.isArray(cond.$in)) {
+        if (!cond.$in.some((item: any) => String(item) === String(fieldVal))) return false;
+      }
+      if ('$nin' in cond && Array.isArray(cond.$nin)) {
+        if (cond.$nin.some((item: any) => String(item) === String(fieldVal))) return false;
+      }
+      if ('$ne' in cond) {
+        if (String(fieldVal) === String(cond.$ne)) return false;
+      }
+      if ('$lte' in cond) {
+        const left = fieldVal instanceof Date ? fieldVal.getTime() : Number(fieldVal);
+        const right = cond.$lte instanceof Date ? cond.$lte.getTime() : Number(cond.$lte);
+        if (!(left <= right)) return false;
+      }
+      if ('$lt' in cond) {
+        const left = fieldVal instanceof Date ? fieldVal.getTime() : Number(fieldVal);
+        const right = cond.$lt instanceof Date ? cond.$lt.getTime() : Number(cond.$lt);
+        if (!(left < right)) return false;
+      }
+      if ('$gt' in cond) {
+        const left = fieldVal instanceof Date ? fieldVal.getTime() : Number(fieldVal);
+        const right = cond.$gt instanceof Date ? cond.$gt.getTime() : Number(cond.$gt);
+        if (!(left > right)) return false;
+      }
+      if ('$regex' in cond) {
+        const re = new RegExp(cond.$regex, cond.$options || '');
+        if (!re.test(String(fieldVal ?? ''))) return false;
+      }
+      continue;
+    }
+    if (fieldVal !== v && String(fieldVal) !== String(v)) return false;
+  }
+  return true;
+}
+
+class InMemoryCollection {
+  docs: any[] = [];
+  indexes: any[] = [];
+
+  async createIndex(keys: any, options?: any) {
+    this.indexes.push({ keys, options });
+    return 'idx';
+  }
+  async findOne(query: any = {}) {
+    return this.docs.find((d) => matchesQuery(d, query)) || null;
+  }
+  find(query: any = {}) {
+    let results = this.docs.filter((d) => matchesQuery(d, query));
+    const cursor = {
+      sort: (sortSpec: Record<string, number>) => {
+        const entries = Object.entries(sortSpec);
+        results = [...results].sort((a, b) => {
+          for (const [field, dir] of entries) {
+            const av = a[field];
+            const bv = b[field];
+            if (av === bv) continue;
+            return (av > bv ? 1 : -1) * dir;
+          }
+          return 0;
+        });
+        return cursor;
+      },
+      limit: (n: number) => {
+        results = results.slice(0, n);
+        return cursor;
+      },
+      toArray: async () => results.map((d) => ({ ...d })),
+    };
+    return cursor;
+  }
+  async insertOne(doc: any) {
+    const record = { _id: doc._id ?? new ObjectId(), ...doc };
+    this.docs.push(record);
+    return { insertedId: record._id };
+  }
+  async updateOne(query: any, update: any, options?: { upsert?: boolean }) {
+    const idx = this.docs.findIndex((d) => matchesQuery(d, query));
+    if (idx === -1) {
+      if (options?.upsert) {
+        const base: any = { _id: new ObjectId() };
+        for (const [k, v] of Object.entries(query)) {
+          if (!k.startsWith('$') && (typeof v !== 'object' || v instanceof ObjectId)) {
+            base[k] = v;
+          }
+        }
+        if (update.$setOnInsert) Object.assign(base, update.$setOnInsert);
+        if (update.$set) Object.assign(base, update.$set);
+        this.docs.push(base);
+        return { matchedCount: 0, modifiedCount: 0, upsertedCount: 1, upsertedId: base._id };
+      }
+      return { matchedCount: 0, modifiedCount: 0 };
+    }
+    const target = { ...this.docs[idx] };
+    if (update.$set) Object.assign(target, update.$set);
+    if (update.$unset) {
+      for (const k of Object.keys(update.$unset)) delete target[k];
+    }
+    if (update.$inc) {
+      for (const [k, v] of Object.entries(update.$inc)) target[k] = Number(target[k] || 0) + Number(v);
+    }
+    this.docs[idx] = target;
+    return { matchedCount: 1, modifiedCount: 1 };
+  }
+  async updateMany(query: any, update: any) {
+    let count = 0;
+    this.docs = this.docs.map((d) => {
+      if (!matchesQuery(d, query)) return d;
+      count++;
+      const copy = { ...d };
+      if (update.$set) Object.assign(copy, update.$set);
+      return copy;
+    });
+    return { matchedCount: count, modifiedCount: count };
+  }
+  async deleteOne(query: any) {
+    const idx = this.docs.findIndex((d) => matchesQuery(d, query));
+    if (idx === -1) return { deletedCount: 0 };
+    this.docs.splice(idx, 1);
+    return { deletedCount: 1 };
+  }
+  async findOneAndDelete(query: any) {
+    const idx = this.docs.findIndex((d) => matchesQuery(d, query));
+    if (idx === -1) return null;
+    const [removed] = this.docs.splice(idx, 1);
+    return { ...removed };
+  }
+  async findOneAndUpdate(query: any, update: any, options?: { returnDocument?: string }) {
+    const idx = this.docs.findIndex((d) => matchesQuery(d, query));
+    if (idx === -1) return null;
+    const before = { ...this.docs[idx] };
+    const after = { ...this.docs[idx] };
+    if (update.$set) Object.assign(after, update.$set);
+    if (update.$inc) {
+      for (const [k, v] of Object.entries(update.$inc)) after[k] = Number(after[k] || 0) + Number(v);
+    }
+    this.docs[idx] = after;
+    return options?.returnDocument === 'after' ? after : before;
+  }
+  async deleteMany(query: any) {
+    const before = this.docs.length;
+    this.docs = this.docs.filter((d) => !matchesQuery(d, query));
+    return { deletedCount: before - this.docs.length };
+  }
+  async countDocuments(query: any = {}) {
+    return this.docs.filter((d) => matchesQuery(d, query)).length;
+  }
+  aggregate(pipeline: any[]) {
+    return {
+      toArray: async () => {
+        let items = [...this.docs];
+        for (const stage of pipeline) {
+          if (stage.$match) {
+            items = items.filter((d) => matchesQuery(d, stage.$match));
+          } else if (stage.$group) {
+            const total = items.reduce((sum, d) => sum + Number(d.encryptedSizeBytes ?? d.size ?? 0), 0);
+            return [{ _id: null, total, usedBytes: total, count: items.length, fileCount: items.length, images: 0, videos: 0, audio: 0, documents: 0, archives: 0, other: total }];
+          }
+        }
+        return items;
+      },
+    };
+  }
+}
+
+class InMemoryDatabase {
+  collections = new Map<string, InMemoryCollection>();
+  collection(name: string) {
+    if (!this.collections.has(name)) {
+      this.collections.set(name, new InMemoryCollection());
+    }
+    return this.collections.get(name)!;
+  }
+}
+
+// ─── Test Harness & Crypto Helpers ───────────────────────────────────────────
+function buildCyte1Blob(plaintext: Buffer): { blob: Buffer; sha256: string } {
+  const magic = Buffer.from('CYTE1', 'ascii');
+  const header = crypto.randomBytes(28);
+  const tag = crypto.randomBytes(16);
+  const ciphertext = Buffer.from(plaintext.map((b, i) => b ^ header[i % header.length]));
+  const blob = Buffer.concat([magic, header, ciphertext, tag]);
+  const sha256 = crypto.createHash('sha256').update(blob).digest('hex');
+  return { blob, sha256 };
+}
+
+function buildValidEncryptedMetadata(keyId = 'key_primary_01') {
+  return {
+    metadataVersion: 1 as const,
+    algorithm: 'AES-256-GCM' as const,
+    keyId,
+    nonce: crypto.randomBytes(12).toString('base64url'),
+    ciphertext: Buffer.from(JSON.stringify({ encrypted: 'opaque-envelope-payload' })).toString('base64url'),
+  };
+}
+
+// ─── Existing Unit Tests ─────────────────────────────────────────────────────
+test('OneDrive parses the first expected range as the committed exclusive offset', () => {
+  assert.equal(parseOneDriveNextOffset(['0-'], 100), 0);
+  assert.equal(parseOneDriveNextOffset(['3276800-'], 10_000_000), 3_276_800);
+  assert.equal(parseOneDriveNextOffset(['100-200', '400-'], 1_000), 100);
+});
+
+test('OneDrive empty ranges use the caller fallback and malformed/out-of-range offsets fail', () => {
+  assert.equal(parseOneDriveNextOffset([], 100, 45), 45);
+  assert.throws(() => parseOneDriveNextOffset(['x-'], 100));
+  assert.throws(() => parseOneDriveNextOffset(['101-'], 100));
+});
+
+test('Google Drive 308 Range is converted to an exclusive offset; missing Range means zero', () => {
+  assert.equal(parseGoogleRangeOffset(undefined, 100), 0);
+  assert.equal(parseGoogleRangeOffset('bytes=0-0', 100), 1);
+  assert.equal(parseGoogleRangeOffset('bytes=0-8388607', 16_777_216), 8_388_608);
+});
+
+test('Google Drive rejects malformed and out-of-range acknowledgements', () => {
+  assert.throws(() => parseGoogleRangeOffset('bytes=1-2', 100));
+  assert.throws(() => parseGoogleRangeOffset('bytes=0-100', 100));
+});
+
+test('same-session operations serialize while different sessions remain independent', async () => {
+  const order: string[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const first = withSessionLock('same', async () => { order.push('first-start'); await gate; order.push('first-end'); });
+  const second = withSessionLock('same', async () => { order.push('second-start'); });
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.deepEqual(order, ['first-start']);
+  release(); await Promise.all([first, second]);
+  assert.deepEqual(order, ['first-start', 'first-end', 'second-start']);
+});
+
+test('committed chunk replay is only accepted when offset, size, and SHA-256 match', async () => {
+  const bytes = Buffer.from('chunk-data');
+  const digest = crypto.createHash('sha256').update(bytes).digest('hex');
+  const isExactReplay = (record: any, offset: number, data: Buffer) => record.offset === offset && record.length === data.length && record.checksum === crypto.createHash('sha256').update(data).digest('hex');
+  const record = { offset: 0, length: bytes.length, checksum: digest };
+  assert.equal(isExactReplay(record, 0, bytes), true);
+  assert.equal(isExactReplay(record, 1, bytes), false);
+  assert.equal(isExactReplay(record, 0, Buffer.from('different')), false);
+});
+
+test('computeFileSha256 streams multi-chunk files without full memory buffering', async () => {
+  const tmpFile = path.join(os.tmpdir(), `cloudyte-sha-${Date.now()}-${Math.random().toString(16).slice(2)}.bin`);
+  const payload = crypto.randomBytes(700 * 1024);
+  fs.writeFileSync(tmpFile, payload);
+  try {
+    const actual = await computeFileSha256(tmpFile, fs);
+    const expected = crypto.createHash('sha256').update(payload).digest('hex');
+    assert.equal(actual, expected);
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch {}
+  }
+});
+
+// ─── Full Backend E2EE Integration Suite (Tests 1..39) ───────────────────────
+test('Cloudyte E2EE Backend Suite (Tests 1-39)', async (t) => {
+  const mockDb = new InMemoryDatabase();
+  const telegramBlobs = new Map<number, { bytes: Buffer; caption: string; fileName: string }>();
+  const googleBlobs = new Map<string, { bytes: Buffer; name: string; mimeType: string; parents: string[]; trashed?: boolean }>();
+  const oneDriveBlobs = new Map<string, { bytes: Buffer; name: string; mimeType: string; parentId: string }>();
+  let nextTgMsgId = 1000;
+  let nextGoogleId = 2000;
+  let nextOneDriveId = 3000;
+  let thumbGenerationCalls = 0;
+
+  const user1Id = 'user_1';
+  const user2Id = 'user_2';
+  const token1 = 'tok_user_1_valid';
+  const token2 = 'tok_user_2_valid';
+
+  const tgAccount1Id = new ObjectId('65f000000000000000000001');
+  const gdAccount1Id = new ObjectId('65f000000000000000000002');
+  const odAccount1Id = new ObjectId('65f000000000000000000003');
+  const tgAccount2Id = new ObjectId('65f000000000000000000004');
+
+  await mockDb.collection('users').insertOne({ _id: user1Id, username: 'alice', isActive: true, isAdmin: false });
+  await mockDb.collection('users').insertOne({ _id: user2Id, username: 'bob', isActive: true, isAdmin: false });
+  await mockDb.collection('sessions').insertOne({ token: token1, userId: user1Id, username: 'alice' });
+  await mockDb.collection('sessions').insertOne({ token: token2, userId: user2Id, username: 'bob' });
+
+  await mockDb.collection('accounts').insertOne({ _id: tgAccount1Id, userId: user1Id, accountType: 'tgdrive', channelId: '-100111', name: 'Alice TG' });
+  await mockDb.collection('accounts').insertOne({ _id: gdAccount1Id, userId: user1Id, accountType: 'google', email: 'alice@gmail.com', tokens: { access_token: 'gd_tok' }, name: 'Alice GDrive' });
+  await mockDb.collection('accounts').insertOne({ _id: odAccount1Id, userId: user1Id, accountType: 'onedrive', email: 'alice@outlook.com', tokens: { access_token: 'od_tok' }, name: 'Alice OneDrive' });
+  await mockDb.collection('accounts').insertOne({ _id: tgAccount2Id, userId: user2Id, accountType: 'tgdrive', channelId: '-100222', name: 'Bob TG' });
+
+  const mockTgClient = {
+    sendFile: async (_peer: any, opts: any) => {
+      const msgId = ++nextTgMsgId;
+      const bytes = typeof opts.file === 'string' ? fs.readFileSync(opts.file) : Buffer.from(opts.file);
+      const attrName = opts.attributes?.[0]?.fileName || 'unknown';
+      telegramBlobs.set(msgId, { bytes, caption: opts.caption || '', fileName: attrName });
+      return { id: msgId };
+    },
+    getMessages: async (_peer: any, { ids }: { ids: number[] }) => {
+      const msgId = ids[0];
+      const item = telegramBlobs.get(msgId);
+      if (!item) return [];
+      return [{ id: msgId, media: { msgId, document: { size: item.bytes.length, thumbs: [{ w: 320, h: 320 }] } } }];
+    },
+    iterDownload: async function* (opts: any) {
+      const msgId = opts.file.msgId;
+      const item = telegramBlobs.get(msgId);
+      if (!item) return;
+      if (opts.offset !== undefined && typeof opts.offset?.divide !== 'function') {
+        throw new TypeError('offset.divide is not a function');
+      }
+      const offset = opts.offset !== undefined
+        ? (typeof opts.offset.toJSNumber === 'function' ? opts.offset.toJSNumber() : Number(opts.offset))
+        : 0;
+      const slice = item.bytes.subarray(offset);
+      const chunkSize = Number(opts.requestSize || 65536);
+      for (let i = 0; i < slice.length; i += chunkSize) {
+        yield slice.subarray(i, Math.min(i + chunkSize, slice.length));
+      }
+    },
+    downloadMedia: async () => {
+      thumbGenerationCalls++;
+      return Buffer.alloc(0);
+    },
+    deleteMessages: async (_peer: any, ids: number[]) => {
+      for (const id of ids) telegramBlobs.delete(id);
+    },
+  };
+
+  const mockDriveFactory = async () => ({
+    context: { _options: { auth: { getAccessToken: async () => 'gd_access_token' } } },
+    about: {
+      get: async () => ({
+        data: {
+          storageQuota: { usage: '1234', limit: '0' },
+          user: { emailAddress: 'alice@gmail.com' },
+        },
+      }),
+    },
+    files: {
+      create: async ({ requestBody, media }: any) => {
+        const id = `gd_${++nextGoogleId}`;
+        const chunks: Buffer[] = [];
+        if (media?.body) {
+          for await (const ch of media.body) chunks.push(Buffer.from(ch));
+        }
+        googleBlobs.set(id, {
+          bytes: Buffer.concat(chunks),
+          name: requestBody.name,
+          mimeType: media?.mimeType || requestBody.mimeType || 'application/octet-stream',
+          parents: requestBody.parents || ['root'],
+        });
+        return { data: { id, name: requestBody.name } };
+      },
+      list: async ({ q }: any = {}) => {
+        const wantTrashed = typeof q === 'string' && q.includes('trashed = true');
+        const wantNotTrashed = typeof q === 'string' && q.includes('trashed = false');
+        const files = Array.from(googleBlobs.entries())
+          .filter(([, g]) => {
+            if (wantTrashed) return g.trashed === true;
+            if (wantNotTrashed) return !g.trashed;
+            return true;
+          })
+          .map(([id, g]) => ({
+            id,
+            name: g.name,
+            mimeType: g.mimeType,
+            size: String(g.bytes.length),
+            modifiedTime: new Date().toISOString(),
+            createdTime: new Date().toISOString(),
+            webViewLink: `https://drive.google.com/file/d/${id}`,
+          }));
+        return { data: { files } };
+      },
+      get: async ({ fileId, alt }: any, options?: any) => {
+        const item = googleBlobs.get(String(fileId));
+        if (!item) throw new Error('Google file not found');
+        if (alt === 'media') {
+          const rangeHeader = options?.headers?.Range as string | undefined;
+          if (rangeHeader && rangeHeader.startsWith('bytes=')) {
+            const [sStr, eStr] = rangeHeader.replace('bytes=', '').split('-');
+            const start = parseInt(sStr, 10);
+            const end = eStr ? parseInt(eStr, 10) : item.bytes.length - 1;
+            const slice = item.bytes.subarray(start, end + 1);
+            return {
+              status: 206,
+              headers: {
+                'content-range': `bytes ${start}-${end}/${item.bytes.length}`,
+                'content-length': String(slice.length),
+                'accept-ranges': 'bytes',
+              },
+              data: Readable.from(slice),
+            };
+          }
+          return {
+            status: 200,
+            headers: {
+              'content-length': String(item.bytes.length),
+              'accept-ranges': 'bytes',
+            },
+            data: Readable.from(item.bytes),
+          };
+        }
+        return { data: { id: fileId, name: item.name, mimeType: item.mimeType, parents: item.parents, size: String(item.bytes.length) } };
+      },
+      update: async ({ fileId, requestBody, addParents }: any) => {
+        const item = googleBlobs.get(String(fileId));
+        if (item) {
+          if (requestBody?.name) item.name = requestBody.name;
+          if (typeof requestBody?.trashed === 'boolean') item.trashed = requestBody.trashed;
+          if (addParents) item.parents = [addParents];
+        }
+        return { data: { id: fileId, parents: item?.parents || [] } };
+      },
+      copy: async ({ fileId, requestBody }: any) => {
+        const orig = googleBlobs.get(String(fileId));
+        if (!orig) throw new Error('Source not found');
+        const id = `gd_${++nextGoogleId}`;
+        googleBlobs.set(id, {
+          bytes: Buffer.from(orig.bytes),
+          name: requestBody?.name || orig.name,
+          mimeType: orig.mimeType,
+          parents: requestBody?.parents || orig.parents,
+        });
+        return { data: { id, name: requestBody?.name || orig.name } };
+      },
+      delete: async ({ fileId }: any) => {
+        googleBlobs.delete(String(fileId));
+      },
+    },
+  });
+
+  // Start local test HTTP server for Express app + mock OneDrive download endpoint
+  const server = app.listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', () => resolve()));
+  const addr = server.address() as { port: number };
+  const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+  // Add a mock internal route to serve OneDrive raw bytes for axios stream downloads
+  app.get('/__test_onedrive_dl/:itemId', (req: any, res: any) => {
+    const item = oneDriveBlobs.get(req.params.itemId);
+    if (!item) return res.status(404).end();
+    const range = req.headers.range;
+    if (range && range.startsWith('bytes=')) {
+      const [sStr, eStr] = range.replace('bytes=', '').split('-');
+      const start = parseInt(sStr, 10);
+      const end = eStr ? parseInt(eStr, 10) : item.bytes.length - 1;
+      const slice = item.bytes.subarray(start, end + 1);
+      res.status(206);
+      res.setHeader('content-range', `bytes ${start}-${end}/${item.bytes.length}`);
+      res.setHeader('content-length', String(slice.length));
+      res.setHeader('accept-ranges', 'bytes');
+      return res.end(slice);
+    }
+    res.setHeader('content-length', String(item.bytes.length));
+    res.setHeader('accept-ranges', 'bytes');
+    return res.end(item.bytes);
+  });
+
+  const mockOneDriveFactory = async () => ({
+    api: (apiPath: string) => ({
+      put: async (stream: NodeJS.ReadableStream) => {
+        const chunks: Buffer[] = [];
+        for await (const ch of stream) chunks.push(Buffer.from(ch));
+        const match = apiPath.match(/:\/([^:]+):\/content$/);
+        const name = match ? decodeURIComponent(match[1]) : 'od_file';
+        const id = `od_${++nextOneDriveId}`;
+        oneDriveBlobs.set(id, { bytes: Buffer.concat(chunks), name, mimeType: 'application/octet-stream', parentId: 'root' });
+        return { id, name };
+      },
+      get: async () => {
+        if (apiPath === '/me/drive') {
+          return { quota: { used: 2048, total: 0 } };
+        }
+        if (apiPath === '/me/drive/root') {
+          return { id: 'od_root' };
+        }
+        if (apiPath.endsWith('/children')) {
+          return {
+            value: Array.from(oneDriveBlobs.entries()).map(([id, item]) => ({
+              id,
+              name: item.name,
+              file: { mimeType: item.mimeType },
+              size: item.bytes.length,
+              lastModifiedDateTime: new Date().toISOString(),
+              createdDateTime: new Date().toISOString(),
+              webUrl: `https://onedrive.live.com/${id}`,
+            })),
+          };
+        }
+        const m = apiPath.match(/\/me\/drive\/items\/([^/]+)$/);
+        if (m) {
+          const item = oneDriveBlobs.get(m[1]);
+          if (!item) throw new Error('OneDrive item not found');
+          return {
+            id: m[1],
+            name: item.name,
+            size: item.bytes.length,
+            file: { mimeType: item.mimeType },
+            '@microsoft.graph.downloadUrl': `${baseUrl}/__test_onedrive_dl/${m[1]}`,
+          };
+        }
+        return { value: [] };
+      },
+      delete: async () => {
+        const m = apiPath.match(/\/me\/drive\/items\/([^/]+)$/);
+        if (m) oneDriveBlobs.delete(m[1]);
+      },
+      patch: async (body: any) => {
+        const m = apiPath.match(/\/me\/drive\/items\/([^/]+)$/);
+        if (m && oneDriveBlobs.has(m[1])) {
+          const item = oneDriveBlobs.get(m[1])!;
+          if (body?.name) item.name = body.name;
+          if (body?.parentReference?.id) item.parentId = body.parentReference.id;
+        }
+      },
+      post: async (body: any) => {
+        const copyMatch = apiPath.match(/\/me\/drive\/items\/([^/]+)\/copy$/);
+        if (copyMatch) {
+          const orig = oneDriveBlobs.get(copyMatch[1]);
+          if (!orig) throw new Error('OneDrive source item not found');
+          const id = `od_${++nextOneDriveId}`;
+          oneDriveBlobs.set(id, {
+            bytes: Buffer.from(orig.bytes),
+            name: body?.name || orig.name,
+            mimeType: orig.mimeType,
+            parentId: body?.parentReference?.id || orig.parentId,
+          });
+          return { id };
+        }
+        return {};
+      },
+    }),
+  });
+
+  setTestDependencies({
+    db: mockDb,
+    getTgClient: async () => mockTgClient,
+    resolvePeer: async (_tg: any, channelId: string) => ({ channelId }),
+    getDriveClient: mockDriveFactory,
+    getOneDriveClient: mockOneDriveFactory,
+  });
+
+  t.after(() => {
+    setTestDependencies(null);
+    server.close();
+  });
+
+  async function apiFetch(urlPath: string, init: RequestInit = {}, token = token1) {
+    const headers = new Headers(init.headers || {});
+    if (token) headers.set('Authorization', `Bearer ${token}`);
+    return fetch(`${baseUrl}${urlPath}`, { ...init, headers });
+  }
+
+  async function uploadMultipart(accountId: string, fileBytes: Buffer, fileName: string, fields: Record<string, string>, token = token1) {
+    const form = new FormData();
+    for (const [k, v] of Object.entries(fields)) form.append(k, v);
+    form.append('file', new Blob([fileBytes], { type: fields.mimeType || 'application/octet-stream' }), fileName);
+    return apiFetch(`/api/upload/${accountId}`, { method: 'POST', body: form }, token);
+  }
+
+  // ── 1. Direct plaintext upload still works and sets isEncrypted = false ──
+  await t.test('1. Direct plaintext upload sets isEncrypted = false', async () => {
+    const plainBytes = Buffer.from('Hello Cloudyte Plaintext World!');
+    const res = await uploadMultipart(String(tgAccount1Id), plainBytes, 'notes.txt', {
+      fileName: 'notes.txt',
+      mimeType: 'text/plain',
+      folderId: 'root',
+    });
+    assert.equal(res.status, 200);
+    const body: any = await res.json();
+    assert.equal(body.success, true);
+    assert.equal(body.isEncrypted, false);
+
+    const listRes = await apiFetch(`/api/files?accountId=${tgAccount1Id}`);
+    const files: any[] = await listRes.json();
+    const uploaded = files.find((f) => f.name === 'notes.txt');
+    assert.ok(uploaded);
+    assert.equal(uploaded.isEncrypted, false);
+    assert.equal(uploaded.encryptionFormatVersion, null);
+    assert.equal(uploaded.encryptedMetadata, null);
+  });
+
+  // ── 2. Direct encrypted upload stores encrypted metadata and opaque filename ──
+  let tgEncryptedFileId = '';
+  const tgEncryptedPayload = buildCyte1Blob(Buffer.from('Top secret financial report 2026'));
+  const tgEncryptedMeta = buildValidEncryptedMetadata('key_tg_1');
+  const tgOpaqueName = 'cyte_tg01secretblob9999.cyte1';
+
+  await t.test('2. Direct encrypted upload stores encrypted metadata and opaque filename', async () => {
+    const res = await uploadMultipart(String(tgAccount1Id), tgEncryptedPayload.blob, tgOpaqueName, {
+      fileName: tgOpaqueName,
+      opaqueRemoteName: tgOpaqueName,
+      mimeType: 'application/octet-stream',
+      size: String(tgEncryptedPayload.blob.length),
+      encryptedSizeBytes: String(tgEncryptedPayload.blob.length),
+      checksum: tgEncryptedPayload.sha256,
+      isEncrypted: 'true',
+      encryptionFormatVersion: '1',
+      encryptionKeyId: 'key_tg_1',
+      encryptedMetadata: JSON.stringify(tgEncryptedMeta),
+    });
+    assert.equal(res.status, 200);
+    const data: any = await res.json();
+    assert.equal(data.success, true);
+    assert.equal(data.isEncrypted, true);
+    assert.equal(data.encryptedChecksum, tgEncryptedPayload.sha256);
+
+    const storedDoc = await mockDb.collection('tg_files').findOne({ accountId: tgAccount1Id, name: tgOpaqueName });
+    assert.ok(storedDoc);
+    tgEncryptedFileId = String(storedDoc._id);
+    assert.equal(storedDoc.isEncrypted, true);
+    assert.equal(storedDoc.opaqueRemoteName, tgOpaqueName);
+    assert.equal(storedDoc.plaintextSizeBytes, null);
+    assert.equal(storedDoc.plaintextChecksum, null);
+    // Verify Telegram caption contains no plaintext filename/MIME
+    const tgMsg = telegramBlobs.get(storedDoc.messageId);
+    assert.ok(tgMsg);
+    assert.equal(tgMsg.caption, 'cloudyte:c1');
+  });
+
+  // ── 3. Direct encrypted upload rejects checksum mismatch with 422 ENCRYPTED_CHECKSUM_MISMATCH ──
+  await t.test('3. Direct encrypted upload rejects checksum mismatch', async () => {
+    const res = await uploadMultipart(String(tgAccount1Id), tgEncryptedPayload.blob, 'cyte_badchecksum1234.bin', {
+      fileName: 'cyte_badchecksum1234.bin',
+      mimeType: 'application/octet-stream',
+      checksum: '0'.repeat(64),
+      isEncrypted: 'true',
+      encryptionFormatVersion: '1',
+      encryptionKeyId: 'key_tg_1',
+      encryptedMetadata: JSON.stringify(tgEncryptedMeta),
+    });
+    assert.equal(res.status, 422);
+    const err: any = await res.json();
+    assert.equal(err.code, 'ENCRYPTED_CHECKSUM_MISMATCH');
+  });
+
+  // ── 4. Direct encrypted upload rejects missing encryptedMetadata ──
+  await t.test('4. Direct encrypted upload rejects missing encryptedMetadata', async () => {
+    const res = await uploadMultipart(String(tgAccount1Id), tgEncryptedPayload.blob, 'cyte_nometa12345.bin', {
+      fileName: 'cyte_nometa12345.bin',
+      mimeType: 'application/octet-stream',
+      checksum: tgEncryptedPayload.sha256,
+      isEncrypted: 'true',
+      encryptionFormatVersion: '1',
+      encryptionKeyId: 'key_tg_1',
+    });
+    assert.equal(res.status, 400);
+    const err: any = await res.json();
+    assert.equal(err.code, 'ENCRYPTED_METADATA_INVALID');
+  });
+
+  // ── 5. Direct encrypted upload rejects non-opaque filename ──
+  await t.test('5. Direct encrypted upload rejects non-opaque filename', async () => {
+    const res = await uploadMultipart(String(tgAccount1Id), tgEncryptedPayload.blob, 'MySecretPassport.pdf', {
+      fileName: 'MySecretPassport.pdf',
+      mimeType: 'application/octet-stream',
+      checksum: tgEncryptedPayload.sha256,
+      isEncrypted: 'true',
+      encryptionFormatVersion: '1',
+      encryptionKeyId: 'key_tg_1',
+      encryptedMetadata: JSON.stringify(tgEncryptedMeta),
+    });
+    assert.equal(res.status, 400);
+    const err: any = await res.json();
+    assert.equal(err.code, 'OPAQUE_FILENAME_REQUIRED');
+  });
+
+  // ── 6. Direct encrypted upload rejects non-octet-stream MIME type ──
+  await t.test('6. Direct encrypted upload rejects non-octet-stream MIME type', async () => {
+    const res = await uploadMultipart(String(tgAccount1Id), tgEncryptedPayload.blob, 'cyte_badmime1234.bin', {
+      fileName: 'cyte_badmime1234.bin',
+      mimeType: 'image/jpeg',
+      checksum: tgEncryptedPayload.sha256,
+      isEncrypted: 'true',
+      encryptionFormatVersion: '1',
+      encryptionKeyId: 'key_tg_1',
+      encryptedMetadata: JSON.stringify(tgEncryptedMeta),
+    });
+    assert.equal(res.status, 400);
+    const err: any = await res.json();
+    assert.equal(err.code, 'ENCRYPTED_MIME_INVALID');
+  });
+
+  // ── 7. Direct encrypted upload rejects unsupported encryptionFormatVersion ──
+  await t.test('7. Direct encrypted upload rejects unsupported encryptionFormatVersion', async () => {
+    const res = await uploadMultipart(String(tgAccount1Id), tgEncryptedPayload.blob, 'cyte_badver1234.bin', {
+      fileName: 'cyte_badver1234.bin',
+      mimeType: 'application/octet-stream',
+      checksum: tgEncryptedPayload.sha256,
+      isEncrypted: 'true',
+      encryptionFormatVersion: '99',
+      encryptionKeyId: 'key_tg_1',
+      encryptedMetadata: JSON.stringify(tgEncryptedMeta),
+    });
+    assert.equal(res.status, 400);
+    const err: any = await res.json();
+    assert.equal(err.code, 'UNSUPPORTED_ENCRYPTION_VERSION');
+  });
+
+  // ── 8. Resumable plaintext upload session still works ──
+  await t.test('8. Resumable plaintext upload session works end-to-end', async () => {
+    const plainData = Buffer.from('Resumable plaintext content chunk 1 + chunk 2');
+    const sha = crypto.createHash('sha256').update(plainData).digest('hex');
+    const createRes = await apiFetch(`/api/upload-sessions/${tgAccount1Id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fileName: 'resumable-plain.txt',
+        mimeType: 'text/plain',
+        size: plainData.length,
+        checksum: sha,
+        idempotencyKey: 'idem_plain_1',
+      }),
+    });
+    assert.equal(createRes.status, 201);
+    const session: any = await createRes.json();
+    assert.equal(session.isEncrypted, false);
+
+    const chunkForm = new FormData();
+    chunkForm.append('chunk', new Blob([plainData]), 'chunk.bin');
+    const putRes = await apiFetch(`/api/upload-sessions/${session.sessionId}/chunks`, {
+      method: 'PUT',
+      headers: { 'Content-Range': `bytes 0-${plainData.length - 1}/${plainData.length}` },
+      body: chunkForm,
+    });
+    assert.equal(putRes.status, 200);
+
+    const compRes = await apiFetch(`/api/upload-sessions/${session.sessionId}/complete`, { method: 'POST' });
+    assert.equal(compRes.status, 200);
+    const compBody: any = await compRes.json();
+    assert.equal(compBody.success, true);
+    assert.equal(compBody.isEncrypted, false);
+  });
+
+  // ── 9 & 10. Resumable encrypted upload session stores fields and returns them on GET ──
+  let encSessionId = '';
+  const sessionCyte = buildCyte1Blob(Buffer.from('Session encrypted payload across multiple chunks!'));
+  const sessionMeta = buildValidEncryptedMetadata('key_sess_1');
+  const sessionOpaqueName = 'cyte_sess_multi_chunk_01.cyte1';
+
+  await t.test('9 & 10. Resumable encrypted upload session stores and returns encryption fields', async () => {
+    const createRes = await apiFetch(`/api/upload-sessions/${tgAccount1Id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fileName: sessionOpaqueName,
+        opaqueRemoteName: sessionOpaqueName,
+        mimeType: 'application/octet-stream',
+        size: sessionCyte.blob.length,
+        encryptedSizeBytes: sessionCyte.blob.length,
+        checksum: sessionCyte.sha256,
+        idempotencyKey: 'idem_enc_sess_1',
+        isEncrypted: true,
+        encryptionFormatVersion: 1,
+        encryptionKeyId: 'key_sess_1',
+        encryptedMetadata: sessionMeta,
+      }),
+    });
+    assert.equal(createRes.status, 201);
+    const created: any = await createRes.json();
+    encSessionId = created.sessionId;
+    assert.equal(created.isEncrypted, true);
+    assert.equal(created.encryptionKeyId, 'key_sess_1');
+    assert.deepEqual(created.encryptedMetadata, sessionMeta);
+
+    const getRes = await apiFetch(`/api/upload-sessions/${encSessionId}`);
+    assert.equal(getRes.status, 200);
+    const statusBody: any = await getRes.json();
+    assert.equal(statusBody.isEncrypted, true);
+    assert.equal(statusBody.receivedBytes, 0);
+    assert.equal(statusBody.totalBytes, sessionCyte.blob.length);
+    assert.equal(statusBody.opaqueRemoteName, sessionOpaqueName);
+  });
+
+  // ── 11, 12, 13, 15. Chunk upload, idempotent replay, conflicting replay, and incomplete completion ──
+  await t.test('11, 12, 13, 15. Resumable encrypted chunk upload, replay, conflict, and incomplete check', async () => {
+    const split = Math.floor(sessionCyte.blob.length / 2);
+    const chunk1 = sessionCyte.blob.subarray(0, split);
+    const chunk2 = sessionCyte.blob.subarray(split);
+
+    // Upload chunk 1
+    const f1 = new FormData();
+    f1.append('chunk', new Blob([chunk1]), 'c1.bin');
+    const r1 = await apiFetch(`/api/upload-sessions/${encSessionId}/chunks`, {
+      method: 'PUT',
+      headers: { 'Content-Range': `bytes 0-${chunk1.length - 1}/${sessionCyte.blob.length}` },
+      body: f1,
+    });
+    assert.equal(r1.status, 200);
+
+    // 12. Idempotent replay of chunk 1 with identical bytes succeeds
+    const f1Replay = new FormData();
+    f1Replay.append('chunk', new Blob([chunk1]), 'c1.bin');
+    const rReplay = await apiFetch(`/api/upload-sessions/${encSessionId}/chunks`, {
+      method: 'PUT',
+      headers: { 'Content-Range': `bytes 0-${chunk1.length - 1}/${sessionCyte.blob.length}` },
+      body: f1Replay,
+    });
+    assert.equal(rReplay.status, 200);
+
+    // 13. Conflicting replay of chunk 1 with altered bytes fails with 409 UPLOAD_SESSION_OFFSET_CONFLICT
+    const badChunk1 = Buffer.from(chunk1);
+    badChunk1[0] ^= 0xff;
+    const f1Conflict = new FormData();
+    f1Conflict.append('chunk', new Blob([badChunk1]), 'c1.bin');
+    const rConflict = await apiFetch(`/api/upload-sessions/${encSessionId}/chunks`, {
+      method: 'PUT',
+      headers: { 'Content-Range': `bytes 0-${chunk1.length - 1}/${sessionCyte.blob.length}` },
+      body: f1Conflict,
+    });
+    assert.equal(rConflict.status, 409);
+    const conflictErr: any = await rConflict.json();
+    assert.equal(conflictErr.code, 'UPLOAD_SESSION_OFFSET_CONFLICT');
+
+    // 15. Completing before chunk 2 is uploaded fails with 409 ENCRYPTED_UPLOAD_INCOMPLETE
+    const rIncomplete = await apiFetch(`/api/upload-sessions/${encSessionId}/complete`, { method: 'POST' });
+    assert.equal(rIncomplete.status, 409);
+    const incErr: any = await rIncomplete.json();
+    assert.equal(incErr.code, 'ENCRYPTED_UPLOAD_INCOMPLETE');
+
+    // Upload chunk 2 and complete
+    const f2 = new FormData();
+    f2.append('chunk', new Blob([chunk2]), 'c2.bin');
+    const r2 = await apiFetch(`/api/upload-sessions/${encSessionId}/chunks`, {
+      method: 'PUT',
+      headers: { 'Content-Range': `bytes ${split}-${sessionCyte.blob.length - 1}/${sessionCyte.blob.length}` },
+      body: f2,
+    });
+    assert.equal(r2.status, 200);
+
+    const rComp = await apiFetch(`/api/upload-sessions/${encSessionId}/complete`, { method: 'POST' });
+    assert.equal(rComp.status, 200);
+    const compJson: any = await rComp.json();
+    assert.equal(compJson.success, true);
+    assert.equal(compJson.isEncrypted, true);
+  });
+
+  // ── 14. Resumable encrypted session complete verifies full encrypted file SHA-256 ──
+  await t.test('14. Resumable encrypted session complete rejects full-file SHA-256 mismatch', async () => {
+    const payload = buildCyte1Blob(Buffer.from('Corrupted session test'));
+    const createRes = await apiFetch(`/api/upload-sessions/${tgAccount1Id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fileName: 'cyte_bad_sess_hash.bin',
+        mimeType: 'application/octet-stream',
+        size: payload.blob.length,
+        checksum: 'f'.repeat(64), // wrong expected hash
+        idempotencyKey: 'idem_bad_hash_sess',
+        isEncrypted: true,
+        encryptionFormatVersion: 1,
+        encryptionKeyId: 'key_sess_1',
+        encryptedMetadata: sessionMeta,
+      }),
+    });
+    const sess: any = await createRes.json();
+    const form = new FormData();
+    form.append('chunk', new Blob([payload.blob]), 'c.bin');
+    await apiFetch(`/api/upload-sessions/${sess.sessionId}/chunks`, {
+      method: 'PUT',
+      headers: { 'Content-Range': `bytes 0-${payload.blob.length - 1}/${payload.blob.length}` },
+      body: form,
+    });
+    const compRes = await apiFetch(`/api/upload-sessions/${sess.sessionId}/complete`, { method: 'POST' });
+    assert.equal(compRes.status, 422);
+    const err: any = await compRes.json();
+    assert.equal(err.code, 'ENCRYPTED_CHECKSUM_MISMATCH');
+  });
+
+  // ── 16 & 17. Cancelling active session andexpired session cleanup deletes temporary encrypted file ──
+  await t.test('16 & 17. Cancelling or expiring encrypted upload session deletes temp file', async () => {
+    const payload = buildCyte1Blob(Buffer.from('Temp cleanup test bytes'));
+    const cRes = await apiFetch(`/api/upload-sessions/${tgAccount1Id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fileName: 'cyte_cancel_test_01.bin',
+        mimeType: 'application/octet-stream',
+        size: payload.blob.length,
+        checksum: payload.sha256,
+        idempotencyKey: 'idem_cancel_01',
+        isEncrypted: true,
+        encryptionFormatVersion: 1,
+        encryptionKeyId: 'key_sess_1',
+        encryptedMetadata: sessionMeta,
+      }),
+    });
+    const sess: any = await cRes.json();
+    const f = new FormData();
+    f.append('chunk', new Blob([payload.blob]), 'c.bin');
+    await apiFetch(`/api/upload-sessions/${sess.sessionId}/chunks`, {
+      method: 'PUT',
+      headers: { 'Content-Range': `bytes 0-${payload.blob.length - 1}/${payload.blob.length}` },
+      body: f,
+    });
+    const dbSess = await mockDb.collection('upload_sessions').findOne({ sessionId: sess.sessionId });
+    assert.ok(fs.existsSync(dbSess.tempPath));
+
+    const delRes = await apiFetch(`/api/upload-sessions/${sess.sessionId}`, { method: 'DELETE' });
+    assert.equal(delRes.status, 204);
+    assert.equal(fs.existsSync(dbSess.tempPath), false);
+
+    // 17. Expired session sweep
+    const cRes2 = await apiFetch(`/api/upload-sessions/${tgAccount1Id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fileName: 'cyte_expire_test_02.bin',
+        mimeType: 'application/octet-stream',
+        size: 0,
+        checksum: crypto.createHash('sha256').update(Buffer.alloc(0)).digest('hex'),
+        idempotencyKey: 'idem_expire_02',
+        isEncrypted: true,
+        encryptionFormatVersion: 1,
+        encryptionKeyId: 'key_sess_1',
+        encryptedMetadata: sessionMeta,
+      }),
+    });
+    const sess2: any = await cRes2.json();
+    await mockDb.collection('upload_sessions').updateOne(
+      { sessionId: sess2.sessionId },
+      { $set: { expiresAt: new Date(Date.now() - 10000) } }
+    );
+    const dbSess2Before = await mockDb.collection('upload_sessions').findOne({ sessionId: sess2.sessionId });
+    assert.ok(fs.existsSync(dbSess2Before.tempPath));
+    await sweepUploadSessions();
+    assert.equal(fs.existsSync(dbSess2Before.tempPath), false);
+  });
+
+  // ── 18 & 19. GET /api/files returns encrypted metadata and thumbUrl = null ──
+  await t.test('18 & 19. GET /api/files returns encrypted metadata and thumbUrl = null', async () => {
+    const res = await apiFetch(`/api/files?accountId=${tgAccount1Id}`);
+    assert.equal(res.status, 200);
+    const items: any[] = await res.json();
+    const encItem = items.find((i) => i.id === tgEncryptedFileId);
+    assert.ok(encItem);
+    assert.equal(encItem.isEncrypted, true);
+    assert.equal(encItem.encryptionFormatVersion, 1);
+    assert.equal(encItem.encryptionKeyId, 'key_tg_1');
+    assert.equal(encItem.encryptedChecksum, tgEncryptedPayload.sha256);
+    assert.deepEqual(encItem.encryptedMetadata, tgEncryptedMeta);
+    assert.equal(encItem.thumbUrl, null);
+    assert.equal(encItem.type, 'other');
+    assert.equal(encItem.mimeType, 'application/octet-stream');
+  });
+
+  // ── 20, 21, 22, 23. GET /api/download returns exact encrypted bytes & supports Range ──
+  await t.test('20, 21, 22, 23. GET /api/download streams exact CYTE1 bytes and supports Range requests', async () => {
+    const res = await apiFetch(`/api/download/${tgAccount1Id}/${tgEncryptedFileId}`);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('content-type'), 'application/octet-stream');
+    assert.match(res.headers.get('content-disposition') || '', new RegExp(tgOpaqueName));
+    const downloaded = Buffer.from(await res.arrayBuffer());
+    assert.deepEqual(downloaded, tgEncryptedPayload.blob);
+
+    // 21 & 22. Valid Range request returns 206 Partial Content with exact encrypted slice
+    const rangeRes = await apiFetch(`/api/download/${tgAccount1Id}/${tgEncryptedFileId}`, {
+      headers: { Range: 'bytes=5-24' },
+    });
+    assert.equal(rangeRes.status, 206);
+    assert.equal(rangeRes.headers.get('content-range'), `bytes 5-24/${tgEncryptedPayload.blob.length}`);
+    const slice = Buffer.from(await rangeRes.arrayBuffer());
+    assert.deepEqual(slice, tgEncryptedPayload.blob.subarray(5, 25));
+
+    // 23. Invalid Range returns 416
+    const badRangeRes = await apiFetch(`/api/download/${tgAccount1Id}/${tgEncryptedFileId}`, {
+      headers: { Range: `bytes=${tgEncryptedPayload.blob.length + 100}-${tgEncryptedPayload.blob.length + 200}` },
+    });
+    assert.equal(badRangeRes.status, 416);
+  });
+
+  // ── 24 & 25. GET /api/thumb returns 409 ENCRYPTED_PREVIEW_UNAVAILABLE without calling Sharp/provider ──
+  await t.test('24 & 25. GET /api/thumb returns 409 ENCRYPTED_PREVIEW_UNAVAILABLE and never invokes thumbnail generator', async () => {
+    const beforeCalls = thumbGenerationCalls;
+    const res = await apiFetch(`/api/thumb/${tgAccount1Id}/${tgEncryptedFileId}?s=256`);
+    assert.equal(res.status, 409);
+    const body: any = await res.json();
+    assert.equal(body.code, 'ENCRYPTED_PREVIEW_UNAVAILABLE');
+    assert.equal(thumbGenerationCalls, beforeCalls);
+  });
+
+  // ── 26 & 27. POST /api/share returns 409 ENCRYPTED_SHARE_UNSUPPORTED for encrypted files, works for plaintext ──
+  await t.test('26 & 27. POST /api/share rejects encrypted files with 409 and allows plaintext files', async () => {
+    const encShareRes = await apiFetch('/api/share', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accountId: String(tgAccount1Id), fileId: tgEncryptedFileId }),
+    });
+    assert.equal(encShareRes.status, 409);
+    const errBody: any = await encShareRes.json();
+    assert.equal(errBody.code, 'ENCRYPTED_SHARE_UNSUPPORTED');
+
+    const plainDoc = await mockDb.collection('tg_files').findOne({ accountId: tgAccount1Id, name: 'notes.txt' });
+    const plainShareRes = await apiFetch('/api/share', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accountId: String(tgAccount1Id), fileId: String(plainDoc._id) }),
+    });
+    assert.equal(plainShareRes.status, 200);
+    const plainShareBody: any = await plainShareRes.json();
+    assert.equal(plainShareBody.success, true);
+    assert.ok(plainShareBody.shareUrl);
+  });
+
+  // ── 28, 29, 30, 31. Move & Copy within same account and across accounts preserves encryption fields ──
+  await t.test('28, 29, 30, 31. Move and copy preserve encryption fields within and across accounts', async () => {
+    // 28. Move within same account
+    const moveRes = await apiFetch('/api/files/move', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceAccountId: String(tgAccount1Id),
+        fileId: tgEncryptedFileId,
+        targetAccountId: String(tgAccount1Id),
+        targetFolderId: 'vault_folder',
+      }),
+    });
+    assert.equal(moveRes.status, 200);
+    const movedDoc = await mockDb.collection('tg_files').findOne({ _id: new ObjectId(tgEncryptedFileId) });
+    assert.equal(movedDoc.folder, 'vault_folder');
+    assert.equal(movedDoc.isEncrypted, true);
+    assert.deepEqual(movedDoc.encryptedMetadata, tgEncryptedMeta);
+
+    // 29. Copy within same account preserves opaque name (no " - Copy" suffix) and encryption fields
+    const copyRes = await apiFetch('/api/files/copy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceAccountId: String(tgAccount1Id),
+        fileId: tgEncryptedFileId,
+        targetAccountId: String(tgAccount1Id),
+        targetFolderId: 'vault_folder',
+      }),
+    });
+    assert.equal(copyRes.status, 200);
+    const copies = await mockDb.collection('tg_files').find({ accountId: tgAccount1Id, folder: 'vault_folder', name: tgOpaqueName }).toArray();
+    assert.equal(copies.length, 2);
+    for (const c of copies) {
+      assert.equal(c.isEncrypted, true);
+      assert.equal(c.name, tgOpaqueName);
+      assert.equal(c.shareId, null);
+    }
+
+    // 30 & 31. Cross-account copy from Telegram to Google Drive and OneDrive preserves encrypted bytes & metadata
+    const crossGdRes = await apiFetch('/api/files/copy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceAccountId: String(tgAccount1Id),
+        fileId: tgEncryptedFileId,
+        targetAccountId: String(gdAccount1Id),
+        targetFolderId: 'root',
+      }),
+    });
+    assert.equal(crossGdRes.status, 200);
+    const gdListRes = await apiFetch(`/api/files?accountId=${gdAccount1Id}`);
+    const gdFiles: any[] = await gdListRes.json();
+    const gdEnc = gdFiles.find((f) => f.name === tgOpaqueName);
+    assert.ok(gdEnc);
+    assert.equal(gdEnc.isEncrypted, true);
+    assert.deepEqual(gdEnc.encryptedMetadata, tgEncryptedMeta);
+
+    const gdDlRes = await apiFetch(`/api/download/${gdAccount1Id}/${gdEnc.id}`);
+    assert.equal(gdDlRes.status, 200);
+    assert.deepEqual(Buffer.from(await gdDlRes.arrayBuffer()), tgEncryptedPayload.blob);
+  });
+
+  // ── 32, 33, 34, 35. Key Backup PUT, GET, DELETE, and validation ──
+  await t.test('32, 33, 34, 35. Key backup PUT, GET, DELETE, and validation', async () => {
+    const validBackup = {
+      backupVersion: 1,
+      keyId: 'key_tg_1',
+      kdfAlgorithm: 'PBKDF2-HMAC-SHA256',
+      kdfIterations: 310000,
+      salt: crypto.randomBytes(16).toString('base64url'),
+      wrapAlgorithm: 'AES-256-GCM',
+      nonce: crypto.randomBytes(12).toString('base64url'),
+      wrappedKey: crypto.randomBytes(48).toString('base64url'),
+    };
+
+    // 32. PUT stores key backup
+    const putRes = await apiFetch(`/api/accounts/${tgAccount1Id}/encryption/key-backup`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(validBackup),
+    });
+    assert.equal(putRes.status, 200);
+    const putJson: any = await putRes.json();
+    assert.equal(putJson.keyId, 'key_tg_1');
+    assert.equal(putJson.kdfIterations, 310000);
+
+    // 33. GET returns key backup for owner
+    const getRes = await apiFetch(`/api/accounts/${tgAccount1Id}/encryption/key-backup`);
+    assert.equal(getRes.status, 200);
+    const getJson: any = await getRes.json();
+    assert.equal(getJson.wrappedKey, validBackup.wrappedKey);
+
+    // 35. Rejects low kdfIterations or forbidden secret fields
+    const lowIterRes = await apiFetch(`/api/accounts/${tgAccount1Id}/encryption/key-backup`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...validBackup, kdfIterations: 1000 }),
+    });
+    assert.equal(lowIterRes.status, 400);
+    assert.equal(((await lowIterRes.json()) as any).code, 'KEY_BACKUP_INVALID');
+
+    const secretFieldRes = await apiFetch(`/api/accounts/${tgAccount1Id}/encryption/key-backup`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...validBackup, recoveryPassphrase: 'leaked-password' }),
+    });
+    assert.equal(secretFieldRes.status, 400);
+    assert.equal(((await secretFieldRes.json()) as any).code, 'KEY_BACKUP_INVALID');
+
+    // 34. DELETE removes key backup and subsequent GET returns 404 KEY_BACKUP_NOT_FOUND
+    const delRes = await apiFetch(`/api/accounts/${tgAccount1Id}/encryption/key-backup`, { method: 'DELETE' });
+    assert.equal(delRes.status, 204);
+
+    const getAfterDel = await apiFetch(`/api/accounts/${tgAccount1Id}/encryption/key-backup`);
+    assert.equal(getAfterDel.status, 404);
+    assert.equal(((await getAfterDel.json()) as any).code, 'KEY_BACKUP_NOT_FOUND');
+  });
+
+  // ── 36. Cross-user access to encrypted file, session, or key backup returns 403 ACCOUNT_ACCESS_DENIED ──
+  await t.test('36. Cross-user access to encrypted file, session, or key backup returns 403 ACCOUNT_ACCESS_DENIED', async () => {
+    const dlRes = await apiFetch(`/api/download/${tgAccount1Id}/${tgEncryptedFileId}`, {}, token2);
+    assert.equal(dlRes.status, 403);
+    assert.equal(((await dlRes.json()) as any).code, 'ACCOUNT_ACCESS_DENIED');
+
+    const thumbRes = await apiFetch(`/api/thumb/${tgAccount1Id}/${tgEncryptedFileId}`, {}, token2);
+    assert.equal(thumbRes.status, 403);
+    assert.equal(((await thumbRes.json()) as any).code, 'ACCOUNT_ACCESS_DENIED');
+
+    const kbRes = await apiFetch(`/api/accounts/${tgAccount1Id}/encryption/key-backup`, {}, token2);
+    assert.equal(kbRes.status, 403);
+    assert.equal(((await kbRes.json()) as any).code, 'ACCOUNT_ACCESS_DENIED');
+
+    const sessRes = await apiFetch(`/api/upload-sessions/${encSessionId}`, {}, token2);
+    assert.equal(sessRes.status, 403);
+    assert.equal(((await sessRes.json()) as any).code, 'ACCOUNT_ACCESS_DENIED');
+  });
+
+  // ── 37, 38, 39. Provider coverage: Telegram, Google Drive, OneDrive encrypted upload/list/download ──
+  await t.test('37, 38, 39. Telegram, Google Drive, and OneDrive encrypted upload, listing, and range download', async () => {
+    for (const [label, accId] of [
+      ['telegram', tgAccount1Id],
+      ['google_drive', gdAccount1Id],
+      ['onedrive', odAccount1Id],
+    ] as const) {
+      const cyte = buildCyte1Blob(Buffer.from(`Provider ${label} E2EE payload 1234567890`));
+      const meta = buildValidEncryptedMetadata(`key_${label}`);
+      const opaqueName = `cyte_${label}_test01.cyte1`;
+
+      const upRes = await uploadMultipart(String(accId), cyte.blob, opaqueName, {
+        fileName: opaqueName,
+        opaqueRemoteName: opaqueName,
+        mimeType: 'application/octet-stream',
+        size: String(cyte.blob.length),
+        encryptedSizeBytes: String(cyte.blob.length),
+        checksum: cyte.sha256,
+        isEncrypted: 'true',
+        encryptionFormatVersion: '1',
+        encryptionKeyId: `key_${label}`,
+        encryptedMetadata: JSON.stringify(meta),
+      });
+      assert.equal(upRes.status, 200, `${label} upload should succeed`);
+
+      const listRes = await apiFetch(`/api/files?accountId=${accId}`);
+      assert.equal(listRes.status, 200);
+      const files: any[] = await listRes.json();
+      const found = files.find((f) => f.name === opaqueName);
+      assert.ok(found, `${label} listing should include uploaded encrypted file`);
+      assert.equal(found.isEncrypted, true);
+      assert.equal(found.encryptionKeyId, `key_${label}`);
+      assert.deepEqual(found.encryptedMetadata, meta);
+      assert.equal(found.thumbUrl, null);
+
+      const dlRes = await apiFetch(`/api/download/${accId}/${found.id}`);
+      assert.equal(dlRes.status, 200);
+      assert.deepEqual(Buffer.from(await dlRes.arrayBuffer()), cyte.blob);
+
+      const rangeRes = await apiFetch(`/api/download/${accId}/${found.id}`, {
+        headers: { Range: 'bytes=0-15' },
+      });
+      assert.equal(rangeRes.status, 206);
+      assert.deepEqual(Buffer.from(await rangeRes.arrayBuffer()), cyte.blob.subarray(0, 16));
+    }
+  });
+
+  // ── Migration test: Legacy documents without isEncrypted get backfilled to isEncrypted: false ──
+  await t.test('Database migration backfills isEncrypted: false on legacy documents', async () => {
+    const legacyId = new ObjectId();
+    await mockDb.collection('tg_files').insertOne({
+      _id: legacyId,
+      accountId: tgAccount1Id,
+      name: 'legacy_photo.jpg',
+      size: 1024,
+      mimeType: 'image/jpeg',
+    });
+    await runEncryptionMigration(mockDb);
+    const migrated = await mockDb.collection('tg_files').findOne({ _id: legacyId });
+    assert.equal(migrated.isEncrypted, false);
+    assert.equal(migrated.encryptionFormatVersion, null);
+    assert.equal(migrated.encryptedMetadata, null);
+  });
+
+  // ── 40. Security: NoSQL operator injection rejected on auth & login ──
+  await t.test('40. Rejects NoSQL operator injection in query token and login body', async () => {
+    const queryInjectRes = await fetch(`${baseUrl}/api/accounts?token[$ne]=invalid`);
+    assert.equal(queryInjectRes.status, 401);
+
+    const loginInjectRes = await fetch(`${baseUrl}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: { $ne: '' }, password: { $ne: '' } }),
+    });
+    assert.equal(loginInjectRes.status, 400);
+  });
+
+  // ── 41. Security: OAuth account-takeover bypass and unauthenticated link blocked ──
+  await t.test('41. Blocks unauthenticated /auth/link and forged JSON state in OAuth callbacks', async () => {
+    const linkUnauth = await fetch(`${baseUrl}/auth/link?tgId=12345`);
+    assert.equal(linkUnauth.status, 401);
+
+    const forgedState = encodeURIComponent(JSON.stringify({ userId: user1Id }));
+    const gCb = await fetch(`${baseUrl}/auth/google/callback?code=fake&state=${forgedState}`);
+    assert.equal(gCb.status, 401);
+
+    const msCb = await fetch(`${baseUrl}/auth/microsoft/callback?code=fake&state=${forgedState}`);
+    assert.equal(msCb.status, 401);
+  });
+
+  // ── 42. Security: Thumbnail endpoint rejects path traversal ──
+  await t.test('42. Rejects path traversal fileId on /api/thumb', async () => {
+    const badThumb = await apiFetch(`/api/thumb/${tgAccount1Id}/..%2F..%2Fetc%2Fpasswd`);
+    assert.equal(badThumb.status, 400);
+  });
+
+  // ── 43. Android parity: POST /api/upload honors ?folderId, X-File-Checksum, and Idempotency-Key ──
+  await t.test('43. POST /api/upload honors folderId query param, X-File-Checksum header, and Idempotency-Key header', async () => {
+    const content = Buffer.from('Android header parity check payload');
+    const sha = crypto.createHash('sha256').update(content).digest('hex');
+
+    // Mismatched X-File-Checksum rejected with 422
+    const badForm = new FormData();
+    badForm.append('file', new Blob([content], { type: 'text/plain' }), 'bad-hdr.txt');
+    const badRes = await apiFetch(`/api/upload/${tgAccount1Id}?folderId=android_dir`, {
+      method: 'POST',
+      headers: { 'X-File-Checksum': '0'.repeat(64) },
+      body: badForm,
+    });
+    assert.equal(badRes.status, 422);
+
+    // Valid X-File-Checksum + Idempotency-Key + ?folderId=
+    const goodForm = new FormData();
+    goodForm.append('file', new Blob([content], { type: 'text/plain' }), 'hdr-ok.txt');
+    const okRes = await apiFetch(`/api/upload/${tgAccount1Id}?folderId=android_dir`, {
+      method: 'POST',
+      headers: {
+        'X-File-Checksum': sha,
+        'Idempotency-Key': 'android_idem_1',
+      },
+      body: goodForm,
+    });
+    assert.equal(okRes.status, 200);
+    const okJson: any = await okRes.json();
+    assert.equal(okJson.success, true);
+
+    const stored = await mockDb.collection('tg_files').findOne({ accountId: tgAccount1Id, idempotencyKey: 'android_idem_1' });
+    assert.ok(stored);
+    assert.equal(stored.folder, 'android_dir');
+
+    // Duplicate Idempotency-Key returns cached record without creating a second tg_files entry
+    const dupForm = new FormData();
+    dupForm.append('file', new Blob([content], { type: 'text/plain' }), 'hdr-ok.txt');
+    const dupRes = await apiFetch(`/api/upload/${tgAccount1Id}?folderId=android_dir`, {
+      method: 'POST',
+      headers: {
+        'X-File-Checksum': sha,
+        'Idempotency-Key': 'android_idem_1',
+      },
+      body: dupForm,
+    });
+    assert.equal(dupRes.status, 200);
+    const dupJson: any = await dupRes.json();
+    assert.equal(dupJson.fileId, okJson.fileId);
+    const storedAll = await mockDb.collection('tg_files').find({ accountId: tgAccount1Id, idempotencyKey: 'android_idem_1' }).toArray();
+    assert.equal(storedAll.length, 1);
+  });
+
+  // ── 44. OneDrive move & copy use getOneDriveClient instead of stale access_token ──
+  await t.test('44. OneDrive move and copy work via getOneDriveClient even with stale account.tokens', async () => {
+    const plain = Buffer.from('OneDrive move copy payload');
+    const upRes = await uploadMultipart(String(odAccount1Id), plain, 'od-move-src.txt', {
+      fileName: 'od-move-src.txt',
+      mimeType: 'text/plain',
+    });
+    assert.equal(upRes.status, 200);
+    const upJson: any = await upRes.json();
+    const odFileId = upJson.fileId;
+
+    const mvRes = await apiFetch('/api/files/move', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceAccountId: String(odAccount1Id),
+        fileId: odFileId,
+        targetAccountId: String(odAccount1Id),
+        targetFolderId: 'od_target_dir',
+      }),
+    });
+    assert.equal(mvRes.status, 200);
+    assert.equal(oneDriveBlobs.get(odFileId)?.parentId, 'od_target_dir');
+
+    const cpRes = await apiFetch('/api/files/copy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceAccountId: String(odAccount1Id),
+        fileId: odFileId,
+        targetAccountId: String(odAccount1Id),
+        targetFolderId: 'od_copy_dir',
+      }),
+    });
+    assert.equal(cpRes.status, 200);
+    const copied = Array.from(oneDriveBlobs.values()).find((b) => b.parentId === 'od_copy_dir');
+    assert.ok(copied);
+  });
+
+  // ── 45. /api/accounts includes isDefault and handles zero quota limit without NaN/Infinity ──
+  await t.test('45. /api/accounts returns isDefault and safe quota percentage on zero limit', async () => {
+    const res = await apiFetch('/api/accounts');
+    assert.equal(res.status, 200);
+    const list: any[] = await res.json();
+    assert.equal(list.length, 3);
+    for (const acc of list) {
+      assert.equal(typeof acc.isDefault, 'boolean');
+      assert.equal(Number.isFinite(acc.percentage), true);
+      assert.equal(acc.percentage >= 0 && acc.percentage <= 100, true);
+      assert.equal(String(acc.usage).includes('NaN'), false);
+      assert.equal(String(acc.total).includes('Infinity'), false);
+    }
+  });
+
+  // ── 46. Public share page validates shareId, sets CSP, and escapes HTML/XSS payloads ──
+  await t.test('46. /s/:shareId validates shareId format, escapes HTML, and sets CSP header', async () => {
+    const badRes = await fetch(`${baseUrl}/s/bad$id!!`);
+    assert.equal(badRes.status, 400);
+
+    const xssShareId = 'share_xss_test_01';
+    const xssDoc = await mockDb.collection('tg_files').insertOne({
+      accountId: tgAccount1Id,
+      messageId: 99999,
+      name: '<script>alert(1)</script>.txt',
+      size: 12,
+      mimeType: 'text/plain',
+      folder: 'root',
+      isEncrypted: false,
+      shareId: xssShareId,
+      createdAt: new Date(),
+    });
+    assert.ok(xssDoc.insertedId);
+    const shareRes = await fetch(`${baseUrl}/s/${xssShareId}`);
+    assert.equal(shareRes.status, 200);
+    assert.ok(shareRes.headers.get('content-security-policy')?.includes("default-src 'none'"));
+    const html = await shareRes.text();
+    assert.equal(html.includes('<script>alert(1)</script>'), false);
+    assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'));
+  });
+
+  // ── 47. Storage summary supports omitted/"all" accountId and populates Google/OneDrive categories ──
+  await t.test('47. /api/storage/summary supports omitted or "all" accountId and computes Google/OneDrive categories', async () => {
+    const gdRes = await apiFetch(`/api/storage/summary?accountId=${gdAccount1Id}`);
+    assert.equal(gdRes.status, 200);
+    const gdSummary: any = await gdRes.json();
+    assert.equal(gdSummary.accountType, 'google');
+    assert.equal(typeof gdSummary.fileCount, 'number');
+    assert.ok(gdSummary.fileCount >= 1);
+    assert.ok(gdSummary.categories);
+    assert.equal(typeof gdSummary.categories.documents, 'number');
+
+    const odRes = await apiFetch(`/api/storage/summary?accountId=${odAccount1Id}`);
+    assert.equal(odRes.status, 200);
+    const odSummary: any = await odRes.json();
+    assert.equal(odSummary.accountType, 'onedrive');
+    assert.equal(typeof odSummary.fileCount, 'number');
+    assert.ok(odSummary.categories);
+
+    const allRes1 = await apiFetch('/api/storage/summary');
+    assert.equal(allRes1.status, 200);
+    const allSummary1: any = await allRes1.json();
+    assert.equal(allSummary1.accountId, 'all');
+    assert.ok(allSummary1.usedBytes >= gdSummary.usedBytes + odSummary.usedBytes);
+    assert.ok(allSummary1.fileCount >= gdSummary.fileCount + odSummary.fileCount);
+    assert.ok(allSummary1.categories);
+
+    const allRes2 = await apiFetch('/api/storage/summary?accountId=all');
+    assert.equal(allRes2.status, 200);
+    const allSummary2: any = await allRes2.json();
+    assert.equal(allSummary2.usedBytes, allSummary1.usedBytes);
+  });
+
+  // ── 48. Trash soft-delete, list, restore, permanent delete, and expired sweep ──
+  await t.test('48. Soft-deletes files to Trash, hides from /api/files, restores, and permanently deletes', async () => {
+    const payload = Buffer.from('Trash lifecycle test file content');
+    const upRes = await uploadMultipart(String(tgAccount1Id), payload, 'trash-me.txt', {
+      fileName: 'trash-me.txt',
+      mimeType: 'text/plain',
+    });
+    assert.equal(upRes.status, 200);
+    const { fileId } = (await upRes.json()) as any;
+    assert.ok(fileId);
+
+    // Soft-delete (default DELETE /api/files/:fileId)
+    const delRes = await apiFetch(`/api/files/${fileId}?accountId=${tgAccount1Id}`, { method: 'DELETE' });
+    assert.equal(delRes.status, 200);
+    const delJson: any = await delRes.json();
+    assert.equal(delJson.trashed, true);
+
+    // Hidden from /api/files
+    const filesRes = await apiFetch(`/api/files?accountId=${tgAccount1Id}`);
+    const filesList: any[] = await filesRes.json();
+    assert.equal(filesList.some((f) => String(f.id) === String(fileId)), false);
+
+    // Appears in /api/trash
+    const trashRes = await apiFetch(`/api/trash?accountId=${tgAccount1Id}`);
+    assert.equal(trashRes.status, 200);
+    const trashList: any[] = await trashRes.json();
+    assert.equal(trashList.some((f) => String(f.id) === String(fileId)), true);
+
+    // Restore from trash
+    const restoreRes = await apiFetch('/api/trash/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accountId: String(tgAccount1Id), fileId }),
+    });
+    assert.equal(restoreRes.status, 200);
+
+    // Back in /api/files
+    const filesAfterRestore: any[] = await (await apiFetch(`/api/files?accountId=${tgAccount1Id}`)).json();
+    assert.equal(filesAfterRestore.some((f) => String(f.id) === String(fileId)), true);
+
+    // Soft-delete again and permanently delete via DELETE /api/trash/:fileId
+    await apiFetch(`/api/files/${fileId}?accountId=${tgAccount1Id}`, { method: 'DELETE' });
+    const permRes = await apiFetch(`/api/trash/${fileId}?accountId=${tgAccount1Id}`, { method: 'DELETE' });
+    assert.equal(permRes.status, 200);
+    const trashAfterPerm: any[] = await (await apiFetch(`/api/trash?accountId=${tgAccount1Id}`)).json();
+    assert.equal(trashAfterPerm.some((f) => String(f.id) === String(fileId)), false);
+
+    // Expired 31-day old trash item is purged by sweepExpiredTrash()
+    const expiredInsert = await mockDb.collection('tg_files').insertOne({
+      accountId: tgAccount1Id,
+      messageId: 88888,
+      name: 'old-trashed.txt',
+      size: 10,
+      mimeType: 'text/plain',
+      trashed: true,
+      trashedAt: new Date(Date.now() - 31 * 24 * 60 * 60 * 1000),
+    });
+    const purgedCount = await sweepExpiredTrash();
+    assert.equal(purgedCount >= 1, true);
+    const checkExpired = await mockDb.collection('tg_files').findOne({ _id: expiredInsert.insertedId });
+    assert.equal(checkExpired, null);
+  });
+
+  // ── 49. Active Sessions listing, token non-exposure, revocation, and expiry enforcement ──
+  await t.test('49. Lists active sessions without exposing raw tokens, revokes sessions, and rejects expired sessions', async () => {
+    const sessTokenA = 'tok_session_device_a';
+    const sessTokenB = 'tok_session_device_b';
+    const expiredToken = 'tok_session_expired';
+
+    await mockDb.collection('sessions').insertOne({
+      sessionId: 'sess_dev_a',
+      token: sessTokenA,
+      userId: user1Id,
+      username: 'alice',
+      deviceName: 'Pixel 9 Pro',
+      userAgent: 'Cloudyte/Android',
+      createdAt: new Date(),
+      lastActiveAt: new Date(),
+      expiresAt: new Date(Date.now() + 7 * 86400 * 1000),
+    });
+    await mockDb.collection('sessions').insertOne({
+      sessionId: 'sess_dev_b',
+      token: sessTokenB,
+      userId: user1Id,
+      username: 'alice',
+      deviceName: 'Chrome Linux',
+      userAgent: 'Mozilla/5.0',
+      createdAt: new Date(),
+      lastActiveAt: new Date(),
+      expiresAt: new Date(Date.now() + 7 * 86400 * 1000),
+    });
+    await mockDb.collection('sessions').insertOne({
+      sessionId: 'sess_expired',
+      token: expiredToken,
+      userId: user1Id,
+      username: 'alice',
+      deviceName: 'Old Phone',
+      createdAt: new Date(Date.now() - 40 * 86400 * 1000),
+      lastActiveAt: new Date(Date.now() - 40 * 86400 * 1000),
+      expiresAt: new Date(Date.now() - 1000),
+    });
+
+    // Expired session token is rejected with 401
+    const expCheck = await fetch(`${baseUrl}/api/accounts`, {
+      headers: { Authorization: `Bearer ${expiredToken}` },
+    });
+    assert.equal(expCheck.status, 401);
+
+    // GET /api/sessions lists active sessions and never leaks raw token
+    const listRes = await fetch(`${baseUrl}/api/sessions`, {
+      headers: { Authorization: `Bearer ${sessTokenA}` },
+    });
+    assert.equal(listRes.status, 200);
+    const sessions: any[] = await listRes.json();
+    assert.ok(sessions.length >= 2);
+    for (const s of sessions) {
+      assert.equal(s.token, undefined);
+      assert.equal(typeof s.deviceName, 'string');
+    }
+    const currentSess = sessions.find((s) => s.id === 'sess_dev_a');
+    assert.ok(currentSess);
+    assert.equal(currentSess.isCurrent, true);
+
+    // Revoke single session B
+    const revRes = await fetch(`${baseUrl}/api/sessions/sess_dev_b`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${sessTokenA}` },
+    });
+    assert.equal(revRes.status, 200);
+    const bCheck = await fetch(`${baseUrl}/api/accounts`, {
+      headers: { Authorization: `Bearer ${sessTokenB}` },
+    });
+    assert.equal(bCheck.status, 401);
+  });
+
+  // ── 50. Async Cross-Account Transfer Job & SSE Progress Stream ──
+  await t.test('50. Streams real-time progress for async cross-account transfer jobs via SSE', async () => {
+    const payload = Buffer.from('Async SSE cross-account transfer payload');
+    const upRes = await uploadMultipart(String(tgAccount1Id), payload, 'sse-transfer.txt', {
+      fileName: 'sse-transfer.txt',
+      mimeType: 'text/plain',
+    });
+    assert.equal(upRes.status, 200);
+    const { fileId } = (await upRes.json()) as any;
+
+    const asyncCopyRes = await apiFetch('/api/files/copy?async=true', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceAccountId: String(tgAccount1Id),
+        fileId,
+        targetAccountId: String(gdAccount1Id),
+        targetFolderId: 'root',
+      }),
+    });
+    assert.equal(asyncCopyRes.status, 202);
+    const asyncCopyJson: any = await asyncCopyRes.json();
+    assert.equal(asyncCopyJson.async, true);
+    assert.ok(asyncCopyJson.jobId);
+
+    const sseRes = await apiFetch(`/api/jobs/${asyncCopyJson.jobId}/stream`);
+    assert.equal(sseRes.status, 200);
+    assert.ok(sseRes.headers.get('content-type')?.includes('text/event-stream'));
+    const sseText = await sseRes.text();
+    const events = sseText
+      .split('\n\n')
+      .map((chunk) => chunk.trim())
+      .filter((chunk) => chunk.startsWith('data: '))
+      .map((chunk) => JSON.parse(chunk.slice(6)));
+
+    assert.ok(events.length >= 1);
+    const finalEvent = events[events.length - 1];
+    assert.equal(finalEvent.status, 'completed');
+    assert.equal(finalEvent.progressPct, 100);
+  });
+
+  // ── 51. Upload Session Pause, Resume, and Dedicated TEMP_DIR Verification ──
+  await t.test('51. Supports pausing and resuming upload sessions and stages files in dedicated TEMP_DIR', async () => {
+    const payload = Buffer.from('Resumable pause-and-resume test payload');
+    const sha256 = crypto.createHash('sha256').update(payload).digest('hex');
+
+    const createRes = await apiFetch(`/api/upload-sessions/${tgAccount1Id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fileName: 'pause-resume.txt',
+        mimeType: 'text/plain',
+        size: payload.length,
+        folderId: 'root',
+        checksum: sha256,
+        idempotencyKey: `idem_pause_resume_${Date.now()}`,
+      }),
+    });
+    assert.equal(createRes.status, 201);
+    const session: any = await createRes.json();
+    assert.equal(session.status, 'active');
+
+    // Verify stored tempPath is inside the dedicated TEMP_DIR
+    const rawSessionDoc = await mockDb.collection('upload_sessions').findOne({ sessionId: session.sessionId });
+    assert.ok(rawSessionDoc);
+    assert.equal(path.dirname(rawSessionDoc.tempPath), path.resolve(TEMP_DIR));
+
+    const sendChunk = async (sid: string, buf: Buffer) => {
+      const form = new FormData();
+      form.append('chunk', new Blob([buf]), 'chunk.bin');
+      return apiFetch(`/api/upload-sessions/${sid}/chunks`, {
+        method: 'PUT',
+        headers: { 'Content-Range': `bytes 0-${buf.length - 1}/${buf.length}` },
+        body: form,
+      });
+    };
+
+    // Pause session
+    const pauseRes = await apiFetch(`/api/upload-sessions/${session.sessionId}/pause`, { method: 'POST' });
+    assert.equal(pauseRes.status, 200);
+    const pausedJson: any = await pauseRes.json();
+    assert.equal(pausedJson.status, 'paused');
+
+    // Uploading a chunk while paused fails with 409 UPLOAD_SESSION_NOT_ACTIVE
+    const chunkWhilePaused = await sendChunk(session.sessionId, payload);
+    assert.equal(chunkWhilePaused.status, 409);
+    const pausedErr: any = await chunkWhilePaused.json();
+    assert.equal(pausedErr.code, 'UPLOAD_SESSION_NOT_ACTIVE');
+
+    // Resume session
+    const resumeRes = await apiFetch(`/api/upload-sessions/${session.sessionId}/resume`, { method: 'POST' });
+    assert.equal(resumeRes.status, 200);
+    const resumedJson: any = await resumeRes.json();
+    assert.equal(resumedJson.status, 'active');
+
+    // Upload chunk and complete
+    const chunkAfterResume = await sendChunk(session.sessionId, payload);
+    assert.equal(chunkAfterResume.status, 200);
+    const completeRes = await apiFetch(`/api/upload-sessions/${session.sessionId}/complete`, { method: 'POST' });
+    assert.equal(completeRes.status, 200);
+    const completeJson: any = await completeRes.json();
+    assert.equal(completeJson.success, true);
+  });
+
+  // ── 52. Transfer Manifest Verification, Job Listing, and Job Cancellation ──
+  await t.test('52. Records transfer manifests on cross-account transfer and supports job listing and cancellation', async () => {
+    const manifests = await mockDb.collection('transfer_manifests').find({}).toArray();
+    assert.ok(manifests.length >= 1);
+    const completedManifest = manifests.find((m: any) => m.status === 'completed');
+    assert.ok(completedManifest);
+    assert.equal(typeof completedManifest.checksum, 'string');
+
+    // List jobs for user
+    const listJobsRes = await apiFetch('/api/jobs');
+    assert.equal(listJobsRes.status, 200);
+    const jobsList: any[] = await listJobsRes.json();
+    assert.ok(jobsList.length >= 1);
+
+    // Enqueue a new async transfer job and cancel it before worker runs
+    const filesInTg = await mockDb.collection('tg_files').find({ accountId: tgAccount1Id }).toArray();
+    const sampleFile = filesInTg[0];
+    assert.ok(sampleFile);
+
+    const asyncMoveRes = await apiFetch('/api/files/copy?async=true', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceAccountId: String(tgAccount1Id),
+        fileId: String(sampleFile._id),
+        targetAccountId: String(gdAccount1Id),
+        targetFolderId: 'root',
+      }),
+    });
+    assert.equal(asyncMoveRes.status, 202);
+    const { jobId } = (await asyncMoveRes.json()) as any;
+
+    const cancelRes = await apiFetch(`/api/jobs/${jobId}/cancel`, { method: 'POST' });
+    assert.equal(cancelRes.status, 200);
+    const cancelledJob: any = await cancelRes.json();
+    assert.equal(cancelledJob.status, 'cancelled');
+  });
+
+  // ── 53. Health, Readiness, and Admin Observability Metrics ──
+  await t.test('53. Exposes /healthz, /readyz, and admin-protected /api/admin/metrics observability snapshot', async () => {
+    const healthRes = await fetch(`${baseUrl}/healthz`);
+    assert.equal(healthRes.status, 200);
+    const healthJson: any = await healthRes.json();
+    assert.equal(healthJson.ok, true);
+
+    const readyRes = await fetch(`${baseUrl}/readyz`);
+    assert.equal(readyRes.status, 200);
+    const readyJson: any = await readyRes.json();
+    assert.equal(readyJson.status, 'ready');
+    assert.equal(readyJson.mongo, true);
+
+    // Non-admin user is denied access to /api/admin/metrics
+    const nonAdminMetrics = await apiFetch('/api/admin/metrics');
+    assert.equal(nonAdminMetrics.status, 403);
+
+    // Admin basic auth receives full observability metrics
+    const adminAuth = Buffer.from('admin:password').toString('base64');
+    const adminMetricsRes = await fetch(`${baseUrl}/api/admin/metrics`, {
+      headers: { Authorization: `Basic ${adminAuth}` },
+    });
+    assert.equal(adminMetricsRes.status, 200);
+    const metricsJson: any = await adminMetricsRes.json();
+    assert.equal(typeof metricsJson.uptimeSeconds, 'number');
+    assert.ok(metricsJson.memoryUsage);
+    assert.ok(metricsJson.disk);
+    assert.ok(metricsJson.jobs);
+    assert.ok(metricsJson.uploads);
+    assert.ok(metricsJson.cache);
+    assert.ok(Array.isArray(metricsJson.alerts));
+  });
+
+  // ── 54. Batch Backup Partial-Failure Resilience, Verification, and Conflict-Safe Restore ──
+  await t.test('54. Runs batch backups with partial-failure resilience, verifies manifests, and creates conflict copies on restore', async () => {
+    const fd = new FormData();
+    fd.append('file', new Blob([Buffer.from('batch-backup-payload')], { type: 'text/plain' }), 'backup-doc.txt');
+    const upRes = await apiFetch(`/api/upload/${tgAccount1Id}`, { method: 'POST', body: fd });
+    assert.equal(upRes.status, 200);
+
+    const tgFiles = await mockDb.collection('tg_files').find({ accountId: tgAccount1Id, name: 'backup-doc.txt' }).toArray();
+    assert.equal(tgFiles.length, 1);
+    const validFileId = String(tgFiles[0]._id);
+
+    // Enqueue batch backup with 1 valid file and 1 missing file to test partial failure resilience
+    const batchRes = await apiFetch('/api/backups/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceAccountId: String(tgAccount1Id),
+        targetAccountId: String(gdAccount1Id),
+        targetFolderId: 'root',
+        fileIds: [validFileId, '000000000000000000000999'],
+        conflictStrategy: 'rename',
+      }),
+    });
+    assert.equal(batchRes.status, 202);
+    const { jobId: batchJobId } = (await batchRes.json()) as any;
+
+    for (let i = 0; i < 30; i++) {
+      await runJobWorker();
+      const jobDoc = await mockDb.collection('jobs').findOne({ _id: batchJobId });
+      if (jobDoc?.status === 'completed' || jobDoc?.status === 'failed') break;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+
+    const batchManifest = await mockDb.collection('transfer_manifests').findOne({ jobId: batchJobId });
+    assert.ok(batchManifest, 'Batch backup manifest should be recorded');
+    assert.equal(batchManifest.succeededCount, 1);
+    assert.equal(batchManifest.failedCount, 1);
+    assert.equal(batchManifest.status, 'completed_with_errors');
+
+    // Verify backup manifest via endpoint
+    const verifyRes = await apiFetch(`/api/backups/${batchJobId}/verify`, { method: 'POST' });
+    assert.equal(verifyRes.status, 200);
+    const verifyJson: any = await verifyRes.json();
+    assert.equal(verifyJson.verifiedCount, 1);
+    assert.equal(verifyJson.totalItems, 2);
+
+    // Also test a clean single-item batch backup between TG accounts and non-destructive restore with conflict copy
+    const tgAccount2Id = new ObjectId('65f000000000000000000099');
+    await mockDb.collection('accounts').insertOne({
+      _id: tgAccount2Id,
+      userId: 'user_1',
+      accountType: 'tgdrive',
+      channelId: '-1001234567890',
+      name: 'Secondary TG Drive',
+    });
+
+    const cleanBatchRes = await apiFetch('/api/backups/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceAccountId: String(tgAccount1Id),
+        targetAccountId: String(tgAccount2Id),
+        targetFolderId: 'root',
+        fileIds: [validFileId],
+        conflictStrategy: 'rename',
+      }),
+    });
+    assert.equal(cleanBatchRes.status, 202);
+    const { jobId: cleanJobId } = (await cleanBatchRes.json()) as any;
+    for (let i = 0; i < 20; i++) {
+      await runJobWorker();
+      const jobDoc = await mockDb.collection('jobs').findOne({ _id: cleanJobId });
+      if (jobDoc?.status === 'completed') break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    const cleanVerifyRes = await apiFetch(`/api/backups/${cleanJobId}/verify`, { method: 'POST' });
+    const cleanVerifyJson: any = await cleanVerifyRes.json();
+    assert.equal(cleanVerifyJson.verified, true);
+
+    // Restore back to tgAccount1Id where 'backup-doc.txt' already exists -> should create 'backup-doc (conflict copy).txt'
+    const restoreRes = await apiFetch(`/api/backups/${cleanJobId}/restore`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetAccountId: String(tgAccount1Id),
+        targetFolderId: 'root',
+      }),
+    });
+    assert.equal(restoreRes.status, 202);
+    const { jobId: restoreJobId } = (await restoreRes.json()) as any;
+    for (let i = 0; i < 20; i++) {
+      await runJobWorker();
+      const jobDoc = await mockDb.collection('jobs').findOne({ _id: restoreJobId });
+      if (jobDoc?.status === 'completed') break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    const restoredFiles = await mockDb.collection('tg_files').find({ accountId: tgAccount1Id }).toArray();
+    const conflictCopy = restoredFiles.find((f: any) => f.name === 'backup-doc (conflict copy).txt');
+    assert.ok(conflictCopy, 'Restore must create a conflict copy rather than overwriting existing file silently');
+  });
+
+  await t.test('55. Zero-double-write raw stream chunk uploads, OneDrive trash lifecycle, and sliding session expiry', async () => {
+    // 1. Raw binary stream chunk upload (application/octet-stream) without intermediate multer disk write
+    const rawPayload = Buffer.from('Zero-double-write direct stream upload payload for Cloudyte!');
+    const rawSha256 = crypto.createHash('sha256').update(rawPayload).digest('hex');
+
+    const initRes = await apiFetch(`/api/upload-sessions/${String(tgAccount1Id)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fileName: 'raw-stream-test.txt',
+        mimeType: 'text/plain',
+        totalBytes: rawPayload.length,
+        chunkSize: 32,
+        folderId: 'root',
+        checksum: rawSha256,
+        idempotencyKey: `idem_raw_stream_${Date.now()}`,
+      }),
+    });
+    assert.equal(initRes.status, 201);
+    const { sessionId } = (await initRes.json()) as any;
+
+    const part1 = rawPayload.subarray(0, 32);
+    const part2 = rawPayload.subarray(32);
+
+    const c1Res = await apiFetch(`/api/upload-sessions/${sessionId}/chunks`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': String(part1.length),
+        'X-Chunk-Offset': '0',
+      },
+      body: part1,
+    });
+    assert.equal(c1Res.status, 200);
+    const c1Json: any = await c1Res.json();
+    assert.equal(c1Json.receivedBytes, part1.length);
+
+    // Exact replay of chunk 1 via raw stream should be idempotently accepted
+    const replayRes = await apiFetch(`/api/upload-sessions/${sessionId}/chunks`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': String(part1.length),
+        'X-Chunk-Offset': '0',
+      },
+      body: part1,
+    });
+    assert.equal(replayRes.status, 200);
+
+    const c2Res = await apiFetch(`/api/upload-sessions/${sessionId}/chunks`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': String(part2.length),
+        'X-Chunk-Offset': String(part1.length),
+      },
+      body: part2,
+    });
+    assert.equal(c2Res.status, 200);
+    const c2Json: any = await c2Res.json();
+    assert.equal(c2Json.complete, true);
+
+    const completeRes = await apiFetch(`/api/upload-sessions/${sessionId}/complete`, { method: 'POST' });
+    assert.equal(completeRes.status, 200);
+
+    // 2. OneDrive Trash lifecycle: soft-delete -> list trash -> restore -> soft-delete -> empty trash
+    const odTrashFileId = 'od_trash_item_99';
+    const delOdRes = await apiFetch(`/api/files/${odTrashFileId}?accountId=${String(odAccount1Id)}`, {
+      method: 'DELETE',
+    });
+    assert.equal(delOdRes.status, 200);
+    const delOdJson: any = await delOdRes.json();
+    assert.equal(delOdJson.trashed, true);
+
+    const listOdTrashRes = await apiFetch(`/api/trash?accountId=${String(odAccount1Id)}`);
+    assert.equal(listOdTrashRes.status, 200);
+    const odTrashItems: any[] = await listOdTrashRes.json();
+    assert.ok(odTrashItems.some((it: any) => String(it.id) === odTrashFileId), 'OneDrive trashed item must be listed in /api/trash');
+
+    const restoreOdRes = await apiFetch('/api/trash/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accountId: String(odAccount1Id), fileId: odTrashFileId }),
+    });
+    assert.equal(restoreOdRes.status, 200);
+
+    const listAfterRestore = await apiFetch(`/api/trash?accountId=${String(odAccount1Id)}`);
+    const afterRestoreItems: any[] = await listAfterRestore.json();
+    assert.ok(!afterRestoreItems.some((it: any) => String(it.id) === odTrashFileId), 'Restored OneDrive item should leave trash');
+
+    // Soft-delete again and Empty Trash
+    await apiFetch(`/api/files/${odTrashFileId}?accountId=${String(odAccount1Id)}`, { method: 'DELETE' });
+    const emptyOdTrashRes = await apiFetch(`/api/trash?accountId=${String(odAccount1Id)}`, { method: 'DELETE' });
+    assert.equal(emptyOdTrashRes.status, 200);
+    const emptyOdJson: any = await emptyOdTrashRes.json();
+    assert.ok(emptyOdJson.deletedCount >= 1);
+  });
+});
+
+
+
