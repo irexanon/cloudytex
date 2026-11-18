@@ -46,6 +46,7 @@ COPY --from=builder /app/dist ./dist
 
 # Copy backend files
 COPY server.ts telegram.ts provider-transfer-protocol.ts ./
+COPY backend ./backend
 
 
 
