@@ -1,10 +1,7 @@
-# Use Node 22 as the base image
-FROM node:22-alpine AS builder
+# Use Node 22 Debian Bookworm Slim (glibc — required for Rollup 4 native parser & Sharp prebuilt binaries)
+FROM node:22-bookworm-slim AS builder
 
 WORKDIR /app
-
-# Install dependencies required for node-gyp/native modules
-RUN apk add --no-cache python3 make g++
 
 # Copy package files
 COPY package*.json ./
@@ -23,7 +20,7 @@ RUN npm prune --omit=dev
 
 
 # Production stage
-FROM node:22-alpine
+FROM node:22-bookworm-slim
 
 WORKDIR /app
 
