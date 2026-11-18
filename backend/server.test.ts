@@ -14,7 +14,7 @@ import {
   validateKeyBackupInput,
   validateOpaqueFilename,
   computeFileSha256,
-} from './provider-transfer-protocol.ts';
+} from './protocol.ts';
 
 process.env.CLOUDYTE_TEST_MODE = '1';
 
@@ -1965,8 +1965,138 @@ test('Cloudyte E2EE Backend Suite (Tests 1-39)', async (t) => {
     assert.equal(emptyOdTrashRes.status, 200);
     const emptyOdJson: any = await emptyOdTrashRes.json();
     assert.ok(emptyOdJson.deletedCount >= 1);
+
+    // 3. Personal Access Tokens (plaintext in DB, scope & account confinement enforcement)
+    const createPatRes = await apiFetch('/api/tokens', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Read-Only Confined Token',
+        scopes: ['read'],
+        accountId: String(tgAccount1Id),
+        expiresInDays: 7,
+      }),
+    });
+    assert.equal(createPatRes.status, 201);
+    const patData: any = await createPatRes.json();
+    assert.ok(patData.token.startsWith('pat_'));
+
+    // Read on confined account succeeds
+    const patReadOk = await fetch(`${baseUrl}/api/files?accountId=${String(tgAccount1Id)}`, {
+      headers: { Authorization: `Bearer ${patData.token}` },
+    });
+    assert.equal(patReadOk.status, 200);
+
+    // Read on a different account is blocked by account confinement (403)
+    const patReadWrongAcc = await fetch(`${baseUrl}/api/files?accountId=${String(gdAccount1Id)}`, {
+      headers: { Authorization: `Bearer ${patData.token}` },
+    });
+    assert.equal(patReadWrongAcc.status, 403);
+
+    // Write operation with read-only PAT is blocked by scope enforcement (403)
+    const patWriteDenied = await fetch(`${baseUrl}/api/folders`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${patData.token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ accountId: String(tgAccount1Id), name: 'forbidden-folder' }),
+    });
+    assert.equal(patWriteDenied.status, 403);
+
+    // Revoking PAT immediately invalidates it
+    const revokePatRes = await apiFetch(`/api/tokens/${patData.tokenId}`, { method: 'DELETE' });
+    assert.equal(revokePatRes.status, 200);
+    const patAfterRevoke = await fetch(`${baseUrl}/api/files?accountId=${String(tgAccount1Id)}`, {
+      headers: { Authorization: `Bearer ${patData.token}` },
+    });
+    assert.equal(patAfterRevoke.status, 401);
+
+    // 4. 7-Point Public Share Validation (maxDownloads, PIN, revocation)
+    const sharedTgId = new ObjectId();
+    await mockDb.collection('tg_files').insertOne({
+      _id: sharedTgId,
+      accountId: tgAccount1Id,
+      userId: 'user_1',
+      messageId: 7771,
+      name: 'shared-report.pdf',
+      mimeType: 'application/pdf',
+      size: 12,
+      folder: '',
+      date: Math.floor(Date.now() / 1000),
+      isEncrypted: false,
+    });
+    const shareCreateRes = await apiFetch('/api/share', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        accountId: String(tgAccount1Id),
+        fileId: String(sharedTgId),
+        maxDownloads: 1,
+        pin: '4321',
+      }),
+    });
+    assert.equal(shareCreateRes.status, 200);
+    const shareJson: any = await shareCreateRes.json();
+    assert.ok(shareJson.shareId);
+
+    // Accessing share page without PIN returns 403
+    const shareNoPin = await fetch(`${baseUrl}/s/${shareJson.shareId}`);
+    assert.equal(shareNoPin.status, 403);
+
+    // Accessing share page with valid PIN succeeds
+    const shareWithPin = await fetch(`${baseUrl}/s/${shareJson.shareId}?pin=4321`);
+    assert.equal(shareWithPin.status, 200);
+
+    // Revoking share blocks public access with 404/410
+    const revokeShareRes = await apiFetch(`/api/share/${shareJson.shareId}`, { method: 'DELETE' });
+    assert.equal(revokeShareRes.status, 200);
+    const shareAfterRevoke = await fetch(`${baseUrl}/s/${shareJson.shareId}?pin=4321`);
+    assert.ok(shareAfterRevoke.status === 404 || shareAfterRevoke.status === 410);
+
+    // 5. One-Time Download Tickets (using the uploaded raw-stream-test.txt which exists in mock tgMessages)
+    const uploadedRawDoc = await mockDb.collection('tg_files').findOne({ accountId: tgAccount1Id, name: 'raw-stream-test.txt' });
+    assert.ok(uploadedRawDoc);
+    const ticketRes = await apiFetch('/api/download-tickets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        accountId: String(tgAccount1Id),
+        fileId: String(uploadedRawDoc._id),
+        singleUse: true,
+        ttlSeconds: 120,
+      }),
+    });
+    assert.equal(ticketRes.status, 201);
+    const ticketJson: any = await ticketRes.json();
+    assert.ok(ticketJson.ticket.startsWith('dlt_'));
+
+    const firstTicketDl = await fetch(`${baseUrl}/api/download/ticket/${ticketJson.ticket}`);
+    assert.equal(firstTicketDl.status, 200);
+    await firstTicketDl.arrayBuffer();
+
+    // Second use of single-use ticket must fail with 410
+    const secondTicketDl = await fetch(`${baseUrl}/api/download/ticket/${ticketJson.ticket}`);
+    assert.equal(secondTicketDl.status, 410);
+
+    // 6. Queue Health & Admin Audit Logs
+    const qHealthRes = await apiFetch('/api/jobs/health');
+    assert.equal(qHealthRes.status, 200);
+    const qHealth: any = await qHealthRes.json();
+    assert.equal(qHealth.ok, true);
+    assert.ok(qHealth.queues.cross_account_transfer);
+
+    const adminBasicAuth = Buffer.from('admin:password').toString('base64');
+    const auditRes = await fetch(`${baseUrl}/api/admin/audit-logs?limit=20`, {
+      headers: { Authorization: `Basic ${adminBasicAuth}` },
+    });
+    assert.equal(auditRes.status, 200);
+    const auditJson: any = await auditRes.json();
+    assert.ok(Array.isArray(auditJson.logs));
+    assert.ok(auditJson.logs.length > 0);
   });
 });
+
 
 
 

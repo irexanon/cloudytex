@@ -15,19 +15,25 @@ All API routes are served under the root URL of your deployed Cloudyte server.
 
 ---
 
-## 2. Authentication
+## 2. Authentication & Access Tokens
 
-Most endpoints require user authentication. Supply the session token returned by `/api/login` in the standard HTTP `Authorization` header:
+Most endpoints require user authentication. Cloudyte supports two bearer credential types in the standard HTTP `Authorization` header:
 
-```http
-Authorization: Bearer <session_token>
-```
+1. **Session Token** (returned by `POST /api/login`):
+   ```http
+   Authorization: Bearer <session_token>
+   ```
+2. **Personal Access Token (PAT)** (created via `POST /api/tokens` with fine-grained scopes and optional account/folder confinement):
+   ```http
+   Authorization: Bearer pat_<token>
+   ```
 
-*Alternative Query Parameter:*
-For media downloads or WebView rendering where setting custom headers is difficult, you can pass the token as a query parameter:
-```
-GET /api/download/:accountId/:fileId?token=<session_token>
-```
+*Alternative Query Parameter & One-Time Download Tickets:*
+- For native media players or WebViews that cannot set custom headers, prefer issuing a short-lived or single-use **Download Ticket** (`POST /api/download-tickets` -> `GET /api/download/ticket/:ticket`) so bearer tokens never appear in URLs or logs.
+- Legacy query-parameter tokens (`GET /api/download/:accountId/:fileId?token=<session_token>`) and signed media URLs (`GET /api/media-link/:accountId/:fileId`) also remain supported.
+
+*Origin Protection:*
+- When `ALLOWED_ORIGINS` (comma-separated origin list) is configured, state-changing requests (`POST`, `PUT`, `PATCH`, `DELETE`) carrying an `Origin` header are validated against the allowlist (`403 FORBIDDEN` on mismatch).
 
 *Admin Basic Auth:*
 Admin endpoints also accept HTTP Basic Auth using the root credentials:
@@ -116,10 +122,14 @@ Register a new user account if public registration is enabled. Subject to rate l
   ```
 - **Errors:** `400 Bad Request` (missing fields, username taken, registration disabled), `429 Too Many Requests`.
 
-### 3.4 User Login
-Authenticate with username and password to receive a persistent session token. Subject to rate limits (10 req/min).
+### 3.4 User Login (with Progressive Throttling & Lockout)
+Authenticate with username and password to receive a persistent session token.
 - **Method & Route:** `POST /api/login`
 - **Auth Required:** No
+- **Brute-Force Protection:**
+  - Tracked independently per username and per client IP (`LOGIN_WINDOW_MS`, default 15 minutes).
+  - Applies a progressive delay (`250ms`, `500ms`, `1000ms`, up to `2000ms`) starting after the 2nd failed attempt.
+  - Locks out the username/IP for `LOGIN_LOCKOUT_MS` (default 15 minutes) after `LOGIN_MAX_ATTEMPTS` (default 5) failed attempts, returning `429 RATE_LIMITED` with a `Retry-After` header.
 - **Request Body (JSON):**
   ```json
   {
@@ -136,10 +146,10 @@ Authenticate with username and password to receive a persistent session token. S
     "isAdmin": false
   }
   ```
-- **Errors:** `401 Unauthorized` (invalid credentials or deactivated account), `429 Too Many Requests`.
+- **Errors:** `401 Unauthorized` (invalid credentials or deactivated account), `429 Too Many Requests` (rate limit or login lockout active).
 
 ### 3.5 Logout
-Terminates and invalidates the session token in the database.
+Revokes the current session (`revokedAt`) in MongoDB and evicts it from the in-memory auth cache.
 - **Method & Route:** `POST /api/logout`
 - **Auth Required:** Yes
 - **Response (200 OK):**
@@ -149,13 +159,53 @@ Terminates and invalidates the session token in the database.
   }
   ```
 
-### 3.6 Active Device Sessions & Sliding Expiry
+### 3.6 Active Device Sessions, IP History & Sliding Expiry
 List or revoke active login sessions for the authenticated user (raw tokens are never returned).
-- **Sliding Session Expiry:** Sessions default to a 30-day TTL (`expiresAt`) and automatically slide forward by 30 days whenever the user is active (throttled to once every 5 minutes in both memory cache and MongoDB).
+- **Sliding Session Expiry & Device Tracking:** Sessions default to a 30-day TTL (`expiresAt`), slide forward automatically on activity, and track `deviceName`, `userAgent`, current `ip`, and recent `ipHistory` (up to 10 distinct IPs).
 - **List Sessions:** `GET /api/sessions`
-  - **Response (200 OK):** Array of `{ sessionId, userAgent, ip, createdAt, lastActiveAt, expiresAt, isCurrent }`.
+  - **Response (200 OK):** Array of `{ sessionId, deviceName, userAgent, ip, ipHistory, createdAt, lastActiveAt, lastUsedAt, expiresAt, isCurrent }`.
 - **Revoke Session:** `DELETE /api/sessions/:sessionId`
-  - **Response (200 OK):** `{ "success": true }`
+  - Marks the session as revoked (`revokedAt`) and immediately invalidates it (`200 OK`: `{ "success": true }`).
+
+### 3.7 Personal Access Tokens (PATs) with Scopes & Confinement
+Issue scoped, revocable API tokens for CLI tools, automation scripts, or third-party integrations without exposing a full user session.
+- **Supported Scopes:**
+  - `read`: Read-only access (`GET` / `HEAD` endpoints such as file listings, downloads, thumbnails, storage summary).
+  - `write`: Upload files, create folders, rename, copy, move, and manage upload sessions.
+  - `delete`: Soft-delete files, permanently delete files, and empty trash.
+  - `share`: Create or revoke public share links (`/api/share*`).
+  - `admin`: Access admin endpoints (only effective if the owning user is an admin).
+- **Account & Folder Confinement:**
+  - If `accountId` is set on the token, requests targeting any other `accountId` are rejected with `403 FORBIDDEN`.
+  - If `rootFolderId` is set on the token, requests targeting folders outside that root folder path are rejected with `403 FORBIDDEN`.
+- **List Active Tokens:** `GET /api/tokens`
+  - **Response (200 OK):** Array of `{ tokenId, name, tokenPreview, scopes, accountId, rootFolderId, createdAt, lastUsedAt, expiresAt }`.
+- **Create Token:** `POST /api/tokens`
+  - **Request Body (JSON):**
+    ```json
+    {
+      "name": "Backup Script Token",
+      "scopes": ["read", "write"],
+      "accountId": "65d8a1f2e4b0111111111111",
+      "rootFolderId": "backups/2026",
+      "expiresInDays": 30
+    }
+    ```
+  - **Response (201 Created):**
+    ```json
+    {
+      "tokenId": "448wphlmrz4k",
+      "name": "Backup Script Token",
+      "token": "pat_9f8e7d6c5b4a...",
+      "scopes": ["read", "write"],
+      "accountId": "65d8a1f2e4b0111111111111",
+      "rootFolderId": "backups/2026",
+      "createdAt": "2026-11-18T09:00:00.000Z",
+      "expiresAt": "2026-12-18T09:00:00.000Z"
+    }
+    ```
+- **Revoke Token:** `DELETE /api/tokens/:tokenId`
+  - Immediately revokes the token (`200 OK`: `{ "success": true }`).
 
 ---
 
@@ -538,33 +588,68 @@ Uploads a file to a specific storage drive and destination folder using disk-str
 Recommended for large files and interrupted networks:
 1. **Create Session:** `POST /api/upload-sessions/:accountId`
    - **Headers:** `Idempotency-Key: <key>` *(Optional if passed in JSON body)*
-   - **Body (JSON):** `{ "fileName": "video.mp4", "mimeType": "video/mp4", "totalBytes": 104857600, "chunkSize": 2097152, "folderId": "root", "checksum": "<optional-sha256-hex>", "idempotencyKey": "<key>" }` *(Note: `size` and `desiredChunkSize` are also accepted as aliases for `totalBytes` and `chunkSize`)*.
+   - **Body (JSON):** `{ "fileName": "video.mp4", "mimeType": "video/mp4", "totalBytes": 104857600, "chunkSize": 2097152, "folderId": "root", "checksum": "<optional-sha256-hex>", "deduplicate": false, "idempotencyKey": "<key>" }` *(Note: `size` and `desiredChunkSize` are also accepted as aliases for `totalBytes` and `chunkSize`)*.
+   - **Quota & Duplicate Checks:**
+     - Normalizes unsafe characters/path traversal in `fileName` via `normalizeSafeFilename`.
+     - Verifies target account storage quota headroom when cached quota metadata is available (`403 INSUFFICIENT_STORAGE` if full).
+     - When `deduplicate: true` and `checksum` are supplied, checks if an identical non-trashed file already exists in the target folder and returns `{ deduplicated: true, status: "completed", existingFileId }` (`200 OK`) without re-uploading.
    - **Response (`201 Created` or `200 OK` on idempotent replay):** Returns session descriptor `{ sessionId, status: "active", receivedBytes, totalBytes, chunkSize, expiresAt, ... }`.
 2. **Inspect Session State:** `GET /api/upload-sessions/:sessionId`
    - Returns current `status` (`active`, `paused`, `completing`, `completed`, `expired`, `cancelled`), `receivedBytes`, and `totalBytes`.
 3. **Upload Chunk (Zero-Double-Write Direct Stream or Multipart):** `PUT /api/upload-sessions/:sessionId/chunks`
-   - **Recommended Direct Stream Mode (`Content-Type: application/octet-stream`):** Send raw chunk bytes in the request body with `X-Chunk-Offset: <byte_offset>` (or `Content-Range: bytes <start>-<end>/<total>`) and `Content-Length`. Streams directly into `session.tempPath` while computing SHA-256 on the fly with zero intermediate Multer disk write.
-   - **Multipart Mode (`Content-Type: multipart/form-data`):** Send `chunk` binary field + `offset` form field (or `X-Chunk-Offset` / `Content-Range` header).
+   - **Recommended Direct Stream Mode (`Content-Type: application/octet-stream`):** Send raw chunk bytes in the request body with `X-Chunk-Offset: <byte_offset>` (or `Content-Range: bytes <start>-<end>/<total>`), `Content-Length`, and optional `X-Chunk-Sha256: <hex>`. Streams directly into `session.tempPath` while computing SHA-256 on the fly with zero intermediate Multer disk write.
+   - **Multipart Mode (`Content-Type: multipart/form-data`):** Send `chunk` binary field + `offset` form field (or `X-Chunk-Offset` / `Content-Range` header) and optional `X-Chunk-Sha256`.
+   - **Per-Chunk Integrity:** If `X-Chunk-Sha256` (or `chunkChecksum` body field) is provided and does not match the received chunk digest, the chunk is rejected (`422 BAD_REQUEST`) and the file is truncated back to `session.receivedBytes`.
    - **Response (`200 OK`):** `{ sessionId, receivedBytes, totalBytes, nextOffset, complete }`. Returns `409 UPLOAD_SESSION_NOT_ACTIVE` if paused, `409 UPLOAD_SESSION_OFFSET_CONFLICT` on mismatched offset, or `410 UPLOAD_SESSION_EXPIRED` if expired. Exact chunk replays with matching SHA-256 are acknowledged idempotently (`200 OK`).
 4. **Pause Session:** `POST /api/upload-sessions/:sessionId/pause`
    - Transitions an `active` session to `paused` (`200 OK`).
 5. **Resume Session:** `POST /api/upload-sessions/:sessionId/resume`
    - Transitions a `paused` session back to `active` (`200 OK`).
 6. **Complete Session:** `POST /api/upload-sessions/:sessionId/complete`
-   - Acquires a completion lease lock, verifies received byte size and SHA-256 checksum, streams the staged file to the target provider (persisting upstream OneDrive `nextExpectedRanges` or Google Drive resumable upload URIs), and cleans up temporary staging files.
+   - Acquires a completion lease lock, verifies received byte size and full-file SHA-256 checksum, inspects file magic bytes and ZIP central directory compression ratios via `sniffMagicMimeType` to block archive bombs (`400 ARCHIVE_BOMB_DETECTED`), streams the staged file to the target provider (persisting upstream OneDrive `nextExpectedRanges` or Google Drive resumable upload URIs), records an audit event, and cleans up temporary staging files.
 7. **Cancel Session:** `DELETE /api/upload-sessions/:sessionId` (or `POST /api/upload-sessions/:sessionId/cancel`)
    - Marks the session `cancelled` and immediately unlinks staged temp files.
 
 ### 6.5 Download or Stream File (`GET` & `HEAD`)
 Streams or downloads a file from any linked drive (Telegram, Google Drive, OneDrive).
 - **Method & Route:** `GET /api/download/:accountId/:fileId` and `HEAD /api/download/:accountId/:fileId`
-- **Auth Required:** Yes (`Authorization` header or `?token=<session_token>`)
+- **Auth Required:** Yes (`Authorization` header, `?token=<session_token>`, or signed media URL)
 - **Query Parameters:**
   - `preview=1` *(Optional)*: Sets `Content-Disposition: inline` instead of `attachment`, enabling in-app preview for images, PDFs, and video playback.
 - **Headers & Streaming:**
-  - Always sends `Accept-Ranges: bytes`, `Cache-Control: private, no-cache` (never cached publicly), `Content-Type`, `Content-Length`, `ETag`, and RFC 5987 `Content-Disposition: filename*=UTF-8''<encoded_name>`.
+  - Always sends `Accept-Ranges: bytes`, `Cache-Control: private, no-cache` (never cached publicly), `Content-Type`, `Content-Length`, `ETag`, and RFC 6266 / 5987 safe `Content-Disposition` (`buildSafeContentDisposition`).
   - Supports `HEAD` requests to inspect file size, MIME type, and ETag before downloading bytes.
   - Enforces per-user concurrent download limits (`MAX_CONCURRENT_DOWNLOADS_PER_USER`) and idle-stream timeouts (`DOWNLOAD_IDLE_TIMEOUT_MS`), destroying upstream provider streams immediately on client disconnect.
+
+#### 6.5.1 One-Time & Short-Lived Download Tickets (`/api/download-tickets`)
+Issue a short-lived or single-use download ticket so native media players, external download managers, or browser downloads never expose bearer tokens in query strings.
+- **Create Download Ticket:** `POST /api/download-tickets`
+  - **Auth Required:** Yes (`read` scope)
+  - **Request Body (JSON):**
+    ```json
+    {
+      "accountId": "65d8a1f2e4b0111111111111",
+      "fileId": "65d8a2b5e4b0222222222222",
+      "singleUse": true,
+      "ttlSeconds": 300,
+      "preview": false
+    }
+    ```
+  - **Response (201 Created):**
+    ```json
+    {
+      "ticket": "dlt_to9rx7sqlbwp3n1ow6nnj3g3cj0333sg",
+      "downloadUrl": "/api/download/ticket/dlt_to9rx7sqlbwp3n1ow6nnj3g3cj0333sg",
+      "expiresAt": "2026-11-18T09:52:29.369Z",
+      "singleUse": true
+    }
+    ```
+- **Redeem Ticket & Stream File:** `GET /api/download/ticket/:ticket`
+  - **Auth Required:** No (the ticket itself is the capability)
+  - **Behavior:** Atomically marks `singleUse: true` tickets as consumed (`usedCount: 1`) and streams the file with full HTTP `Range` support. Subsequent requests to a consumed single-use ticket or expired/revoked ticket return `410 Gone`.
+- **Revoke Ticket:** `DELETE /api/download-tickets/:ticket`
+  - **Auth Required:** Yes
+  - **Response (200 OK):** `{ "success": true }`
 
 ### 6.6 Rename File
 Renames an existing file or folder.
@@ -679,16 +764,51 @@ Duplicates a file in the destination directory or clones it across different sto
 
 ---
 
-### 7.3 Durable Background Jobs (`GET /api/jobs*`, `POST /api/jobs/:jobId/*`)
-- **Concurrent Worker Pool:** Processed by up to `MAX_CONCURRENT_JOBS` (default `3`) parallel background workers with atomic MongoDB lease locks (`leaseUntil`, `leaseOwner`) and per-account-pair serialization (`providerLimit("transfer:source:target", 1)`).
-- **List Jobs:** `GET /api/jobs?status=<optional_status>`
-  - Returns the authenticated user's recent background transfer and backup jobs.
-- **Get Job Status:** `GET /api/jobs/:jobId`
-  - **Response:** `{ "id": "...", "type": "cross_account_transfer|batch_backup|batch_restore", "status": "queued|running|completed|failed|cancelled", "stage": "...", "progressPct": 100, "bytesProcessed": 1024, "totalBytes": 1024, "attempts": 1, "maxAttempts": 3, "deadLettered": false }`
+### 7.3 Unified Operation & Multi-Queue Background Jobs (`GET /api/jobs*`, `POST /api/jobs/:jobId/*`)
+- **Multi-Queue Worker Architecture:** Processed by up to `MAX_CONCURRENT_JOBS` (default `3`) parallel background workers with atomic MongoDB lease locks (`leaseExpiresAt`, `workerId`), priority ordering, heartbeat tracking, and per-account-pair serialization (`providerLimit("transfer:source:target", 1)`).
+- **Supported Queue Types:** `cross_account_transfer`, `batch_backup`, `batch_restore`, `trash_cleanup`, `thumb_generation`, `provider_sync`.
+- **Safe Move Verification Fence:** On cross-account moves (`isMove: true`), the worker verifies that the destination provider returned a real file identifier (`id` / `_id` / `messageId`) AND that `verifiedBytes === sourceSize`, then writes `sourceDeleteApproved: true` into `transfer_manifests` before deleting the source file.
+- **List Operations:** `GET /api/jobs?status=<optional_status>`
+  - Returns the authenticated user's recent background operations.
+- **Get Operation Status:** `GET /api/jobs/:jobId`
+  - **Response (Unified Operation Model):**
+    ```json
+    {
+      "id": "job_01",
+      "jobId": "job_01",
+      "userId": "user_1",
+      "accountId": "65d8a1f2e4b0111111111111",
+      "type": "cross_account_transfer",
+      "status": "completed",
+      "stage": "completed",
+      "source": { "accountId": "65d8a1f2e4b0111111111111", "fileId": "f1" },
+      "destination": { "accountId": "65d8a1f2e4b0222222222222", "folderId": "root", "fileId": "gd_99" },
+      "progress": 100,
+      "progressPct": 100,
+      "bytesProcessed": 1024,
+      "totalBytes": 1024,
+      "itemsProcessed": 1,
+      "totalItems": 1,
+      "retryCount": 0,
+      "attempts": 1,
+      "maxAttempts": 3,
+      "deadLettered": false,
+      "cancellationRequested": false,
+      "cancelRequested": false,
+      "sourceDeleteApproved": true,
+      "createdAt": "2026-11-18T09:00:00.000Z",
+      "startedAt": "2026-11-18T09:00:01.000Z",
+      "completedAt": "2026-11-18T09:00:03.000Z",
+      "expiresAt": null,
+      "error": null
+    }
+    ```
+- **Queue Health & Worker Heartbeat Endpoint:** `GET /api/jobs/health`
+  - **Response (200 OK):** Returns `{ ok: true, workerHealthy: true, lastWorkerHeartbeatAt, activeJobs, maxConcurrentJobs, activeTransfers, queues: { cross_account_transfer: { queued, running, retrying, deadLetter, completed, failed, cancelled }, ... } }`.
 - **Real-Time Job Progress Stream (SSE):** `GET /api/jobs/:jobId/stream`
   - Streams Server-Sent Events (`text/event-stream`) as job `stage` and `progressPct` advance until completion, failure, or cancellation.
 - **Cancel Job:** `POST /api/jobs/:jobId/cancel`
-  - Cooperatively cancels a `queued` or `running` job, aborts in-flight transfers, and guarantees the source file is never deleted on a cancelled move.
+  - Cooperatively cancels a `queued` or `running` job, aborts in-flight transfers via an atomic cancellation fence, and guarantees the source file is never deleted on a cancelled move.
 - **Retry Failed / Cancelled Job:** `POST /api/jobs/:jobId/retry`
   - Resets `status` to `queued` and clears dead-letter flags so the worker re-processes the job idempotently.
 
@@ -712,35 +832,59 @@ Duplicates a file in the destination directory or clones it across different sto
   - **Request Body (JSON):** `{ "targetAccountId": "...", "targetFolderId": "root", "conflictStrategy": "rename" }`
   - **Behavior:** Restores completed backup items as a `batch_restore` background job (`202 Accepted`). Defaults to `conflictStrategy: "rename"` so existing destination files are **never silently overwritten** (conflicting filenames are saved as `<name> (conflict copy).<ext>`).
 
-## 8. Public Share Links
+## 8. Public Share Links (7-Point Validated)
+
+Every public share request (`/s/:shareId` and `/api/public/download/:shareId`) enforces a **7-point live validation check**:
+1. Share record exists
+2. Share is active (`revokedAt == null`)
+3. Share has not expired (`expiresAt`)
+4. Share download count is within `maxDownloads` and `allowDownload !== false`
+5. Optional share PIN matches (`?pin=<pin>` or `X-Share-Pin: <pin>`)
+6. Linked storage account exists and is active
+7. Underlying file still exists on the provider and is **neither trashed nor permanently deleted**
 
 ### 8.1 Create Public Share Link
-Generates a short shareable URL for any file (allows public access without authentication).
+Generates a shareable URL for any non-encrypted file with optional expiration, download cap, and PIN protection.
 - **Method & Route:** `POST /api/share`
-- **Auth Required:** Yes
+- **Auth Required:** Yes (`share` scope)
 - **Request Body (JSON):**
   ```json
   {
     "accountId": "65d8a1f2e4b0111111111111",
-    "fileId": "65d8a2b5e4b0222222222222"
+    "fileId": "65d8a2b5e4b0222222222222",
+    "expiresInHours": 48,
+    "maxDownloads": 10,
+    "pin": "4321",
+    "allowDownload": true
   }
   ```
 - **Response (200 OK):**
   ```json
   {
     "success": true,
-    "shareUrl": "https://your-domain.com/s/a1b2c3"
+    "shareId": "a1b2c3",
+    "shareUrl": "https://your-domain.com/s/a1b2c3",
+    "expiresAt": "2026-11-20T09:00:00.000Z",
+    "maxDownloads": 10,
+    "hasPin": true,
+    "allowDownload": true
   }
   ```
 
-### 8.2 Public Direct Download
-Direct binary file stream for shared files (no auth required).
+### 8.2 List & Revoke Public Shares
+- **List Active Shares:** `GET /api/shares`
+  - Returns the authenticated user's active shares (`shareId`, `accountId`, `fileId`, `fileName`, `createdAt`, `expiresAt`, `maxDownloads`, `downloadCount`, `hasPin`, `allowDownload`).
+- **Revoke Share:** `DELETE /api/share/:shareId`
+  - Marks the share as revoked (`revokedAt`) so `/s/:shareId` and `/api/public/download/:shareId` immediately stop serving the file (`200 OK`: `{ "success": true }`).
+
+### 8.3 Public Direct Download
+Direct binary file stream for shared files (no auth required; pass `?pin=<pin>` or `X-Share-Pin` if PIN-protected).
 - **Method & Route:** `GET /api/public/download/:shareId`
 - **Auth Required:** No
-- **Response:** Binary file stream with `Content-Disposition: attachment`. Supports video range streaming.
+- **Response:** Binary file stream with safe RFC 6266 `Content-Disposition: attachment`. Supports video range streaming and increments `downloadCount`.
 
-### 8.3 Public Share Landing Page
-HTML preview and download web page for end users.
+### 8.4 Public Share Landing Page
+HTML preview and download web page for end users (pass `?pin=<pin>` if PIN-protected).
 - **Method & Route:** `GET /s/:shareId`
 - **Auth Required:** No
 - **Response:** Styled HTML landing page with file metadata, thumbnail preview, and direct download button.
@@ -788,7 +932,7 @@ Permanently deletes the user and all their linked accounts and file references.
 - **Response:** `{ "success": true }`
 
 ### 9.8 Get System & Provider Observability Metrics
-Returns real-time process health, CPU, memory, event-loop lag, open file descriptors, active connections/uploads/downloads, temp/thumb disk usage, job queue depth, dead-letter job counts, cache hit/miss stats, per-provider call telemetry, and active threshold alerts.
+Returns real-time process health, CPU, memory, event-loop lag, open file descriptors, active connections/uploads/downloads, upload/download byte throughput, OAuth refresh failure counts, worker heartbeats, temp/thumb disk usage, job queue depth, dead-letter job counts, cache hit/miss stats, per-provider call telemetry, and active threshold alerts.
 - **Method & Route:** `GET /api/admin/metrics`
 - **Auth Required:** Admin session or Admin Basic Auth
 - **Response (200 OK):**
@@ -800,10 +944,27 @@ Returns real-time process health, CPU, memory, event-loop lag, open file descrip
     "openFileDescriptors": 42,
     "memoryUsage": { "rss": 98566144, "heapTotal": 45088768, "heapUsed": 32112640 },
     "disk": { "tempFreeHeadroomOk": true, "tempDirBytes": 0, "tempFileCount": 0, "thumbDirBytes": 1245184 },
-    "uploads": { "activeGlobal": 0, "completed": 15, "failed": 0 },
-    "downloads": { "activeGlobal": 0 },
-    "jobs": { "queued": 0, "running": 0, "failed": 0, "deadLetter": 0, "transfersCompleted": 8, "transfersFailed": 0 },
-    "cache": { "driveCacheKeys": 14, "authCacheKeys": 3 },
+    "uploads": { "activeGlobal": 0, "completed": 15, "failed": 0, "bytesTotal": 104857600 },
+    "downloads": { "activeGlobal": 0, "bytesTotal": 52428800 },
+    "jobs": {
+      "queued": 0,
+      "running": 0,
+      "failed": 0,
+      "deadLetter": 0,
+      "transfersCompleted": 8,
+      "transfersFailed": 0,
+      "workerHeartbeats": 284,
+      "lastWorkerHeartbeatAt": "2026-11-18T09:47:29.000Z"
+    },
+    "oauth": { "refreshFailures": 0 },
+    "cache": {
+      "driveCacheKeys": 14,
+      "driveCacheHits": 120,
+      "driveCacheMisses": 14,
+      "thumbCacheKeys": 8,
+      "failedThumbCacheKeys": 0,
+      "authCacheKeys": 3
+    },
     "providers": {
       "google": { "calls": 24, "errors": 0, "retries": 1, "totalDurationMs": 3120 },
       "onedrive": { "calls": 10, "errors": 0, "retries": 0, "totalDurationMs": 1450 },
@@ -813,6 +974,16 @@ Returns real-time process health, CPU, memory, event-loop lag, open file descrip
   }
   ```
 
+### 9.9 Security & Operational Audit Logs
+Queries structured security and operational audit records persisted in `audit_logs` (90-day automatic TTL retention, with automatic credential/token redaction).
+- **Method & Route:** `GET /api/admin/audit-logs`
+- **Auth Required:** Admin session or Admin Basic Auth
+- **Query Parameters:**
+  - `userId` *(Optional)*: Filter logs by user ID.
+  - `action` *(Optional)*: Filter by audit action (e.g. `login_success`, `login_failed`, `api_token_created`, `api_token_revoked`, `auth_scope_denied`, `auth_confinement_denied`, `file_uploaded`, `file_downloaded`, `file_deleted`, `share_created`, `share_revoked`, `public_share_downloaded`, `oauth_refresh_failed`).
+  - `limit` *(Optional)*: Max records to return (`1..500`, default `100`).
+- **Response (200 OK):** Array of audit log documents ordered newest-first.
+
 ---
 
 ## 10. Android & Mobile Developer Quick Reference
@@ -821,31 +992,35 @@ Returns real-time process health, CPU, memory, event-loop lag, open file descrip
 | :--- | :--- | :--- | :--- | :--- |
 | **Health Check** | `/healthz` | GET | None | Liveness check returns `{ "ok": true, "uptimeSec": ... }` |
 | **Readiness Check** | `/readyz` | GET | None | Checks MongoDB connectivity and temp disk headroom |
-| **Login** | `/api/login` | POST | None | Rate limited (10/min); returns Bearer `token` |
+| **Login** | `/api/login` | POST | None | Progressive throttling & lockout; returns Bearer `token` |
 | **Register** | `/api/register` | POST | None | Rate limited (10/min) |
-| **Active Sessions** | `/api/sessions` | GET / DELETE | Bearer | List or revoke active device sessions |
+| **Active Sessions** | `/api/sessions` | GET / DELETE | Bearer | List or revoke active device sessions (with IP history) |
+| **Personal Access Tokens**| `/api/tokens` | GET / POST / DELETE | Bearer | Scoped PATs (`read`, `write`, `delete`, `share`) + account/folder confinement |
 | **List Drives** | `/api/accounts` | GET | Bearer | Returns all linked drives |
 | **Storage Summary** | `/api/storage/summary` | GET | Bearer | Pass `?accountId=<id>` or `all`; returns `usedBytes`, `totalBytes`, `fileCount`, `categories` |
 | **Google OAuth** | `/api/auth/drive-link` | GET | Bearer | Open returned `url` in Chrome Custom Tabs |
 | **OneDrive OAuth** | `/api/auth/onedrive-link` | GET | Bearer | Open returned `url` in Chrome Custom Tabs |
 | **Add TG Drive** | `/api/tgdrive/register` | POST | Bearer | Pass `channelId` and `driveName` |
 | **List Files** | `/api/files` | GET | Bearer | Supports `cursor`, `limit`, weak ETag 304, returns `sizeBytes`, `updatedAt` & `thumbUrl` |
-| **Thumbnail** | `/api/thumb/:accId/:fileId` | GET | Bearer or `?token=` | Optimized image/video thumbnail, `?s=256` |
+| **Thumbnail** | `/api/thumb/:accId/:fileId` | GET | Bearer or `?token=` | Optimized image/video thumbnail with negative retry cache, `?s=256` |
 | **Create Folder** | `/api/folders` | POST | Bearer | Pass `name` & `parentId` |
 | **Upload File** | `/api/upload/:accountId` | POST | Bearer | Multipart Form: `file` & `folderId` + `Idempotency-Key` |
-| **Upload Sessions** | `/api/upload-sessions/:accId` | POST / PUT / GET / DELETE | Bearer | Resumable chunked uploads with `/pause`, `/resume`, `/complete`, `/cancel` |
-| **Download/Stream** | `/api/download/:accId/:fileId`| GET / HEAD | Bearer or `?token=` | Supports `Range`, `HEAD`, RFC 5987, ETag 304, and `?preview=1` |
+| **Upload Sessions** | `/api/upload-sessions/:accId` | POST / PUT / GET / DELETE | Bearer | Resumable chunked uploads (`X-Chunk-Sha256`, deduplication, quota & archive-bomb checks) |
+| **Download/Stream** | `/api/download/:accId/:fileId`| GET / HEAD | Bearer or `?token=` | Supports `Range`, `HEAD`, RFC 6266/5987, ETag 304, and `?preview=1` |
+| **Download Tickets** | `/api/download-tickets` | POST / DELETE | Bearer | Issue or revoke short-lived / single-use download tickets (`dlt_...`) |
+| **Redeem Ticket** | `/api/download/ticket/:ticket`| GET | None | Stream file using a short-lived or one-time download ticket |
 | **Trash Management** | `/api/trash` | GET / POST / DELETE | Bearer | List trashed files, `/api/trash/restore`, or permanent delete |
 | **Move File** | `/api/files/move` | POST | Bearer | Supports same-drive & cross-drive transfers (`?async=true` for job queue) |
 | **Copy File** | `/api/files/copy` | POST | Bearer | Supports same-drive & cross-drive cloning (`?async=true` for job queue) |
-| **Jobs Queue** | `/api/jobs` | GET / POST | Bearer | Inspect jobs, SSE `/stream`, `/cancel`, and `/retry` |
+| **Jobs Queue** | `/api/jobs` | GET / POST | Bearer | Unified Operation model, `/api/jobs/health`, SSE `/stream`, `/cancel`, `/retry` |
 | **Batch Backups** | `/api/backups/batch` | POST | Bearer | Background batch backup, `/:jobId/verify`, and conflict-safe `/:jobId/restore` |
-| **Share Link** | `/api/share` | POST | Bearer | Returns public URL `/s/:shareId` (`409` for encrypted files) |
-| **Public Download**| `/api/public/download/:shareId`| GET | None | Direct file download (`409` for encrypted files) |
+| **Share Links** | `/api/share` & `/api/shares` | POST / GET / DELETE | Bearer | 7-point validated shares with `expiresInHours`, `maxDownloads`, `pin`, and revocation |
+| **Public Download**| `/api/public/download/:shareId`| GET | None | 7-point validated direct file download (`?pin=` if PIN-protected) |
 | **Put Key Backup** | `/api/accounts/:id/encryption/key-backup` | PUT | Bearer | Store opaque PBKDF2-wrapped encryption key backup |
 | **Get Key Backup** | `/api/accounts/:id/encryption/key-backup` | GET | Bearer | Retrieve opaque wrapped encryption key backup |
 | **Delete Key Backup**| `/api/accounts/:id/encryption/key-backup` | DELETE | Bearer | Delete stored key backup (`204 No Content`) |
-| **Admin Metrics** | `/api/admin/metrics` | GET | Admin | Full process, disk, provider, queue, and alert telemetry |
+| **Admin Metrics** | `/api/admin/metrics` | GET | Admin | Full process, disk, provider, queue, cache, and alert telemetry |
+| **Admin Audit Logs** | `/api/admin/audit-logs` | GET | Admin | Query structured security and operational audit records |
 
 ---
 

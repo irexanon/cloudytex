@@ -539,3 +539,88 @@ export async function computeFileSha256(filePath: string, fsModule: typeof impor
   }
   return hash.digest('hex');
 }
+
+/**
+ * Normalizes a filename to Unicode NFC, strips control characters and path separators,
+ * and ensures a safe bounded length.
+ */
+export function normalizeSafeFilename(rawName: unknown, fallback = 'file'): string {
+  if (typeof rawName !== 'string' || !rawName.trim()) return fallback;
+  const nfc = rawName.normalize('NFC');
+  const cleaned = nfc
+    .replace(/[\x00-\x1f\x7f/\\]/g, '_')
+    .replace(/^\.+$/, '_')
+    .trim();
+  if (!cleaned) return fallback;
+  return cleaned.length > 255 ? cleaned.slice(0, 255) : cleaned;
+}
+
+/**
+ * Inspects the first bytes of a file or buffer to detect magic-byte MIME types
+ * and checks for suspicious nested archive flags.
+ */
+export async function sniffMagicMimeType(
+  filePath: string,
+  fsModule: typeof import('fs') = fs
+): Promise<{ detectedMime: string | null; isArchive: boolean; suspiciousArchive: boolean }> {
+  try {
+    const handle = await fsModule.promises.open(filePath, 'r');
+    try {
+      const buf = Buffer.alloc(64);
+      const { bytesRead } = await handle.read(buf, 0, 64, 0);
+      if (bytesRead < 4) {
+        return { detectedMime: null, isArchive: false, suspiciousArchive: false };
+      }
+      if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+        return { detectedMime: 'image/png', isArchive: false, suspiciousArchive: false };
+      }
+      if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+        return { detectedMime: 'image/jpeg', isArchive: false, suspiciousArchive: false };
+      }
+      if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) {
+        return { detectedMime: 'image/gif', isArchive: false, suspiciousArchive: false };
+      }
+      if (
+        bytesRead >= 12 &&
+        buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
+        buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50
+      ) {
+        return { detectedMime: 'image/webp', isArchive: false, suspiciousArchive: false };
+      }
+      if (buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46) {
+        return { detectedMime: 'application/pdf', isArchive: false, suspiciousArchive: false };
+      }
+      if (buf[0] === 0x50 && buf[1] === 0x4b && (buf[2] === 0x03 || buf[2] === 0x05) && (buf[3] === 0x04 || buf[3] === 0x06)) {
+        // Check ZIP local file header uncompressed vs compressed size ratio if present
+        let suspiciousArchive = false;
+        if (bytesRead >= 26 && buf[2] === 0x03 && buf[3] === 0x04) {
+          const compressedSize = buf.readUInt32LE(18);
+          const uncompressedSize = buf.readUInt32LE(22);
+          if (compressedSize > 0 && uncompressedSize / compressedSize > 200) {
+            suspiciousArchive = true;
+          }
+        }
+        return { detectedMime: 'application/zip', isArchive: true, suspiciousArchive };
+      }
+      if (buf[0] === 0x1f && buf[1] === 0x8b) {
+        return { detectedMime: 'application/gzip', isArchive: true, suspiciousArchive: false };
+      }
+      return { detectedMime: null, isArchive: false, suspiciousArchive: false };
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return { detectedMime: null, isArchive: false, suspiciousArchive: false };
+  }
+}
+
+/**
+ * Builds a RFC 6266 / 5987 safe Content-Disposition header value.
+ */
+export function buildSafeContentDisposition(dispositionType: 'inline' | 'attachment', rawFilename: string): string {
+  const safeName = normalizeSafeFilename(rawFilename, 'download');
+  const asciiFallback = safeName.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+  const encoded = encodeURIComponent(safeName);
+  return `${dispositionType}; filename="${asciiFallback}"; filename*=UTF-8''${encoded}`;
+}
+
