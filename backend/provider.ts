@@ -488,11 +488,7 @@ async function tgStreamFile(messageId: number, channelId: string, req: any, res:
 
     const isEncrypted = meta?.isEncrypted === true;
     let totalSize: number = isEncrypted ? Number(meta?.encryptedSizeBytes ?? meta?.size ?? 0) : Number(meta?.size || 0);
-    // Always fall back to Telegram media size — handles cases where meta.size is missing or zero
-    if (!totalSize) {
-      const mediaSizeRaw = media?.document?.size ?? media?.photo?.size ?? media?.video?.size ?? null;
-      if (mediaSizeRaw !== null && mediaSizeRaw !== undefined) totalSize = Number(mediaSizeRaw);
-    }
+    if (!totalSize && media?.document?.size) totalSize = Number(media.document.size);
     const contentType = isEncrypted ? 'application/octet-stream' : (meta?.mimeType || 'application/octet-stream');
 
     const rangeHeader = req.headers['range'];
@@ -510,7 +506,7 @@ async function tgStreamFile(messageId: number, channelId: string, req: any, res:
       res.setHeader('Accept-Ranges', 'bytes');
       res.setHeader('Content-Length', chunkSize);
       res.setHeader('Content-Type', contentType);
-      const stepSize = 1024 * 1024;
+      const stepSize = 512 * 1024;
       let skipBytes = start % stepSize;
       const alignedStart = start - skipBytes;
       let downloaded = 0;
@@ -542,7 +538,7 @@ async function tgStreamFile(messageId: number, channelId: string, req: any, res:
       res.setHeader('Content-Type', contentType);
       res.setHeader('Accept-Ranges', 'bytes');
       if (totalSize) res.setHeader('Content-Length', totalSize);
-      for await (const chunk of telegram.iterDownload({ file: media, requestSize: 1024 * 1024 })) {
+      for await (const chunk of telegram.iterDownload({ file: media, requestSize: 512 * 1024 })) {
         resetIdle();
         if (clientAborted || res.destroyed) break;
         const canContinue = res.write(chunk);

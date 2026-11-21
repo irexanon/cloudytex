@@ -1,32 +1,88 @@
 import React from 'react';
-import { Folder, File as FileIconLucide, Eye, RefreshCw, Video, HardDrive, LayoutGrid, Settings } from 'lucide-react';
+import {
+  Folder,
+  File as FileIconLucide,
+  Image as ImageIcon,
+  Music,
+  Video,
+  FileSpreadsheet,
+  FileText,
+  Presentation,
+  FileArchive,
+} from 'lucide-react';
 import TelegramIcon from './Icons/TelegramIcon';
 
-export default function FileIcon({ file, type, size = 'sm', isTg = false, accountId, showThumbnails = true }: { file?: any; type: string; size?: 'sm' | 'lg'; isTg?: boolean; accountId?: string | null; showThumbnails?: boolean }) {
-  const container = size === 'lg' ? 'w-20 h-20 rounded-3xl' : 'w-10 h-10 rounded-xl';
-  const iconSize  = size === 'lg' ? 32 : 18;
-  const base      = `${container} flex items-center justify-center shrink-0 shadow-sm transition-all`;
+export function getFileTintClasses(type: string, isTg = false): string {
+  if (type === 'folder') return 'bg-[#F59E0B]/15 text-[#F59E0B]';
+  if (isTg && type === 'other') return 'bg-[#38BDF8]/15 text-[#0EA5E9] dark:text-[#38BDF8]';
+  if (type === 'pdf') return 'bg-[#F43F5E]/15 text-[#F43F5E]';
+  if (type === 'sheet') return 'bg-[#10B981]/15 text-[#10B981]';
+  if (type === 'doc') return 'bg-[#3B82F6]/15 text-[#3B82F6]';
+  if (type === 'video') return 'bg-[#A855F7]/15 text-[#A855F7]';
+  if (type === 'zip') return 'bg-[#94A3B8]/18 text-[#64748B] dark:text-[#94A3B8]';
+  if (type === 'slide') return 'bg-[#F97316]/15 text-[#F97316]';
+  if (type === 'image') return 'bg-[#14B8A6]/15 text-[#14B8A6]';
+  if (type === 'audio') return 'bg-[#EC4899]/15 text-[#EC4899]';
+  return 'bg-slate-200/60 dark:bg-slate-800 text-[var(--sub)]';
+}
+
+export function renderFileTypeGlyph(type: string, iconSize: number, isTg = false) {
+  if (type === 'folder') return <Folder size={iconSize} fill="currentColor" />;
+  if (isTg && type === 'other') return <TelegramIcon size={iconSize} />;
+  if (type === 'pdf') return <FileText size={iconSize} />;
+  if (type === 'image') return <ImageIcon size={iconSize} />;
+  if (type === 'audio') return <Music size={iconSize} />;
+  if (type === 'video') return <Video size={iconSize} />;
+  if (type === 'sheet') return <FileSpreadsheet size={iconSize} />;
+  if (type === 'doc') return <FileText size={iconSize} />;
+  if (type === 'slide') return <Presentation size={iconSize} />;
+  if (type === 'zip') return <FileArchive size={iconSize} />;
+  return <FileIconLucide size={iconSize} />;
+}
+
+export default function FileIcon({
+  file,
+  type,
+  size = 'sm',
+  isTg = false,
+  accountId,
+  showThumbnails = true,
+}: {
+  file?: any;
+  type: string;
+  size?: 'sm' | 'lg' | 'card';
+  isTg?: boolean;
+  accountId?: string | null;
+  showThumbnails?: boolean;
+}) {
+  const iconSize = size === 'card' ? 42 : size === 'lg' ? 40 : 20;
+  const containerClass =
+    size === 'card'
+      ? 'w-full h-[108px]'
+      : size === 'lg'
+      ? 'w-20 h-20 rounded-2xl'
+      : 'w-10 h-10 rounded-xl';
+  const tintClass = getFileTintClasses(type, isTg);
 
   if (file?.type === 'image' && accountId && showThumbnails) {
     const token = localStorage.getItem('cloudyte_token');
     const url = `/api/download/${accountId}/${file.id}?preview=1&token=${token}`;
     return (
-      <div className={`${container} shrink-0 overflow-hidden shadow-sm bg-slate-100 dark:bg-slate-800`}>
-        <img src={url} alt={file.name} className="w-full h-full object-cover" loading="lazy" />
+      <div className={`${containerClass} shrink-0 overflow-hidden bg-[var(--sf)] relative flex items-center justify-center ${size === 'card' ? '' : 'border border-[var(--bd)]'}`}>
+        <img
+          src={url}
+          alt={file.name}
+          referrerPolicy="no-referrer"
+          className="w-full h-full object-cover"
+          loading="lazy"
+        />
       </div>
     );
   }
 
-  if (type === 'folder') return <div className={`${base} bg-amber-50 dark:bg-amber-900/20 text-amber-500 group-hover:scale-110`}><Folder size={iconSize} fill="currentColor" /></div>;
-  if (isTg)             return <div className={`${base} bg-sky-50 dark:bg-sky-900/20 text-sky-500 group-hover:scale-110`}><TelegramIcon size={iconSize} /></div>;
-  if (type === 'pdf')   return <div className={`${base} bg-rose-50 dark:bg-rose-900/20 text-rose-500`}><FileIconLucide size={iconSize} /></div>;
-  if (type === 'image') return <div className={`${base} bg-blue-50 dark:bg-blue-900/20 text-blue-500 group-hover:scale-110`}><Eye size={iconSize} /></div>;
-  if (type === 'audio') return <div className={`${base} bg-pink-50 dark:bg-pink-900/20 text-pink-500 group-hover:scale-110`}><RefreshCw size={iconSize} /></div>;
-  if (type === 'video') return <div className={`${base} bg-purple-50 dark:bg-purple-900/20 text-purple-500 group-hover:scale-110`}><Video size={iconSize} /></div>;
-  if (type === 'sheet') return <div className={`${base} bg-emerald-50 dark:bg-emerald-900/20 text-emerald-600`}><HardDrive size={iconSize} /></div>;
-  if (type === 'doc')   return <div className={`${base} bg-blue-50 dark:bg-blue-900/20 text-blue-600`}><FileIconLucide size={iconSize} /></div>;
-  if (type === 'slide') return <div className={`${base} bg-orange-50 dark:bg-orange-900/20 text-orange-600`}><LayoutGrid size={iconSize} /></div>;
-  if (type === 'zip')   return <div className={`${base} bg-slate-100 dark:bg-slate-800 text-slate-600`}><Settings size={iconSize} /></div>;
-  
-  return <div className={`${base} bg-slate-50 dark:bg-slate-900 text-slate-400`}><FileIconLucide size={iconSize} /></div>;
+  return (
+    <div className={`${containerClass} ${tintClass} flex items-center justify-center shrink-0 transition-colors`}>
+      {renderFileTypeGlyph(type, iconSize, isTg)}
+    </div>
+  );
 }
