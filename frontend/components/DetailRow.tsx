@@ -2,9 +2,11 @@ import React from 'react';
 
 export default function DetailRow({ label, value }: { label: string; value: string }) {
   return (
-    <div className="flex justify-between items-center py-2 border-b border-slate-50 dark:border-slate-800/50">
-      <span className="text-[10px] font-black uppercase text-slate-400 tracking-widest">{label}</span>
-      <span className="text-xs font-bold text-slate-700 dark:text-slate-300 truncate max-w-[180px]">{value}</span>
+    <div className="flex justify-between items-center py-2.5 border-b border-[var(--bd)]/70 last:border-b-0 gap-4">
+      <span className="text-xs font-medium text-[var(--sub)] shrink-0">{label}</span>
+      <span className="text-xs font-medium text-[var(--tx)] truncate max-w-[200px] tabular-nums text-right">
+        {value}
+      </span>
     </div>
   );
 }

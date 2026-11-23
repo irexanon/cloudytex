@@ -27,6 +27,8 @@ import {
   normalizeSafeFilename,
   sniffMagicMimeType,
   buildSafeContentDisposition,
+  parseHttpByteRange,
+  shouldHonorRangeHeader,
   isSafeProviderItemId,
   escapeDriveQueryValue,
   isTrustedGraphNextLink,
@@ -184,8 +186,16 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
-// 1. DEPENDENCIES: Add compression before routes
-app.use(compression());
+// 1. DEPENDENCIES: Add compression before routes (bypass binary/file downloads so Content-Length & byte ranges stay intact)
+app.use(compression({
+  filter: (req, res) => {
+    if (req.path.startsWith('/api/download') || req.path.startsWith('/api/public/download')) {
+      return false;
+    }
+    if (res.getHeader('Content-Range')) return false;
+    return compression.filter(req, res);
+  },
+}));
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '1mb' }));
 app.use(originGuardMiddleware);
 // Correlate client-visible failures with server logs without logging credentials.
@@ -2654,7 +2664,13 @@ async function handleDownloadRequest(req: any, res: any, isHead = false) {
     if (fileDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this file', req.requestId);
 
     res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', (req.query.preview === '1' && !meta?.isEncrypted) ? 'private, max-age=86400' : 'private, no-cache');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.setHeader(
+      'Cache-Control',
+      (req.query.preview === '1' && !meta?.isEncrypted)
+        ? 'private, max-age=86400, no-transform'
+        : 'private, no-cache, no-transform'
+    );
     const dispositionType = (meta?.isEncrypted === true) ? 'attachment' : (req.query.preview === '1' ? 'inline' : 'attachment');
 
     if (account.accountType === 'tgdrive') {
@@ -2664,7 +2680,7 @@ async function handleDownloadRequest(req: any, res: any, isHead = false) {
         ? `"${meta.encryptedChecksum}"`
         : `"${meta._id}-${meta.size}"`;
       res.setHeader('ETag', etag);
-      if (req.headers['if-none-match'] === etag) {
+      if (req.headers['if-none-match'] === etag && !req.headers.range) {
         return res.status(304).end();
       }
 
@@ -2673,7 +2689,18 @@ async function handleDownloadRequest(req: any, res: any, isHead = false) {
       const tgSize = meta.isEncrypted ? Number(meta.encryptedSizeBytes ?? meta.size ?? 0) : Number(meta.size || 0);
       if (isHead) {
         res.setHeader('Content-Type', meta.isEncrypted ? 'application/octet-stream' : (meta.mimeType || 'application/octet-stream'));
-        if (tgSize) res.setHeader('Content-Length', tgSize);
+        const effectiveRange = shouldHonorRangeHeader(req.headers, etag) ? req.headers.range : undefined;
+        const parsedRange = parseHttpByteRange(effectiveRange, tgSize);
+        if (parsedRange.kind === 'invalid') {
+          res.setHeader('Content-Range', `bytes */${tgSize}`);
+          return res.status(416).end();
+        }
+        if (parsedRange.kind === 'range') {
+          res.setHeader('Content-Range', `bytes ${parsedRange.start}-${parsedRange.end}/${tgSize}`);
+          res.setHeader('Content-Length', String(parsedRange.length));
+          return res.status(206).end();
+        }
+        if (tgSize > 0) res.setHeader('Content-Length', String(tgSize));
         return res.status(200).end();
       }
       systemMetrics.downloadBytesTotal += tgSize;
@@ -2688,60 +2715,108 @@ async function handleDownloadRequest(req: any, res: any, isHead = false) {
       const dlUrl = item['@microsoft.graph.downloadUrl'];
       if (!dlUrl) return res.status(404).send('Download link not available');
 
+      const totalSize = Number(item.size || 0);
       const isEncrypted = meta?.isEncrypted === true;
       const downloadName = isEncrypted ? (meta.opaqueRemoteName || item.name) : item.name;
-      const odEtag = (isEncrypted && meta?.encryptedChecksum) ? `"${meta.encryptedChecksum}"` : `"${account._id}-${fileId}-${item.size || 0}"`;
+      const odEtag = (isEncrypted && meta?.encryptedChecksum) ? `"${meta.encryptedChecksum}"` : `"${account._id}-${fileId}-${totalSize}"`;
       res.setHeader('ETag', odEtag);
       res.setHeader('Content-Disposition', buildSafeContentDisposition(dispositionType, downloadName));
       res.setHeader('Content-Type', isEncrypted ? 'application/octet-stream' : (item.file?.mimeType || 'application/octet-stream'));
+
+      const effectiveRange = shouldHonorRangeHeader(req.headers, odEtag) ? req.headers.range : undefined;
+      const parsedRange = parseHttpByteRange(effectiveRange, totalSize);
+      if (parsedRange.kind === 'invalid') {
+        res.setHeader('Content-Range', `bytes */${totalSize}`);
+        return res.status(416).end();
+      }
+
       if (isHead) {
-        if (item.size) res.setHeader('Content-Length', item.size);
+        if (parsedRange.kind === 'range') {
+          res.setHeader('Content-Range', `bytes ${parsedRange.start}-${parsedRange.end}/${totalSize}`);
+          res.setHeader('Content-Length', String(parsedRange.length));
+          return res.status(206).end();
+        }
+        if (totalSize > 0) res.setHeader('Content-Length', String(totalSize));
         return res.status(200).end();
       }
-      systemMetrics.downloadBytesTotal += Number(item.size || 0);
+
+      systemMetrics.downloadBytesTotal += parsedRange.kind === 'range' ? parsedRange.length : totalSize;
       recordAuditEvent('file_downloaded', { userId: userId ? String(userId) : null, accountId, fileId, provider: 'onedrive' });
+      const upstreamHeaders: Record<string, string> = { 'Accept-Encoding': 'identity' };
+      if (parsedRange.kind === 'range') upstreamHeaders.Range = parsedRange.header;
+
       const response = await axios.get(dlUrl, {
         responseType: 'stream',
         timeout: PROVIDER_API_TIMEOUT_MS,
-        headers: req.headers.range ? { Range: req.headers.range } : undefined,
+        headers: upstreamHeaders,
+        decompress: false,
         validateStatus: (status: number) => status === 200 || status === 206 || status === 416
       });
       if (response.status === 416) {
-        if (response.headers['content-range']) res.setHeader('Content-Range', response.headers['content-range']);
+        res.setHeader('Content-Range', response.headers['content-range'] || (totalSize > 0 ? `bytes */${totalSize}` : 'bytes */*'));
         return res.status(416).end();
       }
       if (response.status === 206) res.status(206);
       for (const header of ['content-range', 'content-length', 'accept-ranges']) {
         if (response.headers[header]) res.setHeader(header, response.headers[header]);
       }
+      if (!res.getHeader('Content-Length')) {
+        if (response.status === 206 && parsedRange.kind === 'range') {
+          res.setHeader('Content-Length', String(parsedRange.length));
+        } else if (response.status === 200 && totalSize > 0) {
+          res.setHeader('Content-Length', String(totalSize));
+        }
+      }
+      if (response.status === 206 && !res.getHeader('Content-Range') && parsedRange.kind === 'range') {
+        res.setHeader('Content-Range', `bytes ${parsedRange.start}-${parsedRange.end}/${totalSize}`);
+      }
+      res.setHeader('Accept-Ranges', 'bytes');
       pipeUpstreamWithAbort(response.data, req, res);
       return;
     }
 
     const drive    = await getDriveClient(account.tokens || account.credentials);
     const file     = await drive.files.get({ fileId, fields: 'name,mimeType,size' });
+    const totalSize = Number(file.data.size || 0);
     const isEncrypted = meta?.isEncrypted === true;
     const fileName = isEncrypted ? (meta.opaqueRemoteName || file.data.name || 'file') : (file.data.name || 'file');
-    const gdEtag = (isEncrypted && meta?.encryptedChecksum) ? `"${meta.encryptedChecksum}"` : `"${account._id}-${fileId}-${file.data.size || 0}"`;
+    const gdEtag = (isEncrypted && meta?.encryptedChecksum) ? `"${meta.encryptedChecksum}"` : `"${account._id}-${fileId}-${totalSize}"`;
     res.setHeader('ETag', gdEtag);
     res.setHeader('Content-Disposition', buildSafeContentDisposition(dispositionType, fileName));
     res.setHeader('Content-Type', isEncrypted ? 'application/octet-stream' : (file.data.mimeType || 'application/octet-stream'));
+
+    const effectiveRange = shouldHonorRangeHeader(req.headers, gdEtag) ? req.headers.range : undefined;
+    const parsedRange = parseHttpByteRange(effectiveRange, totalSize);
+    if (parsedRange.kind === 'invalid') {
+      res.setHeader('Content-Range', `bytes */${totalSize}`);
+      return res.status(416).end();
+    }
+
     if (isHead) {
-      if (file.data.size) res.setHeader('Content-Length', file.data.size);
+      if (parsedRange.kind === 'range') {
+        res.setHeader('Content-Range', `bytes ${parsedRange.start}-${parsedRange.end}/${totalSize}`);
+        res.setHeader('Content-Length', String(parsedRange.length));
+        return res.status(206).end();
+      }
+      if (totalSize > 0) res.setHeader('Content-Length', String(totalSize));
       return res.status(200).end();
     }
-    systemMetrics.downloadBytesTotal += Number(file.data.size || 0);
+
+    systemMetrics.downloadBytesTotal += parsedRange.kind === 'range' ? parsedRange.length : totalSize;
     recordAuditEvent('file_downloaded', { userId: userId ? String(userId) : null, accountId, fileId, provider: 'google' });
+    const gdHeaders: Record<string, string> = { 'Accept-Encoding': 'identity' };
+    if (parsedRange.kind === 'range') gdHeaders.Range = parsedRange.header;
+
     const response = await drive.files.get(
       { fileId, alt: 'media' },
       {
         responseType: 'stream',
-        headers: req.headers.range ? { Range: req.headers.range } : undefined,
+        headers: gdHeaders,
         validateStatus: (status: number) => status === 200 || status === 206 || status === 416
       } as any
     );
     if (response.status === 416) {
-      const contentRange = response.headers?.['content-range'] || (file.data.size ? `bytes */${file.data.size}` : undefined);
+      const contentRange = response.headers?.['content-range'] || (totalSize > 0 ? `bytes */${totalSize}` : undefined);
       if (contentRange) res.setHeader('Content-Range', contentRange);
       return res.status(416).end();
     }
@@ -2750,6 +2825,17 @@ async function handleDownloadRequest(req: any, res: any, isHead = false) {
       const value = response.headers?.[header];
       if (value) res.setHeader(header, value);
     }
+    if (!res.getHeader('Content-Length')) {
+      if (response.status === 206 && parsedRange.kind === 'range') {
+        res.setHeader('Content-Length', String(parsedRange.length));
+      } else if (response.status === 200 && totalSize > 0) {
+        res.setHeader('Content-Length', String(totalSize));
+      }
+    }
+    if (response.status === 206 && !res.getHeader('Content-Range') && parsedRange.kind === 'range') {
+      res.setHeader('Content-Range', `bytes ${parsedRange.start}-${parsedRange.end}/${totalSize}`);
+    }
+    res.setHeader('Accept-Ranges', 'bytes');
     pipeUpstreamWithAbort(response.data, req, res);
   } catch (err: any) {
     downloadSlot.release();
@@ -2814,9 +2900,12 @@ app.delete('/api/download-tickets/:ticket', requireAuth, async (req: any, res: a
   res.json({ success: true, revokedTicket: ticket });
 });
 
-app.get('/api/download/ticket/:ticket', async (req: any, res: any) => {
+async function handleTicketDownload(req: any, res: any, isHead = false) {
   const database = db || await connectToMongo();
   const ticket = String(req.params.ticket || '').trim();
+  if (!/^dlt_[A-Za-z0-9_-]{8,128}$/.test(ticket)) {
+    return apiError(res, 404, STANDARD_ERROR_CODES.NOT_FOUND, 'Download ticket is invalid or revoked', req.requestId);
+  }
   const doc = await database.collection('download_tickets').findOne({ ticket });
   if (!doc || doc.revoked) {
     return apiError(res, 404, STANDARD_ERROR_CODES.NOT_FOUND, 'Download ticket is invalid or revoked', req.requestId);
@@ -2827,18 +2916,24 @@ app.get('/api/download/ticket/:ticket', async (req: any, res: any) => {
   if (doc.singleUse && Number(doc.usedCount || 0) >= 1) {
     return apiError(res, 410, STANDARD_ERROR_CODES.CONFLICT, 'One-time download ticket has already been used', req.requestId);
   }
-  await database.collection('download_tickets').updateOne(
-    { _id: doc._id },
-    { $inc: { usedCount: 1 }, $set: { lastUsedAt: new Date() } }
-  );
+  // Do not burn download tickets on HEAD metadata probes from browsers / download managers
+  if (!isHead) {
+    await database.collection('download_tickets').updateOne(
+      { _id: doc._id },
+      { $inc: { usedCount: 1 }, $set: { lastUsedAt: new Date() } }
+    );
+  }
   req.db = database;
   req.params.accountId = String(doc.accountId);
   req.params.fileId = String(doc.fileId);
   req.userId = doc.userId;
   req.mediaSigned = true;
   req.isSignedMedia = true;
-  return handleDownloadRequest(req, res, false);
-});
+  return handleDownloadRequest(req, res, isHead);
+}
+
+app.head('/api/download/ticket/:ticket', (req: any, res: any) => handleTicketDownload(req, res, true));
+app.get('/api/download/ticket/:ticket', (req: any, res: any) => handleTicketDownload(req, res, false));
 
 app.head('/api/download/:accountId/:fileId', requireAuthOrSignedMedia, (req: any, res: any) => handleDownloadRequest(req, res, true));
 app.get('/api/download/:accountId/:fileId', requireAuthOrSignedMedia, (req: any, res: any) => handleDownloadRequest(req, res, false));
@@ -3280,8 +3375,8 @@ async function validatePublicShareState(
   return { ok: true, share, tgMeta, account };
 }
 
-// ─── Public download (no auth, 7-point validation) ────────────────────────────
-app.get('/api/public/download/:shareId', async (req: any, res: any) => {
+// ─── Public download (no auth, 7-point validation, HEAD + byte-range resume) ──
+async function handlePublicDownloadRequest(req: any, res: any, isHead = false) {
   const { shareId } = req.params;
   const database    = db || await connectToMongo();
 
@@ -3301,18 +3396,41 @@ app.get('/api/public/download/:shareId', async (req: any, res: any) => {
 
     const { share, tgMeta, account } = check;
     res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.setHeader('Cache-Control', 'private, no-cache, no-transform');
+
+    const shouldCountDownload = (parsedRange: ReturnType<typeof parseHttpByteRange>) =>
+      !isHead && (parsedRange.kind === 'none' || (parsedRange.kind === 'range' && parsedRange.start === 0));
 
     // Check TG Drive files first
     if (tgMeta) {
       if (tgMeta.isEncrypted === true) {
         return apiError(res, 409, 'ENCRYPTED_SHARE_UNSUPPORTED', 'Encrypted file sharing is not supported', req.requestId);
       }
-      if (share) {
+      const tgSize = Number(tgMeta.size || 0);
+      const etag = `"${tgMeta._id}-${tgSize}"`;
+      res.setHeader('ETag', etag);
+      res.setHeader('Content-Disposition', buildSafeContentDisposition('attachment', tgMeta.name));
+      res.setHeader('Content-Type', tgMeta.mimeType || 'application/octet-stream');
+      const effectiveRange = shouldHonorRangeHeader(req.headers, etag) ? req.headers.range : undefined;
+      const parsedRange = parseHttpByteRange(effectiveRange, tgSize);
+      if (parsedRange.kind === 'invalid') {
+        res.setHeader('Content-Range', `bytes */${tgSize}`);
+        return res.status(416).end();
+      }
+      if (isHead) {
+        if (parsedRange.kind === 'range') {
+          res.setHeader('Content-Range', `bytes ${parsedRange.start}-${parsedRange.end}/${tgSize}`);
+          res.setHeader('Content-Length', String(parsedRange.length));
+          return res.status(206).end();
+        }
+        if (tgSize > 0) res.setHeader('Content-Length', String(tgSize));
+        return res.status(200).end();
+      }
+      if (share && shouldCountDownload(parsedRange)) {
         await database.collection('shares').updateOne({ _id: share._id }, { $inc: { downloadCount: 1 }, $set: { lastAccessedAt: new Date() } });
       }
       recordAuditEvent('public_share_downloaded', { shareId, accountId: String(account._id), fileId: String(tgMeta._id), ip: getClientIp(req) });
-      res.setHeader('Content-Disposition', buildSafeContentDisposition('attachment', tgMeta.name));
-      res.setHeader('Content-Type', tgMeta.mimeType || 'application/octet-stream');
       await tgStreamFile(tgMeta.messageId, account.channelId, req, res, tgMeta);
       return;
     }
@@ -3331,10 +3449,30 @@ app.get('/api/public/download/:shareId', async (req: any, res: any) => {
       if (!ObjectId.isValid(String(share.fileId))) return res.status(404).send('File not found');
       const tgDoc = await database.collection('tg_files').findOne({ _id: new ObjectId(String(share.fileId)), accountId: account._id });
       if (!tgDoc || tgDoc.trashed === true) return res.status(404).send('Shared file no longer exists');
-      await database.collection('shares').updateOne({ _id: share._id }, { $inc: { downloadCount: 1 }, $set: { lastAccessedAt: new Date() } });
-      recordAuditEvent('public_share_downloaded', { shareId, accountId: String(account._id), fileId: String(tgDoc._id), ip: getClientIp(req) });
+      const tgSize = Number(tgDoc.size || 0);
+      const etag = `"${tgDoc._id}-${tgSize}"`;
+      res.setHeader('ETag', etag);
       res.setHeader('Content-Disposition', buildSafeContentDisposition('attachment', tgDoc.name));
       res.setHeader('Content-Type', tgDoc.mimeType || 'application/octet-stream');
+      const effectiveRange = shouldHonorRangeHeader(req.headers, etag) ? req.headers.range : undefined;
+      const parsedRange = parseHttpByteRange(effectiveRange, tgSize);
+      if (parsedRange.kind === 'invalid') {
+        res.setHeader('Content-Range', `bytes */${tgSize}`);
+        return res.status(416).end();
+      }
+      if (isHead) {
+        if (parsedRange.kind === 'range') {
+          res.setHeader('Content-Range', `bytes ${parsedRange.start}-${parsedRange.end}/${tgSize}`);
+          res.setHeader('Content-Length', String(parsedRange.length));
+          return res.status(206).end();
+        }
+        if (tgSize > 0) res.setHeader('Content-Length', String(tgSize));
+        return res.status(200).end();
+      }
+      if (shouldCountDownload(parsedRange)) {
+        await database.collection('shares').updateOne({ _id: share._id }, { $inc: { downloadCount: 1 }, $set: { lastAccessedAt: new Date() } });
+      }
+      recordAuditEvent('public_share_downloaded', { shareId, accountId: String(account._id), fileId: String(tgDoc._id), ip: getClientIp(req) });
       await tgStreamFile(tgDoc.messageId, account.channelId, req, res, tgDoc);
       return;
     }
@@ -3345,33 +3483,116 @@ app.get('/api/public/download/:shareId', async (req: any, res: any) => {
       if (!item || item.deleted) return res.status(404).send('Shared file has been deleted');
       const dlUrl = item['@microsoft.graph.downloadUrl'];
       if (!dlUrl) return res.status(404).send('Download link not available');
-      await database.collection('shares').updateOne({ _id: share._id }, { $inc: { downloadCount: 1 }, $set: { lastAccessedAt: new Date() } });
-      recordAuditEvent('public_share_downloaded', { shareId, accountId: String(account._id), fileId: String(share.fileId), ip: getClientIp(req) });
+      const totalSize = Number(item.size || 0);
+      const etag = `"${account._id}-${share.fileId}-${totalSize}"`;
+      res.setHeader('ETag', etag);
       res.setHeader('Content-Disposition', buildSafeContentDisposition('attachment', item.name));
       res.setHeader('Content-Type', item.file?.mimeType || 'application/octet-stream');
-      const r = await axios.get(dlUrl, { responseType: 'stream', headers: req.headers.range ? { Range: req.headers.range } : undefined, validateStatus: (status: number) => status === 200 || status === 206 });
+      const effectiveRange = shouldHonorRangeHeader(req.headers, etag) ? req.headers.range : undefined;
+      const parsedRange = parseHttpByteRange(effectiveRange, totalSize);
+      if (parsedRange.kind === 'invalid') {
+        res.setHeader('Content-Range', `bytes */${totalSize}`);
+        return res.status(416).end();
+      }
+      if (isHead) {
+        if (parsedRange.kind === 'range') {
+          res.setHeader('Content-Range', `bytes ${parsedRange.start}-${parsedRange.end}/${totalSize}`);
+          res.setHeader('Content-Length', String(parsedRange.length));
+          return res.status(206).end();
+        }
+        if (totalSize > 0) res.setHeader('Content-Length', String(totalSize));
+        return res.status(200).end();
+      }
+      if (shouldCountDownload(parsedRange)) {
+        await database.collection('shares').updateOne({ _id: share._id }, { $inc: { downloadCount: 1 }, $set: { lastAccessedAt: new Date() } });
+      }
+      recordAuditEvent('public_share_downloaded', { shareId, accountId: String(account._id), fileId: String(share.fileId), ip: getClientIp(req) });
+      const upstreamHeaders: Record<string, string> = { 'Accept-Encoding': 'identity' };
+      if (parsedRange.kind === 'range') upstreamHeaders.Range = parsedRange.header;
+      const r = await axios.get(dlUrl, {
+        responseType: 'stream',
+        headers: upstreamHeaders,
+        decompress: false,
+        validateStatus: (status: number) => status === 200 || status === 206 || status === 416
+      });
+      if (r.status === 416) {
+        res.setHeader('Content-Range', r.headers['content-range'] || (totalSize > 0 ? `bytes */${totalSize}` : 'bytes */*'));
+        return res.status(416).end();
+      }
       if (r.status === 206) res.status(206);
       for (const header of ['content-range', 'content-length', 'accept-ranges']) if (r.headers[header]) res.setHeader(header, r.headers[header]);
+      if (!res.getHeader('Content-Length')) {
+        if (r.status === 206 && parsedRange.kind === 'range') res.setHeader('Content-Length', String(parsedRange.length));
+        else if (r.status === 200 && totalSize > 0) res.setHeader('Content-Length', String(totalSize));
+      }
+      if (r.status === 206 && !res.getHeader('Content-Range') && parsedRange.kind === 'range') {
+        res.setHeader('Content-Range', `bytes ${parsedRange.start}-${parsedRange.end}/${totalSize}`);
+      }
+      res.setHeader('Accept-Ranges', 'bytes');
       pipeUpstreamWithAbort(r.data, req, res);
       return;
     }
 
     const drive    = await getDriveClient(account.tokens || account.credentials);
-    const file     = await drive.files.get({ fileId: share.fileId, fields: 'name,mimeType,trashed' });
+    const file     = await drive.files.get({ fileId: share.fileId, fields: 'name,mimeType,size,trashed' });
     if (!file?.data || file.data.trashed === true) return res.status(404).send('Shared file has been trashed or deleted');
-    await database.collection('shares').updateOne({ _id: share._id }, { $inc: { downloadCount: 1 }, $set: { lastAccessedAt: new Date() } });
-    recordAuditEvent('public_share_downloaded', { shareId, accountId: String(account._id), fileId: String(share.fileId), ip: getClientIp(req) });
+    const totalSize = Number(file.data.size || 0);
+    const etag = `"${account._id}-${share.fileId}-${totalSize}"`;
     const fileName = file.data.name || 'file';
+    res.setHeader('ETag', etag);
     res.setHeader('Content-Disposition', buildSafeContentDisposition('attachment', fileName));
     res.setHeader('Content-Type', file.data.mimeType || 'application/octet-stream');
-    const response = await drive.files.get({ fileId: share.fileId, alt: 'media' }, { responseType: 'stream', headers: req.headers.range ? { Range: req.headers.range } : undefined });
+    const effectiveRange = shouldHonorRangeHeader(req.headers, etag) ? req.headers.range : undefined;
+    const parsedRange = parseHttpByteRange(effectiveRange, totalSize);
+    if (parsedRange.kind === 'invalid') {
+      res.setHeader('Content-Range', `bytes */${totalSize}`);
+      return res.status(416).end();
+    }
+    if (isHead) {
+      if (parsedRange.kind === 'range') {
+        res.setHeader('Content-Range', `bytes ${parsedRange.start}-${parsedRange.end}/${totalSize}`);
+        res.setHeader('Content-Length', String(parsedRange.length));
+        return res.status(206).end();
+      }
+      if (totalSize > 0) res.setHeader('Content-Length', String(totalSize));
+      return res.status(200).end();
+    }
+    if (shouldCountDownload(parsedRange)) {
+      await database.collection('shares').updateOne({ _id: share._id }, { $inc: { downloadCount: 1 }, $set: { lastAccessedAt: new Date() } });
+    }
+    recordAuditEvent('public_share_downloaded', { shareId, accountId: String(account._id), fileId: String(share.fileId), ip: getClientIp(req) });
+    const gdHeaders: Record<string, string> = { 'Accept-Encoding': 'identity' };
+    if (parsedRange.kind === 'range') gdHeaders.Range = parsedRange.header;
+    const response = await drive.files.get(
+      { fileId: share.fileId, alt: 'media' },
+      {
+        responseType: 'stream',
+        headers: gdHeaders,
+        validateStatus: (status: number) => status === 200 || status === 206 || status === 416
+      } as any
+    );
+    if (response.status === 416) {
+      res.setHeader('Content-Range', response.headers?.['content-range'] || (totalSize > 0 ? `bytes */${totalSize}` : 'bytes */*'));
+      return res.status(416).end();
+    }
     if (response.status === 206) res.status(206);
     for (const header of ['content-range', 'content-length', 'accept-ranges']) { const value = response.headers?.[header]; if (value) res.setHeader(header, value); }
+    if (!res.getHeader('Content-Length')) {
+      if (response.status === 206 && parsedRange.kind === 'range') res.setHeader('Content-Length', String(parsedRange.length));
+      else if (response.status === 200 && totalSize > 0) res.setHeader('Content-Length', String(totalSize));
+    }
+    if (response.status === 206 && !res.getHeader('Content-Range') && parsedRange.kind === 'range') {
+      res.setHeader('Content-Range', `bytes ${parsedRange.start}-${parsedRange.end}/${totalSize}`);
+    }
+    res.setHeader('Accept-Ranges', 'bytes');
     pipeUpstreamWithAbort(response.data, req, res);
   } catch {
     if (!res.headersSent) res.status(500).send('Download failed');
   }
-});
+}
+
+app.head('/api/public/download/:shareId', (req: any, res: any) => handlePublicDownloadRequest(req, res, true));
+app.get('/api/public/download/:shareId', (req: any, res: any) => handlePublicDownloadRequest(req, res, false));
 
 // ─── Public share page (7-point validation) ───────────────────────────────────
 app.get('/s/:shareId', async (req: any, res: any) => {

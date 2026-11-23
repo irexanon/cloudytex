@@ -13,6 +13,8 @@ import { Api } from 'telegram/tl/index.js';
 import {
   parseGoogleRangeOffset,
   parseOneDriveNextOffset,
+  parseHttpByteRange,
+  shouldHonorRangeHeader,
   withSessionLock,
   validateOpaqueFilename,
   escapeDriveQueryValue,
@@ -489,22 +491,34 @@ async function tgStreamFile(messageId: number, channelId: string, req: any, res:
     const isEncrypted = meta?.isEncrypted === true;
     let totalSize: number = isEncrypted ? Number(meta?.encryptedSizeBytes ?? meta?.size ?? 0) : Number(meta?.size || 0);
     if (!totalSize && media?.document?.size) totalSize = Number(media.document.size);
+    if (!totalSize && Array.isArray(media?.photo?.sizes)) {
+      const largestPhoto = media.photo.sizes
+        .map((s: any) => Number(s?.size || (Array.isArray(s?.sizes) ? s.sizes[s.sizes.length - 1] : 0) || 0))
+        .reduce((max: number, val: number) => (val > max ? val : max), 0);
+      if (largestPhoto > 0) totalSize = largestPhoto;
+    }
     const contentType = isEncrypted ? 'application/octet-stream' : (meta?.mimeType || 'application/octet-stream');
 
-    const rangeHeader = req.headers['range'];
-    if (rangeHeader && totalSize) {
-      const [startStr, endStr] = rangeHeader.replace(/bytes=/, '').split('-');
-      const start = parseInt(startStr, 10);
-      const end   = endStr ? Math.min(parseInt(endStr, 10), totalSize - 1) : totalSize - 1;
-      if (isNaN(start) || isNaN(end) || start < 0 || start > end || start >= totalSize) {
-        res.status(416).setHeader('Content-Range', `bytes */${totalSize}`).end();
-        return;
-      }
-      const chunkSize = end - start + 1;
+    const currentEtag = String(res.getHeader('ETag') || '');
+    const effectiveRange = shouldHonorRangeHeader(req.headers, currentEtag) ? req.headers['range'] : undefined;
+    const parsedRange = parseHttpByteRange(effectiveRange, totalSize);
+
+    if (parsedRange.kind === 'invalid') {
+      res.status(416)
+        .setHeader('Accept-Ranges', 'bytes')
+        .setHeader('Content-Range', `bytes */${totalSize}`)
+        .end();
+      return;
+    }
+
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    if (parsedRange.kind === 'range') {
+      const { start, end, length: chunkSize } = parsedRange;
       res.status(206);
       res.setHeader('Content-Range', `bytes ${start}-${end}/${totalSize}`);
-      res.setHeader('Accept-Ranges', 'bytes');
-      res.setHeader('Content-Length', chunkSize);
+      res.setHeader('Content-Length', String(chunkSize));
       res.setHeader('Content-Type', contentType);
       const stepSize = 512 * 1024;
       let skipBytes = start % stepSize;
@@ -536,8 +550,7 @@ async function tgStreamFile(messageId: number, channelId: string, req: any, res:
       if (!clientAborted && !res.writableEnded) res.end();
     } else {
       res.setHeader('Content-Type', contentType);
-      res.setHeader('Accept-Ranges', 'bytes');
-      if (totalSize) res.setHeader('Content-Length', totalSize);
+      if (totalSize > 0) res.setHeader('Content-Length', String(totalSize));
       for await (const chunk of telegram.iterDownload({ file: media, requestSize: 512 * 1024 })) {
         resetIdle();
         if (clientAborted || res.destroyed) break;

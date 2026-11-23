@@ -19,6 +19,37 @@ function formatBytes(bytes: number | null | undefined): string {
   return `${(n / 1024 ** i).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
+function formatJobTypeLabel(rawType: string | undefined): string {
+  switch (rawType) {
+    case 'cross_account_move':
+    case 'cross_drive_move':
+      return 'Cross-drive move';
+    case 'cross_account_copy':
+    case 'cross_drive_copy':
+      return 'Cross-drive copy';
+    case 'batch_backup':
+      return 'Batch backup';
+    case 'backup_restore':
+      return 'Backup restore';
+    default:
+      return String(rawType || 'File transfer')
+        .replace(/_/g, ' ')
+        .replace(/^\w/, (c) => c.toUpperCase());
+  }
+}
+
+function formatStatusLabel(status: string | undefined, stage?: string): string {
+  if (status === 'completed') return 'Completed';
+  if (status === 'completed_with_errors') return 'Completed with warnings';
+  if (status === 'failed') return 'Failed';
+  if (status === 'cancelled') return 'Cancelled';
+  if (status === 'queued') return 'Queued';
+  if (stage && stage !== 'running') {
+    return stage.replace(/_/g, ' ').replace(/^\w/, (c) => c.toUpperCase());
+  }
+  return 'In progress';
+}
+
 export default function JobsDrawer({
   isOpen,
   onClose,
@@ -126,80 +157,135 @@ export default function JobsDrawer({
     }
   };
 
+  const activeCount = Number(health?.totals?.running || 0);
+  const queuedCount = Number(health?.totals?.queued || 0);
+
   const jobsListContent = (
     <>
-      {health && (
-        <div className="px-5 py-3.5 rounded-[20px] bg-[var(--sf)] border border-[var(--bd)] flex flex-wrap items-center justify-between gap-3 text-xs font-bold text-[var(--sub)] tabular-nums">
-          <span>Workers: {health.activeWorkers}/{health.maxConcurrentWorkers}</span>
-          <span>Queued: {health.totals?.queued || 0}</span>
-          <span>Running: {health.totals?.running || 0}</span>
-        </div>
-      )}
-
       {jobs.length === 0 ? (
-        <div className="py-20 text-center space-y-3 bg-[var(--sf)] border border-[var(--bd)] rounded-[24px]">
-          <div className="w-14 h-14 mx-auto rounded-2xl bg-[var(--pi)] text-[var(--pit)] flex items-center justify-center">
-            <ArrowLeftRight size={24} />
+        <div className="py-20 px-6 text-center space-y-3 bg-[var(--sf)] border border-[var(--bd)] rounded-[24px]">
+          <div className="w-12 h-12 mx-auto rounded-2xl bg-[var(--pi)] text-[var(--pit)] flex items-center justify-center">
+            <ArrowLeftRight size={22} />
           </div>
-          <p className="text-base font-bold text-[var(--tx)]">No transfers yet</p>
-          <p className="text-xs text-[var(--sub)] max-w-sm mx-auto">
+          <p className="text-base font-semibold text-[var(--tx)]">No transfers yet</p>
+          <p className="text-sm text-[var(--sub)] max-w-sm mx-auto">
             Cross-drive moves, copies, and batch backups appear here with live progress.
           </p>
         </div>
       ) : (
-        <div className="space-y-3">
-          {jobs.map((job) => {
-            const pct = Number(job.progressPct ?? job.progress ?? 0);
+        <div className="bg-[var(--sf)] border border-[var(--bd)] rounded-[22px] divide-y divide-[var(--bd)]/75 overflow-hidden">
+          {jobs.map((job, idx) => {
+            const pct = Math.min(100, Math.max(0, Number(job.progressPct ?? job.progress ?? 0)));
             const isRunning = job.status === 'running' || job.status === 'queued';
             const isCompleted = job.status === 'completed' || job.status === 'completed_with_errors';
             const isFailed = job.status === 'failed' || job.status === 'cancelled';
 
+            const clipId = `job-wave-${String(job.id || job.jobId || idx).replace(/[^a-zA-Z0-9_-]/g, '')}`;
+            const waveWidth = 260;
+            const activeEnd = pct <= 0 ? 0 : Math.min(waveWidth - 2, Math.max(8, (pct / 100) * (waveWidth - 4) + 2));
+            const trackStart = pct <= 0 ? 2 : Math.min(waveWidth - 4, activeEnd + 6);
+            const strokeColor = isFailed ? '#F43F5E' : isCompleted ? '#10B981' : '#2563EB';
+            const primaryName = job.fileName || job.payload?.fileName || formatJobTypeLabel(job.type);
+            const showTypeSubtitle = Boolean(job.fileName || job.payload?.fileName);
+
             return (
-              <div
-                key={job.id || job.jobId}
-                className="p-4 sm:p-5 rounded-[24px] border border-[var(--bd)] bg-[var(--sf)] space-y-3"
-              >
+              <div key={job.id || job.jobId || idx} className="p-4 sm:px-5 sm:py-4 space-y-3">
                 <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2 text-xs font-black text-[var(--tx)] uppercase tracking-wide">
-                      {isCompleted && <CheckCircle2 size={15} className="text-emerald-500 shrink-0" />}
-                      {isFailed && <XCircle size={15} className="text-red-500 shrink-0" />}
-                      {isRunning && <RefreshCw size={15} className="text-blue-500 animate-spin shrink-0" />}
-                      <span className="truncate">{String(job.type || 'transfer').replace(/_/g, ' ')}</span>
+                  <div className="flex items-start gap-3 min-w-0">
+                    <span
+                      className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 mt-0.5 ${
+                        isCompleted
+                          ? 'bg-emerald-500/12 text-emerald-600 dark:text-emerald-400'
+                          : isFailed
+                          ? 'bg-rose-500/12 text-rose-600 dark:text-rose-400'
+                          : 'bg-[var(--pi)] text-[var(--pit)]'
+                      }`}
+                    >
+                      {isCompleted ? (
+                        <CheckCircle2 size={17} />
+                      ) : isFailed ? (
+                        <XCircle size={17} />
+                      ) : (
+                        <RefreshCw size={16} className="animate-spin" />
+                      )}
+                    </span>
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold text-[var(--tx)] truncate">{primaryName}</p>
+                      <p className="text-xs text-[var(--sub)] mt-0.5 tabular-nums flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
+                        {showTypeSubtitle && (
+                          <>
+                            <span>{formatJobTypeLabel(job.type)}</span>
+                            <span aria-hidden="true">·</span>
+                          </>
+                        )}
+                        <span>{formatStatusLabel(job.status, job.stage)}</span>
+                        {job.totalBytes > 0 && (
+                          <>
+                            <span aria-hidden="true">·</span>
+                            <span>
+                              {formatBytes(job.bytesProcessed)} / {formatBytes(job.totalBytes)}
+                            </span>
+                          </>
+                        )}
+                        {job.retryCount > 0 && (
+                          <>
+                            <span aria-hidden="true">·</span>
+                            <span>Attempt {job.retryCount + 1}</span>
+                          </>
+                        )}
+                      </p>
                     </div>
-                    <p className="text-xs text-[var(--sub)] mt-1 tabular-nums">
-                      {job.status} · {job.stage || 'queued'}
-                      {job.totalBytes > 0 ? ` · ${formatBytes(job.bytesProcessed)} / ${formatBytes(job.totalBytes)}` : ''}
-                      {job.retryCount > 0 ? ` · Retry #${job.retryCount}` : ''}
-                    </p>
                   </div>
-                  <span className="text-xs font-black text-blue-600 dark:text-blue-400 shrink-0 tabular-nums">{pct}%</span>
+                  <span className="text-xs font-mono font-semibold text-[var(--tx)] shrink-0 tabular-nums pt-0.5">
+                    {pct}%
+                  </span>
                 </div>
 
-                <div className="h-2 bg-[var(--tr)] rounded-full overflow-hidden">
-                  <div
-                    className={`h-full transition-all duration-300 ${
-                      isFailed ? 'bg-red-500' : isCompleted ? 'bg-emerald-500' : 'bg-blue-600'
-                    }`}
-                    style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}
-                  />
-                </div>
+                {/* M3 Expressive Wavy Progress Line */}
+                <svg viewBox="0 0 260 10" className="w-full h-[9px] block overflow-visible" aria-hidden="true">
+                  <defs>
+                    <clipPath id={clipId}>
+                      <rect x="0" y="0" width={activeEnd} height="10" />
+                    </clipPath>
+                  </defs>
+                  {trackStart < 256 && (
+                    <line
+                      x1={trackStart}
+                      y1="5"
+                      x2="256"
+                      y2="5"
+                      stroke="var(--tr)"
+                      strokeWidth="2.8"
+                      strokeLinecap="round"
+                    />
+                  )}
+                  {pct > 0 && (
+                    <path
+                      d="M2 5 Q5 1.8 8 5 T14 5 T20 5 T26 5 T32 5 T38 5 T44 5 T50 5 T56 5 T62 5 T68 5 T74 5 T80 5 T86 5 T92 5 T98 5 T104 5 T110 5 T116 5 T122 5 T128 5 T134 5 T140 5 T146 5 T152 5 T158 5 T164 5 T170 5 T176 5 T182 5 T188 5 T194 5 T200 5 T206 5 T212 5 T218 5 T224 5 T230 5 T236 5 T242 5 T248 5 T254 5"
+                      fill="none"
+                      stroke={strokeColor}
+                      strokeWidth="2.8"
+                      strokeLinecap="round"
+                      clipPath={`url(#${clipId})`}
+                    />
+                  )}
+                </svg>
 
                 {job.error && (
-                  <p className="text-xs text-red-500 font-medium break-words">{job.error}</p>
+                  <p className="text-xs text-rose-600 dark:text-rose-400 font-medium break-words">{job.error}</p>
                 )}
 
-                <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
-                  <span className="text-[11px] text-[var(--sub)]">
+                <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">
+                  <span className="text-xs text-[var(--sub)] tabular-nums">
                     {job.createdAt ? new Date(job.createdAt).toLocaleString() : ''}
-                    {job.sourceDeleteApproved ? ' · Verified Move' : ''}
+                    {job.sourceDeleteApproved ? ' · Verified move' : ''}
                   </span>
                   <div className="flex items-center gap-2">
                     {isRunning && (
                       <button
                         type="button"
                         onClick={() => handleCancelJob(job.id)}
-                        className="px-3.5 py-1.5 rounded-xl bg-red-500/10 text-red-500 text-xs font-bold hover:bg-red-500/20 transition-colors"
+                        className="h-8 px-3 rounded-xl bg-rose-500/10 text-rose-600 dark:text-rose-400 text-xs font-semibold hover:bg-rose-500/20 transition-colors"
                       >
                         Cancel
                       </button>
@@ -208,7 +294,7 @@ export default function JobsDrawer({
                       <button
                         type="button"
                         onClick={() => handleRetryJob(job.id)}
-                        className="px-3.5 py-1.5 rounded-xl bg-[var(--pi)] text-[var(--pit)] text-xs font-bold flex items-center gap-1.5 hover:opacity-90 transition-opacity"
+                        className="h-8 px-3 rounded-xl bg-[var(--pi)] text-[var(--pit)] text-xs font-semibold flex items-center gap-1.5 hover:opacity-90 transition-opacity"
                       >
                         <RotateCcw size={12} /> Retry
                       </button>
@@ -219,17 +305,17 @@ export default function JobsDrawer({
                           type="button"
                           disabled={verifyingId === job.id}
                           onClick={() => handleVerifyBackup(job.id)}
-                          className="px-3.5 py-1.5 rounded-xl bg-emerald-500/15 text-emerald-500 text-xs font-bold flex items-center gap-1.5 hover:bg-emerald-500/25 disabled:opacity-50 transition-colors"
+                          className="h-8 px-3 rounded-xl bg-emerald-500/12 text-emerald-600 dark:text-emerald-400 text-xs font-semibold flex items-center gap-1.5 hover:bg-emerald-500/20 disabled:opacity-50 transition-colors"
                         >
-                          <ShieldCheck size={12} /> {verifyingId === job.id ? 'Verifying...' : 'Verify'}
+                          <ShieldCheck size={13} /> {verifyingId === job.id ? 'Verifying...' : 'Verify'}
                         </button>
                         <button
                           type="button"
                           disabled={restoringId === job.id}
                           onClick={() => handleRestoreBackup(job.id)}
-                          className="px-3.5 py-1.5 rounded-xl bg-indigo-500/15 text-indigo-400 text-xs font-bold flex items-center gap-1.5 hover:bg-indigo-500/25 disabled:opacity-50 transition-colors"
+                          className="h-8 px-3 rounded-xl bg-[var(--pi)] text-[var(--pit)] text-xs font-semibold flex items-center gap-1.5 hover:opacity-90 disabled:opacity-50 transition-colors"
                         >
-                          <ArchiveRestore size={12} /> {restoringId === job.id ? 'Restoring...' : 'Restore'}
+                          <ArchiveRestore size={13} /> {restoringId === job.id ? 'Restoring...' : 'Restore'}
                         </button>
                       </>
                     )}
@@ -246,39 +332,38 @@ export default function JobsDrawer({
   if (variant === 'page') {
     if (!isOpen) return null;
     return (
-      <div className="max-w-5xl mx-auto space-y-6">
+      <div className="max-w-4xl mx-auto space-y-5 pt-2">
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-3">
             <button
               type="button"
               onClick={onClose}
-              className="w-10 h-10 rounded-[20px] bg-[var(--sf)] border border-[var(--bd)] text-[var(--sub)] hover:text-[var(--tx)] flex items-center justify-center transition-colors shrink-0"
-              title="Back to Drive"
-              aria-label="Back to Drive"
+              className="w-9 h-9 rounded-full bg-[var(--sf)] border border-[var(--bd)] text-[var(--sub)] hover:text-[var(--tx)] flex items-center justify-center transition-colors shrink-0"
+              title="Back to Files"
+              aria-label="Back to Files"
             >
-              <ArrowLeft size={18} />
+              <ArrowLeft size={17} />
             </button>
-            <div className="w-11 h-11 rounded-2xl bg-[var(--pi)] text-[var(--pit)] flex items-center justify-center shrink-0">
-              <ArrowLeftRight size={20} />
-            </div>
             <div>
-              <h1 className="text-xl sm:text-2xl font-black text-[var(--tx)] tracking-tight">Transfers</h1>
-              <p className="text-xs sm:text-sm text-[var(--sub)] font-medium">
-                Active transfers, batch backups &amp; recovery queue
+              <h1 className="text-xl font-bold text-[var(--tx)] tracking-tight">Transfers</h1>
+              <p className="text-xs text-[var(--sub)] mt-0.5 tabular-nums">
+                {activeCount > 0 || queuedCount > 0
+                  ? `${activeCount} active · ${queuedCount} queued`
+                  : 'Cross-drive moves, copies, and batch backups'}
               </p>
             </div>
           </div>
           <button
             type="button"
             onClick={loadJobs}
-            className="h-10 px-4 rounded-[20px] bg-[var(--sf)] border border-[var(--bd)] text-xs font-bold text-[var(--tx)] hover:border-[var(--sub)]/40 flex items-center gap-2 transition-colors"
+            className="h-9 px-3.5 rounded-full bg-[var(--sf)] border border-[var(--bd)] text-xs font-semibold text-[var(--tx)] hover:bg-[var(--hover)] flex items-center gap-2 transition-colors"
           >
-            <RefreshCw size={15} className={loading ? 'animate-spin' : ''} />
+            <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
             <span>Refresh</span>
           </button>
         </div>
 
-        <div className="space-y-4">{jobsListContent}</div>
+        <div>{jobsListContent}</div>
       </div>
     );
   }
@@ -299,39 +384,38 @@ export default function JobsDrawer({
             animate={{ x: 0 }}
             exit={{ x: '100%' }}
             transition={{ type: 'spring', damping: 30, stiffness: 360 }}
-            className="relative z-10 w-full max-w-lg bg-white dark:bg-[#0D1424] border-l border-slate-200 dark:border-[#1B253B] shadow-2xl flex flex-col h-full"
+            className="relative z-10 w-full max-w-lg bg-[var(--sf)] border-l border-[var(--bd)] shadow-2xl flex flex-col h-full text-[var(--tx)]"
           >
-            <div className="px-6 py-5 border-b border-slate-100 dark:border-[#182238] flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-xl bg-blue-50 dark:bg-[#162344] text-blue-600 dark:text-blue-400 flex items-center justify-center">
-                  <ArrowLeftRight size={20} />
-                </div>
-                <div>
-                  <h2 className="text-lg font-black text-slate-900 dark:text-white tracking-tight">Transfers</h2>
-                  <p className="text-[11px] text-slate-500 font-medium">Active transfers, batch backups &amp; recovery queue</p>
-                </div>
+            <div className="px-6 py-4 border-b border-[var(--bd)] flex items-center justify-between">
+              <div>
+                <h2 className="text-base font-bold text-[var(--tx)] tracking-tight">Transfers</h2>
+                <p className="text-xs text-[var(--sub)] mt-0.5 tabular-nums">
+                  {activeCount > 0 || queuedCount > 0
+                    ? `${activeCount} active · ${queuedCount} queued`
+                    : 'Cross-drive moves, copies, and batch backups'}
+                </p>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1.5">
                 <button
                   type="button"
                   onClick={loadJobs}
-                  className="p-2 rounded-xl hover:bg-slate-100 dark:hover:bg-[#172136] text-slate-500"
+                  className="w-8 h-8 rounded-full hover:bg-[var(--hover)] text-[var(--sub)] hover:text-[var(--tx)] flex items-center justify-center transition-colors"
                   title="Refresh"
                 >
-                  <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
+                  <RefreshCw size={15} className={loading ? 'animate-spin' : ''} />
                 </button>
                 <button
                   type="button"
                   onClick={onClose}
-                  className="p-2 rounded-xl hover:bg-slate-100 dark:hover:bg-[#172136] text-slate-400"
+                  className="w-8 h-8 rounded-full hover:bg-[var(--hover)] text-[var(--sub)] hover:text-[var(--tx)] flex items-center justify-center transition-colors"
                   aria-label="Close"
                 >
-                  <X size={18} />
+                  <X size={17} />
                 </button>
               </div>
             </div>
 
-            <div className="flex-1 overflow-y-auto p-6 space-y-4 no-scrollbar">
+            <div className="flex-1 overflow-y-auto p-5 space-y-4 no-scrollbar">
               {jobsListContent}
             </div>
           </motion.div>

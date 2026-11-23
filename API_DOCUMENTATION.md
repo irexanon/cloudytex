@@ -616,13 +616,15 @@ Streams or downloads a file from any linked drive (Telegram, Google Drive, OneDr
 - **Auth Required:** Yes (`Authorization` header, `?token=<session_token>`, or signed media URL)
 - **Query Parameters:**
   - `preview=1` *(Optional)*: Sets `Content-Disposition: inline` instead of `attachment`, enabling in-app preview for images, PDFs, and video playback.
-- **Headers & Streaming:**
-  - Always sends `Accept-Ranges: bytes`, `Cache-Control: private, no-cache` (never cached publicly), `Content-Type`, `Content-Length`, `ETag`, and RFC 6266 / 5987 safe `Content-Disposition` (`buildSafeContentDisposition`).
-  - Supports `HEAD` requests to inspect file size, MIME type, and ETag before downloading bytes.
+- **Headers, Byte-Range & Resume Streaming:**
+  - Always bypasses HTTP gzip/deflate compression on download streams (`Accept-Encoding: identity` upstream) so exact `Content-Length` (total file size) is always preserved for browsers and download managers.
+  - Sends `Accept-Ranges: bytes`, `X-Accel-Buffering: no`, `Cache-Control: private, no-cache, no-transform` (or `max-age=86400, no-transform` for unencrypted `?preview=1`), `Content-Type`, `Content-Length`, `ETag`, and RFC 6266 / 5987 safe `Content-Disposition` (`buildSafeContentDisposition`).
+  - Supports full RFC 9110 single byte-range requests (`Range: bytes=start-end`, `bytes=start-`, and suffix `bytes=-N`) returning `206 Partial Content` + `Content-Range`, `If-Range` ETag validation (automatically falling back to `200 OK` full file on ETag mismatch), and `416 Range Not Satisfiable` (`Content-Range: bytes */<total>`) on malformed or out-of-bounds ranges.
+  - Supports `HEAD` requests (with optional `Range`) to inspect exact file size, `Accept-Ranges`, MIME type, and ETag before downloading bytes.
   - Enforces per-user concurrent download limits (`MAX_CONCURRENT_DOWNLOADS_PER_USER`) and idle-stream timeouts (`DOWNLOAD_IDLE_TIMEOUT_MS`), destroying upstream provider streams immediately on client disconnect.
 
-#### 6.5.1 One-Time & Short-Lived Download Tickets (`/api/download-tickets`)
-Issue a short-lived or single-use download ticket so native media players, external download managers, or browser downloads never expose bearer tokens in query strings.
+#### 6.5.1 One-Time & Resumable Download Tickets (`/api/download-tickets`)
+Issue a short-lived resumable or single-use download ticket so native media players, external download managers (IDM/ADM), or browser downloads never expose bearer tokens in query strings.
 - **Create Download Ticket:** `POST /api/download-tickets`
   - **Auth Required:** Yes (`read` scope)
   - **Request Body (JSON):**
@@ -630,26 +632,29 @@ Issue a short-lived or single-use download ticket so native media players, exter
     {
       "accountId": "65d8a1f2e4b0111111111111",
       "fileId": "65d8a2b5e4b0222222222222",
-      "singleUse": true,
-      "ttlSeconds": 300,
-      "preview": false
+      "singleUse": false,
+      "ttlSeconds": 3600
     }
     ```
+    - Set `singleUse: false` (recommended for browser downloads, download managers, and video players; `ttlSeconds` bounded to `15..3600`) to allow pause/resume and multi-connection byte-range requests until expiry.
+    - Set `singleUse: true` (default if omitted) for strict one-shot downloads.
   - **Response (201 Created):**
     ```json
     {
       "ticket": "dlt_to9rx7sqlbwp3n1ow6nnj3g3cj0333sg",
-      "downloadUrl": "/api/download/ticket/dlt_to9rx7sqlbwp3n1ow6nnj3g3cj0333sg",
-      "expiresAt": "2026-11-18T09:52:29.369Z",
-      "singleUse": true
+      "downloadUrl": "https://your-domain.com/api/download/ticket/dlt_to9rx7sqlbwp3n1ow6nnj3g3cj0333sg",
+      "expiresAt": "2026-11-18T10:52:29.369Z",
+      "singleUse": false
     }
     ```
-- **Redeem Ticket & Stream File:** `GET /api/download/ticket/:ticket`
-  - **Auth Required:** No (the ticket itself is the capability)
-  - **Behavior:** Atomically marks `singleUse: true` tickets as consumed (`usedCount: 1`) and streams the file with full HTTP `Range` support. Subsequent requests to a consumed single-use ticket or expired/revoked ticket return `410 Gone`.
+- **Probe Metadata or Stream File via Ticket:** `HEAD /api/download/ticket/:ticket` and `GET /api/download/ticket/:ticket`
+  - **Auth Required:** No (the ticket itself is the file-scoped capability)
+  - **Behavior:**
+    - `HEAD` validates the ticket and returns `Content-Length`, `Accept-Ranges: bytes`, `ETag`, and `Content-Disposition` **without** incrementing `usedCount` (so metadata probes never burn `singleUse: true` tickets).
+    - `GET` streams the file uncompressed with full HTTP `Range` (`206` / `If-Range` / `416`) support. For `singleUse: true` tickets, the first `GET` consumes the ticket and subsequent `GET` calls return `410 Gone`; for `singleUse: false` tickets, pause/resume and multi-part range requests work until `expiresAt` or manual revocation (`404`/`410`).
 - **Revoke Ticket:** `DELETE /api/download-tickets/:ticket`
   - **Auth Required:** Yes
-  - **Response (200 OK):** `{ "success": true }`
+  - **Response (200 OK):** `{ "success": true, "revokedTicket": "dlt_..." }`
 
 ### 6.6 Rename File
 Renames an existing file or folder.
@@ -877,11 +882,11 @@ Generates a shareable URL for any non-encrypted file with optional expiration, d
 - **Revoke Share:** `DELETE /api/share/:shareId`
   - Marks the share as revoked (`revokedAt`) so `/s/:shareId` and `/api/public/download/:shareId` immediately stop serving the file (`200 OK`: `{ "success": true }`).
 
-### 8.3 Public Direct Download
+### 8.3 Public Direct Download (`GET` & `HEAD`)
 Direct binary file stream for shared files (no auth required; pass `?pin=<pin>` or `X-Share-Pin` if PIN-protected).
-- **Method & Route:** `GET /api/public/download/:shareId`
+- **Method & Route:** `GET /api/public/download/:shareId` and `HEAD /api/public/download/:shareId`
 - **Auth Required:** No
-- **Response:** Binary file stream with safe RFC 6266 `Content-Disposition: attachment`. Supports video range streaming and increments `downloadCount`.
+- **Response:** Uncompressed binary file stream with exact `Content-Length`, `Accept-Ranges: bytes`, `ETag`, `Cache-Control: private, no-cache, no-transform`, and safe RFC 6266 `Content-Disposition: attachment`. Supports `HEAD` metadata probes, full HTTP `Range` (`206` / `If-Range` / `416`) pause/resume, and only increments `downloadCount` on full downloads or byte-range requests starting at offset `0` (not on `HEAD` probes or mid-file resume chunks).
 
 ### 8.4 Public Share Landing Page
 HTML preview and download web page for end users (pass `?pin=<pin>` if PIN-protected).
@@ -1006,16 +1011,16 @@ Queries structured security and operational audit records persisted in `audit_lo
 | **Create Folder** | `/api/folders` | POST | Bearer | Pass `name` & `parentId` |
 | **Upload File** | `/api/upload/:accountId` | POST | Bearer | Multipart Form: `file` & `folderId` + `Idempotency-Key` |
 | **Upload Sessions** | `/api/upload-sessions/:accId` | POST / PUT / GET / DELETE | Bearer | Resumable chunked uploads (`X-Chunk-Sha256`, deduplication, quota & archive-bomb checks) |
-| **Download/Stream** | `/api/download/:accId/:fileId`| GET / HEAD | Bearer or `?token=` | Supports `Range`, `HEAD`, RFC 6266/5987, ETag 304, and `?preview=1` |
-| **Download Tickets** | `/api/download-tickets` | POST / DELETE | Bearer | Issue or revoke short-lived / single-use download tickets (`dlt_...`) |
-| **Redeem Ticket** | `/api/download/ticket/:ticket`| GET | None | Stream file using a short-lived or one-time download ticket |
+| **Download/Stream** | `/api/download/:accId/:fileId`| GET / HEAD | Bearer or `?token=` | Uncompressed `Content-Length`, `Range`/`If-Range`/`416`, `HEAD`, RFC 6266/5987, ETag 304, `?preview=1` |
+| **Download Tickets** | `/api/download-tickets` | POST / DELETE | Bearer | Issue or revoke resumable (`singleUse: false`) or one-time download tickets (`dlt_...`) |
+| **Redeem Ticket** | `/api/download/ticket/:ticket`| GET / HEAD | None | Probe size (`HEAD`, non-consuming) or stream/resume file (`Range` 206) via ticket |
 | **Trash Management** | `/api/trash` | GET / POST / DELETE | Bearer | List trashed files, `/api/trash/restore`, or permanent delete |
 | **Move File** | `/api/files/move` | POST | Bearer | Supports same-drive & cross-drive transfers (`?async=true` for job queue) |
 | **Copy File** | `/api/files/copy` | POST | Bearer | Supports same-drive & cross-drive cloning (`?async=true` for job queue) |
 | **Jobs Queue** | `/api/jobs` | GET / POST | Bearer | Unified Operation model, `/api/jobs/health`, SSE `/stream`, `/cancel`, `/retry` |
 | **Batch Backups** | `/api/backups/batch` | POST | Bearer | Background batch backup, `/:jobId/verify`, and conflict-safe `/:jobId/restore` |
 | **Share Links** | `/api/share` & `/api/shares` | POST / GET / DELETE | Bearer | 7-point validated shares with `expiresInHours`, `maxDownloads`, `pin`, and revocation |
-| **Public Download**| `/api/public/download/:shareId`| GET | None | 7-point validated direct file download (`?pin=` if PIN-protected) |
+| **Public Download**| `/api/public/download/:shareId`| GET / HEAD | None | 7-point validated direct download with `HEAD`, `Content-Length`, & `Range` resume (`?pin=` if PIN-protected) |
 | **Put Key Backup** | `/api/accounts/:id/encryption/key-backup` | PUT | Bearer | Store opaque PBKDF2-wrapped encryption key backup |
 | **Get Key Backup** | `/api/accounts/:id/encryption/key-backup` | GET | Bearer | Retrieve opaque wrapped encryption key backup |
 | **Delete Key Backup**| `/api/accounts/:id/encryption/key-backup` | DELETE | Bearer | Delete stored key backup (`204 No Content`) |

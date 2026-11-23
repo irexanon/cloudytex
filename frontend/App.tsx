@@ -3,7 +3,7 @@ import {
   Plus, Search, Trash2, RotateCcw, Edit3, Download, Folder, FolderPlus, File as FileIconLucide, ChevronRight, ChevronLeft, ChevronDown, 
   LogOut, Cloud, HardDrive, X, RefreshCw, Check, CheckCircle2, LayoutGrid, 
   List as ListIcon, Info, Moon, Sun, Eye, Settings, MoreVertical, 
-  Share2, Video, Send, ArrowLeft, ArrowUp, ArrowDown, ExternalLink, Archive, FileArchive, Maximize, Copy, Activity,
+  Share2, Send, ArrowLeft, ArrowUp, ArrowDown, ExternalLink, Archive, FileArchive, Copy,
   Upload, ArrowLeftRight, Shield, SlidersHorizontal, AlertTriangle, UploadCloud, FolderOpen, Pause, Play, ChevronUp
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
@@ -17,7 +17,7 @@ import SecuritySettingsTabs from "./components/modals/SecuritySettingsTabs";
 import JobsDrawer from "./components/modals/JobsDrawer";
 import AdminObservabilityPanel from "./components/modals/AdminObservabilityPanel";
 import DetailRow from "./components/DetailRow";
-import FileIcon, { renderFileTypeGlyph } from "./components/FileIcon";
+import FileIcon from "./components/FileIcon";
 import TelegramIcon from "./components/Icons/TelegramIcon";
 import {
   parseAppLocation,
@@ -67,9 +67,14 @@ export default function App() {
   });
   const [searchQuery, setSearchQuery]     = useState(initialRoute.search);
   const [debouncedSearch, setDebouncedSearch] = useState(initialRoute.search);
-  const [viewMode, setViewMode]           = useState<'list' | 'grid'>('list');
+  const [viewMode, setViewMode]           = useState<'list' | 'grid'>('grid');
   const [isDrivesExpanded, setIsDrivesExpanded] = useState(false);
+  const [sortBy, setSortBy]               = useState<'name' | 'modified' | 'size'>('name');
   const [sortOrder, setSortOrder]         = useState<'asc' | 'desc'>('asc');
+  const [isSortMenuOpen, setIsSortMenuOpen] = useState(false);
+  const [focusedFileId, setFocusedFileId] = useState<string | null>(null);
+  const [previewInfoOpen, setPreviewInfoOpen] = useState(false);
+  const [isBackupDropdownOpen, setIsBackupDropdownOpen] = useState(false);
   const [isProfileMenuOpen, setIsProfileMenuOpen] = useState(false);
   const [mobileSearchOpen, setMobileSearchOpen] = useState(false);
   const [runningJobsCount, setRunningJobsCount] = useState(0);
@@ -252,33 +257,40 @@ export default function App() {
     if (next.has(fileId)) next.delete(fileId);
     else next.add(fileId);
     setSelectedFileIds(next);
+    setFocusedFileId(fileId);
   };
-
-  const clickTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const handleSingleClick = (file: any, e: React.MouseEvent) => {
     e.stopPropagation();
     if (window.innerWidth < 768) {
       if (file.type === 'folder') navigateToFolder(file);
-      else if (['image', 'video', 'audio', 'pdf'].includes(file.type)) openPreview(file);
-      else openFileInspector(file);
+      else openPreview(file);
       return;
     }
-    if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
-    clickTimeoutRef.current = setTimeout(() => {
-      openFileInspector(file);
-      clickTimeoutRef.current = null;
-    }, 250);
+    if (e.metaKey || e.ctrlKey) {
+      toggleSelection(e, file.id);
+      return;
+    }
+    setFocusedFileId(file.id);
+    // If Details Inspector is already open, live-update it to follow focus (Google Drive behavior)
+    if (selectedFile) {
+      setSelectedFile(file);
+      syncUrl({ infoFileId: file.id }, 'replace');
+    }
   };
 
   const handleDoubleClick = (file: any, e: React.MouseEvent) => {
     e.stopPropagation();
-    if (clickTimeoutRef.current) {
-      clearTimeout(clickTimeoutRef.current);
-      clickTimeoutRef.current = null;
-    }
+    setFocusedFileId(file.id);
     if (file.type === 'folder') navigateToFolder(file);
-    else if (['image', 'video', 'audio', 'pdf'].includes(file.type)) openPreview(file);
+    else openPreview(file);
+  };
+
+  const handleRowContextMenu = (file: any, e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setFocusedFileId(file.id);
+    setContextMenu({ file, x: e.clientX, y: e.clientY });
   };
 
   const showToast = useCallback((
@@ -722,12 +734,18 @@ export default function App() {
     return `/api/download/${encodeURIComponent(accId)}/${encodeURIComponent(fileId)}${suffix}`;
   }, [getAuthHeaders]);
 
-  // ── Download: uses short-lived single-use download ticket (no token in URL) ─
+  // ── Download: uses short-lived resumable download ticket (supports HEAD, byte-range, & resume) ─
   const handleDownload = async (fileId: string) => {
     if (!selectedAccountId) return;
     try {
-      const url = await requestDownloadTicketUrl(selectedAccountId, fileId, { singleUse: true, ttlSeconds: 300 });
-      window.open(url, '_blank');
+      const url = await requestDownloadTicketUrl(selectedAccountId, fileId, { singleUse: false, ttlSeconds: 3600 });
+      const link = document.createElement('a');
+      link.href = url;
+      link.rel = 'noopener noreferrer';
+      link.style.display = 'none';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
     } catch (err: any) { showToast('Download failed: ' + err.message, 'error'); }
   };
 
@@ -1478,7 +1496,8 @@ export default function App() {
   };
 
   const openPreview = useCallback(async (file: any, opts: { syncHistory?: boolean } = {}) => {
-    if (!selectedAccountId) return;
+    if (!selectedAccountId || !file || file.type === 'folder') return;
+    setFullScreenGalleryFile(null);
     const url = await requestDownloadTicketUrl(selectedAccountId, file.id, {
       singleUse: false,
       ttlSeconds: 600,
@@ -1493,6 +1512,34 @@ export default function App() {
   const touchStartX = useRef<number | null>(null);
   const touchEndX = useRef<number | null>(null);
 
+  const openFullScreenGallery = useCallback(async (file: any, opts: { syncHistory?: boolean } = {}) => {
+    await openPreview(file, opts);
+  }, [openPreview]);
+
+  const previewableFiles = files.filter(f => f.type !== 'folder');
+  const activePreviewIndex = previewFile ? previewableFiles.findIndex(f => f.id === previewFile.id) : -1;
+  const hasNextPreview = activePreviewIndex >= 0 && activePreviewIndex < previewableFiles.length - 1;
+  const hasPrevPreview = activePreviewIndex > 0;
+
+  const navigatePreview = useCallback(async (direction: 'next' | 'prev', e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    let target: any = null;
+    if (direction === 'next' && activePreviewIndex >= 0 && activePreviewIndex < previewableFiles.length - 1) {
+      target = previewableFiles[activePreviewIndex + 1];
+    }
+    if (direction === 'prev' && activePreviewIndex > 0) {
+      target = previewableFiles[activePreviewIndex - 1];
+    }
+    if (!target || !selectedAccountId) return;
+    const url = await requestDownloadTicketUrl(selectedAccountId, target.id, {
+      singleUse: false,
+      ttlSeconds: 600,
+      preview: true,
+    });
+    setPreviewFile({ ...target, url });
+    syncUrl({ previewFileId: target.id, galleryFileId: null }, 'replace');
+  }, [activePreviewIndex, previewableFiles, selectedAccountId, requestDownloadTicketUrl, syncUrl]);
+
   const handleTouchStart = (e: React.TouchEvent) => {
     touchEndX.current = null;
     touchStartX.current = e.targetTouches[0].clientX;
@@ -1506,64 +1553,11 @@ export default function App() {
     if (!touchStartX.current || !touchEndX.current) return;
     const distance = touchStartX.current - touchEndX.current;
     const minSwipeDistance = 50;
-    if (distance > minSwipeDistance && hasNextMedia) navigateGallery('next');
-    if (distance < -minSwipeDistance && hasPrevMedia) navigateGallery('prev');
+    if (distance > minSwipeDistance && hasNextPreview) navigatePreview('next');
+    if (distance < -minSwipeDistance && hasPrevPreview) navigatePreview('prev');
     touchStartX.current = null;
     touchEndX.current = null;
   };
-
-  const openFullScreenGallery = useCallback(async (file: any, opts: { syncHistory?: boolean } = {}) => {
-    setPreviewFile(null); // Close the smaller modal
-    if (!file.url && selectedAccountId) {
-      const url = await requestDownloadTicketUrl(selectedAccountId, file.id, { singleUse: false, ttlSeconds: 600, preview: true });
-      setFullScreenGalleryFile({ ...file, url });
-    } else {
-      setFullScreenGalleryFile(file);
-    }
-    if (opts.syncHistory !== false) {
-      syncUrl({ galleryFileId: file.id, previewFileId: null });
-    }
-  }, [selectedAccountId, requestDownloadTicketUrl, syncUrl]);
-
-  const getMediaUrl = useCallback((file: any) => {
-    if (!file) return '';
-    if (file.url) return file.url;
-    return '';
-  }, []);
-
-  const mediaFiles = files.filter(f => ['image', 'video', 'audio'].includes(f.type));
-  const currentGalleryIndex = fullScreenGalleryFile ? mediaFiles.findIndex(f => f.id === fullScreenGalleryFile.id) : -1;
-  const hasNextMedia = currentGalleryIndex >= 0 && currentGalleryIndex < mediaFiles.length - 1;
-  const hasPrevMedia = currentGalleryIndex > 0;
-
-  const navigateGallery = useCallback(async (direction: 'next' | 'prev', e?: React.MouseEvent) => {
-    e?.stopPropagation();
-    let target: any = null;
-    if (direction === 'next' && currentGalleryIndex >= 0 && currentGalleryIndex < mediaFiles.length - 1) target = mediaFiles[currentGalleryIndex + 1];
-    if (direction === 'prev' && currentGalleryIndex > 0) target = mediaFiles[currentGalleryIndex - 1];
-    if (!target) return;
-    if (!target.url && selectedAccountId) {
-      const url = await requestDownloadTicketUrl(selectedAccountId, target.id, { singleUse: false, ttlSeconds: 600, preview: true });
-      setFullScreenGalleryFile({ ...target, url });
-    } else {
-      setFullScreenGalleryFile(target);
-    }
-    syncUrl({ galleryFileId: target.id, previewFileId: null }, 'replace');
-  }, [currentGalleryIndex, mediaFiles, selectedAccountId, requestDownloadTicketUrl, syncUrl]);
-
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (!fullScreenGalleryFile) return;
-      if (e.key === 'ArrowRight') navigateGallery('next');
-      if (e.key === 'ArrowLeft') navigateGallery('prev');
-      if (e.key === 'Escape') {
-        setFullScreenGalleryFile(null);
-        syncUrl({ galleryFileId: null });
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [fullScreenGalleryFile, navigateGallery, syncUrl]);
 
   const handleBulkZip = async (specificIds?: Set<string>) => {
     const idsToProcess = specificIds || selectedFileIds;
@@ -1993,6 +1987,17 @@ export default function App() {
   const isTgDrive = selectedAccount?.accountType === 'tgdrive';
   const userInitials = (username || 'U').replace(/[^a-zA-Z0-9]/g, '').slice(0, 2).toUpperCase() || 'U';
 
+  const parseReadableSizeToBytes = (rawSize: any): number => {
+    if (typeof rawSize === 'number' && Number.isFinite(rawSize)) return rawSize;
+    const str = String(rawSize || '').trim();
+    const match = str.match(/^([\d.]+)\s*(B|KB|MB|GB|TB)$/i);
+    if (!match) return 0;
+    const num = parseFloat(match[1]);
+    const unit = match[2].toUpperCase();
+    const mult: Record<string, number> = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, TB: 1024 ** 4 };
+    return num * (mult[unit] || 1);
+  };
+
   const displayedFiles = React.useMemo(() => {
     const filtered = files.filter((file) => {
       if (searchFilterType === 'all') return true;
@@ -2015,11 +2020,137 @@ export default function App() {
       const aDir = a.type === 'folder' ? 0 : 1;
       const bDir = b.type === 'folder' ? 0 : 1;
       if (aDir !== bDir) return aDir - bDir;
-      const cmp = String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' });
+      let cmp = 0;
+      if (sortBy === 'size') {
+        cmp = parseReadableSizeToBytes(a.sizeBytes ?? a.size) - parseReadableSizeToBytes(b.sizeBytes ?? b.size);
+      } else if (sortBy === 'modified') {
+        const aTime = Date.parse(a.modifiedTime || a.modified || a.createdAt || '') || 0;
+        const bTime = Date.parse(b.modifiedTime || b.modified || b.createdAt || '') || 0;
+        cmp = aTime - bTime;
+      }
+      if (cmp === 0) {
+        cmp = String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' });
+      }
       return sortOrder === 'asc' ? cmp : -cmp;
     });
     return list;
-  }, [files, sortOrder, searchFilterType]);
+  }, [files, sortBy, sortOrder, searchFilterType]);
+
+  // Global keyboard shortcuts for Lightbox & Desktop File Browser
+  useEffect(() => {
+    const handleGlobalKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const isTyping =
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable);
+
+      if (previewFile) {
+        if (e.key === 'ArrowRight') {
+          e.preventDefault();
+          navigatePreview('next');
+        } else if (e.key === 'ArrowLeft') {
+          e.preventDefault();
+          navigatePreview('prev');
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          setPreviewFile(null);
+          setPreviewInfoOpen(false);
+          syncUrl({ previewFileId: null, galleryFileId: null });
+        } else if (e.key.toLowerCase() === 'i' && !isTyping) {
+          setPreviewInfoOpen(prev => !prev);
+        }
+        return;
+      }
+
+      if (isTyping || !isAuthenticated) return;
+      if (confirmModal?.isOpen || promptModal?.isOpen || isMoveModalOpen || linkProviderModal || tgDriveModal || shareTargetFile) return;
+
+      if (e.key === 'Escape') {
+        if (contextMenu) { setContextMenu(null); return; }
+        if (isSortMenuOpen) { setIsSortMenuOpen(false); return; }
+        if (uploadMenuAnchor) { setUploadMenuAnchor(null); return; }
+        if (selectedFile) { openFileInspector(null); return; }
+        if (selectedFileIds.size > 0) { setSelectedFileIds(new Set()); return; }
+        if (focusedFileId) { setFocusedFileId(null); return; }
+        return;
+      }
+
+      if (isSettingsOpen || isJobsDrawerOpen || isAdminPanelOpen || displayedFiles.length === 0) return;
+
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'a') {
+        e.preventDefault();
+        setSelectedFileIds(new Set(displayedFiles.map(f => f.id)));
+        return;
+      }
+
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        const curIdx = displayedFiles.findIndex(f => f.id === focusedFileId);
+        const nextIdx =
+          e.key === 'ArrowDown'
+            ? (curIdx < 0 ? 0 : Math.min(displayedFiles.length - 1, curIdx + 1))
+            : (curIdx <= 0 ? 0 : curIdx - 1);
+        const nextFile = displayedFiles[nextIdx];
+        if (nextFile) {
+          setFocusedFileId(nextFile.id);
+          if (selectedFile) {
+            setSelectedFile(nextFile);
+            syncUrl({ infoFileId: nextFile.id }, 'replace');
+          }
+        }
+        return;
+      }
+
+      if (e.key === 'Enter' && focusedFileId) {
+        const focused = displayedFiles.find(f => f.id === focusedFileId);
+        if (focused) {
+          e.preventDefault();
+          if (focused.type === 'folder') navigateToFolder(focused);
+          else openPreview(focused);
+        }
+        return;
+      }
+
+      if (e.key === 'Delete' || (e.key === 'Backspace' && (e.metaKey || e.ctrlKey))) {
+        if (selectedFileIds.size > 0) {
+          e.preventDefault();
+          handleBulkDelete();
+        } else if (focusedFileId) {
+          e.preventDefault();
+          handleDeleteFile(focusedFileId);
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleGlobalKeyDown);
+    return () => window.removeEventListener('keydown', handleGlobalKeyDown);
+  }, [
+    previewFile,
+    navigatePreview,
+    syncUrl,
+    isAuthenticated,
+    confirmModal?.isOpen,
+    promptModal?.isOpen,
+    isMoveModalOpen,
+    linkProviderModal,
+    tgDriveModal,
+    shareTargetFile,
+    contextMenu,
+    isSortMenuOpen,
+    uploadMenuAnchor,
+    selectedFile,
+    openFileInspector,
+    selectedFileIds,
+    focusedFileId,
+    isSettingsOpen,
+    isJobsDrawerOpen,
+    isAdminPanelOpen,
+    displayedFiles,
+    openPreview,
+  ]);
 
   const renderProviderBadge = (accountType: string, size: 'sm' | 'md' = 'md') => {
     const dims = size === 'sm' ? 'w-6 h-6 text-[11px]' : 'w-10 h-10 text-[15px]';
@@ -2063,86 +2194,126 @@ export default function App() {
     const canRegisterOnWeb = regSettings && !isRegDisabled && !isWebRegDisabled;
 
     return (
-      <div className="min-h-screen bg-slate-950 flex items-center justify-center p-6 bg-[radial-gradient(circle_at_50%_-20%,#1e293b,transparent)]">
-        <div className="bg-white dark:bg-slate-800 p-8 rounded-[2.5rem] shadow-2xl max-w-md w-full border border-slate-100 dark:border-slate-700">
-          <div className="w-20 h-20 bg-blue-700 rounded-3xl flex items-center justify-center mx-auto mb-8 shadow-xl shadow-blue-900/20">
-            <Cloud size={40} className="text-white" />
+      <div className={`min-h-screen bg-[var(--bg)] text-[var(--tx)] flex flex-col items-center justify-center p-6 relative transition-colors duration-200 ${isDarkMode ? 'dark' : ''}`}>
+        {/* Theme toggle in corner */}
+        <button
+          type="button"
+          onClick={() => setIsDarkMode(!isDarkMode)}
+          className="fixed top-5 right-5 w-10 h-10 rounded-full bg-[var(--sf)] border border-[var(--bd)] text-[var(--sub)] hover:text-[var(--tx)] flex items-center justify-center transition-colors"
+          title={isDarkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+        >
+          {isDarkMode ? <Sun size={18} /> : <Moon size={18} />}
+        </button>
+
+        <div className="w-full max-w-[400px] bg-[var(--sf)] border border-[var(--bd)] rounded-[28px] p-8 shadow-sm">
+          <div className="flex flex-col items-center text-center mb-7">
+            <div className="w-12 h-12 rounded-2xl bg-[#2563EB] text-white flex items-center justify-center shadow-md shadow-blue-600/20 mb-4">
+              <Cloud size={24} fill="currentColor" />
+            </div>
+            <h1 className="text-2xl font-bold text-[var(--tx)] tracking-tight">
+              {isRegisterMode ? 'Create your account' : 'Sign in to Cloudyte'}
+            </h1>
+            <p className="text-sm text-[var(--sub)] mt-1">
+              {isRegisterMode ? 'Set up a workspace for your cloud drives' : 'Access all your connected drives in one place'}
+            </p>
           </div>
-          <h1 className="text-3xl font-black text-slate-900 dark:text-white mb-2 text-center tracking-tight">Cloudyte</h1>
-          <p className="text-slate-400 mb-8 text-center font-medium">
-            {isRegisterMode ? 'Create a new account' : 'Login with your credentials'}
-          </p>
 
           <form onSubmit={isRegisterMode ? handleRegister : handleLogin} className="space-y-4">
-            <div className="space-y-1">
-              <label className="text-[10px] font-black uppercase text-slate-400 px-2 tracking-widest">Username</label>
-              <input name="username" type="text" placeholder="e.g. john_doe" required className="w-full px-6 py-4 bg-slate-50 dark:bg-slate-900 border-2 border-transparent focus:border-blue-500 rounded-2xl outline-none transition-all font-bold text-slate-700 dark:text-white" />
+            <div className="space-y-1.5">
+              <label className="block text-xs font-medium text-[var(--sub)]">Username</label>
+              <input
+                name="username"
+                type="text"
+                placeholder="Enter username"
+                required
+                autoComplete="username"
+                className="w-full h-11 px-4 bg-[var(--bg)] border border-[var(--bd)] focus:border-[#2563EB] rounded-xl outline-none transition-colors text-sm font-medium text-[var(--tx)] placeholder:text-[var(--sub)]/70"
+              />
             </div>
-            <div className="space-y-1">
-              <label className="text-[10px] font-black uppercase text-slate-400 px-2 tracking-widest">Password</label>
-              <input name="password" type="password" placeholder="••••••••" required className="w-full px-6 py-4 bg-slate-50 dark:bg-slate-900 border-2 border-transparent focus:border-blue-500 rounded-2xl outline-none transition-all font-bold text-slate-700 dark:text-white" />
+            <div className="space-y-1.5">
+              <label className="block text-xs font-medium text-[var(--sub)]">Password</label>
+              <input
+                name="password"
+                type="password"
+                placeholder="Enter password"
+                required
+                autoComplete={isRegisterMode ? 'new-password' : 'current-password'}
+                className="w-full h-11 px-4 bg-[var(--bg)] border border-[var(--bd)] focus:border-[#2563EB] rounded-xl outline-none transition-colors text-sm font-medium text-[var(--tx)] placeholder:text-[var(--sub)]/70"
+              />
             </div>
             {isRegisterMode && (
-              <div className="space-y-1">
-                <label className="text-[10px] font-black uppercase text-slate-400 px-2 tracking-widest">Confirm Password</label>
-                <input name="confirm_password" type="password" placeholder="••••••••" required className="w-full px-6 py-4 bg-slate-50 dark:bg-slate-900 border-2 border-transparent focus:border-blue-500 rounded-2xl outline-none transition-all font-bold text-slate-700 dark:text-white" />
+              <div className="space-y-1.5">
+                <label className="block text-xs font-medium text-[var(--sub)]">Confirm password</label>
+                <input
+                  name="confirm_password"
+                  type="password"
+                  placeholder="Re-enter password"
+                  required
+                  autoComplete="new-password"
+                  className="w-full h-11 px-4 bg-[var(--bg)] border border-[var(--bd)] focus:border-[#2563EB] rounded-xl outline-none transition-colors text-sm font-medium text-[var(--tx)] placeholder:text-[var(--sub)]/70"
+                />
               </div>
             )}
-            
-            {loginError && <motion.p initial={{ opacity: 0, x: -10 }} animate={{ opacity: 1, x: 0 }} className="text-red-500 text-xs font-bold px-2">{loginError}</motion.p>}
-            
-            <button disabled={isLoggingIn} className="w-full bg-slate-900 dark:bg-blue-700 text-white py-4 rounded-2xl font-black text-lg hover:bg-slate-800 transition-all active:scale-[0.98] shadow-lg flex items-center justify-center gap-2 disabled:opacity-50 mt-4">
+
+            {loginError && (
+              <motion.p initial={{ opacity: 0, y: -4 }} animate={{ opacity: 1, y: 0 }} className="text-rose-600 dark:text-rose-400 text-xs font-medium">
+                {loginError}
+              </motion.p>
+            )}
+
+            <button
+              disabled={isLoggingIn}
+              className="w-full h-11 bg-[#2563EB] hover:bg-blue-700 text-white rounded-xl font-semibold text-sm transition-colors active:scale-[0.99] flex items-center justify-center gap-2 disabled:opacity-50 mt-2"
+            >
               {isLoggingIn ? (
-                <><RefreshCw size={20} className="animate-spin" /><span>{isRegisterMode ? 'Creating Account...' : 'Authenticating...'}</span></>
+                <><RefreshCw size={16} className="animate-spin" /><span>{isRegisterMode ? 'Creating account...' : 'Signing in...'}</span></>
               ) : (
-                <span>{isRegisterMode ? 'Create Account' : 'Access Dashboard'}</span>
+                <span>{isRegisterMode ? 'Create account' : 'Sign in'}</span>
               )}
             </button>
           </form>
 
-          <div className="mt-8 pt-8 border-t border-slate-100 dark:border-slate-700 flex flex-col items-center gap-4 min-h-[60px]">
+          <div className="mt-6 pt-5 border-t border-[var(--bd)] flex flex-col items-center gap-2 text-center">
             {!regSettings ? (
-              <div className="flex items-center gap-2 text-slate-500 text-xs font-medium">
+              <div className="flex items-center gap-2 text-[var(--sub)] text-xs">
                 <RefreshCw size={12} className="animate-spin" />
-                <span>Fetching platform settings...</span>
+                <span>Loading workspace settings...</span>
               </div>
             ) : isRegisterMode ? (
-              <button 
+              <button
+                type="button"
                 onClick={() => {
                   setIsRegisterMode(false);
                   setLoginError(null);
                   window.history.pushState(null, '', '/login');
                 }}
-                className="text-xs font-bold text-blue-500 hover:underline"
+                className="text-xs font-semibold text-[#2563EB] dark:text-[#60A5FA] hover:underline"
               >
-                Already have an account? Login
+                Already have an account? Sign in
+              </button>
+            ) : canRegisterOnWeb ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setIsRegisterMode(true);
+                  setLoginError(null);
+                  window.history.pushState(null, '', '/register');
+                }}
+                className="text-xs font-semibold text-[#2563EB] dark:text-[#60A5FA] hover:underline"
+              >
+                New here? Create an account
               </button>
             ) : (
-              <>
-                {canRegisterOnWeb ? (
-                  <button 
-                    onClick={() => {
-                      setIsRegisterMode(true);
-                      setLoginError(null);
-                      window.history.pushState(null, '', '/register');
-                    }}
-                    className="text-xs font-bold text-blue-500 hover:underline"
-                  >
-                    Don't have an account? Register here
-                  </button>
-                ) : (
-                  <div className="text-center space-y-2">
-                    <p className="text-xs text-slate-400 font-medium italic">
-                      Registration is managed by platform security.
-                    </p>
-                    {regSettings?.botRegistrationEnabled !== false && !isRegDisabled && (
-                      <p className="text-[10px] font-bold text-slate-500 uppercase tracking-tight">
-                        Use <span className="text-blue-500">/register</span> in the Telegram bot.
-                      </p>
-                    )}
-                  </div>
+              <div className="space-y-1">
+                <p className="text-xs text-[var(--sub)]">
+                  Registration is invite-only on this workspace.
+                </p>
+                {regSettings?.botRegistrationEnabled !== false && !isRegDisabled && (
+                  <p className="text-xs text-[var(--sub)]">
+                    Use <span className="font-mono text-[#2563EB] dark:text-[#60A5FA]">/register</span> in the Telegram bot.
+                  </p>
                 )}
-              </>
+              </div>
             )}
           </div>
         </div>
@@ -2163,15 +2334,8 @@ export default function App() {
       ? 'trash'
       : 'files';
 
-  const gridFolders = displayedFiles.filter(f => f.type === 'folder');
-  const gridFiles = displayedFiles.filter(f => f.type !== 'folder');
 
-  const getRowRadiusClass = (idx: number, total: number) => {
-    if (total <= 1) return 'rounded-[20px]';
-    if (idx === 0) return 'rounded-t-[20px] rounded-b-[4px]';
-    if (idx === total - 1) return 'rounded-t-[4px] rounded-b-[20px]';
-    return 'rounded-[4px]';
-  };
+
 
   const renderDrivesPanelContent = (isMobileDrawer = false) => (
     <div className="flex flex-col h-full min-w-0">
@@ -2654,78 +2818,111 @@ export default function App() {
         onDrop={handleDrop}
       >
         {isDragging && !isSettingsOpen && !isJobsDrawerOpen && !isAdminPanelOpen && (
-          <div className="absolute inset-0 z-50 bg-blue-500/10 backdrop-blur-sm border-4 border-dashed border-blue-500 flex flex-col items-center justify-center pointer-events-none">
-            <div className="bg-[var(--sf)] p-8 rounded-full shadow-2xl animate-bounce">
-              <Folder size={64} className="text-[#2563EB]" />
+          <div className="absolute inset-0 z-50 bg-[#2563EB]/[0.06] ring-2 ring-inset ring-[#2563EB]/45 backdrop-blur-[1.5px] pointer-events-none flex items-end justify-center pb-10 px-4">
+            <div className="bg-[var(--sf)] border border-[#2563EB]/40 rounded-2xl shadow-xl px-5 py-3.5 flex items-center gap-3.5 max-w-md">
+              <span className="w-10 h-10 rounded-xl bg-[#2563EB]/12 text-[#2563EB] flex items-center justify-center shrink-0">
+                <UploadCloud size={20} />
+              </span>
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-[var(--tx)]">Drop files to upload</p>
+                <p className="text-xs text-[var(--sub)] truncate mt-0.5">
+                  {(selectedAccount?.name || (isTgDrive ? 'TG Drive' : selectedAccount?.email || 'Drive'))}
+                  {path.length > 1 ? ` › ${path.slice(1).map(p => p.name).join(' › ')}` : ' › Files'}
+                </p>
+              </div>
             </div>
-            <p className="mt-8 text-3xl font-black text-[#2563EB] dark:text-[#60A5FA] drop-shadow-md">Drop files here to upload</p>
           </div>
         )}
 
         {/* Top Header */}
-        <header className="h-16 md:h-[88px] px-4 md:px-8 flex items-center gap-3 sticky top-0 z-40 bg-[var(--bg)] shrink-0">
+        <header className="h-16 md:h-[68px] px-4 md:px-7 flex items-center gap-3 sticky top-0 z-40 bg-[var(--bg)]/95 backdrop-blur-md shrink-0">
           {/* Mobile Drive Switcher Pill (or Back to Drive on sub-pages) */}
           {!isSettingsOpen && !isJobsDrawerOpen && !isAdminPanelOpen ? (
             <button
               type="button"
               onClick={() => setIsDrivesExpanded(true)}
-              className="md:hidden h-10 pl-1.5 pr-3 rounded-[20px] bg-[var(--sf)] border border-[var(--bd)] flex items-center gap-2 text-sm font-bold text-[var(--tx)] max-w-[200px] shrink-0"
+              className="md:hidden h-10 pl-1.5 pr-3 rounded-[20px] bg-[var(--sf)] border border-[var(--bd)] flex items-center gap-2 text-sm font-semibold text-[var(--tx)] max-w-[200px] shrink-0"
             >
               {renderProviderBadge(selectedAccount?.accountType || 'google', 'sm')}
               <span className="truncate">
                 {selectedAccount?.name || (isTgDrive ? 'TG Drive' : selectedAccount?.email || 'Select Drive')}
               </span>
-              <ChevronDown size={16} className="text-[var(--sub)] shrink-0" />
+              <ChevronDown size={15} className="text-[var(--sub)] shrink-0" />
             </button>
           ) : (
             <div className="md:hidden flex items-center gap-2">
               <span className="w-8 h-8 rounded-xl bg-[#2563EB] text-white flex items-center justify-center">
                 <Cloud size={16} fill="currentColor" />
               </span>
-              <span className="text-sm font-extrabold text-[var(--tx)]">
+              <span className="text-sm font-semibold text-[var(--tx)]">
                 {isAdminPanelOpen ? 'Admin' : isSettingsOpen ? 'Settings' : 'Transfers'}
               </span>
             </div>
           )}
 
-          {/* Desktop Search Pill (hidden on dedicated sub-pages) */}
+          {/* Desktop Active Drive Identity Pill + Compact Search Bar */}
           {!isSettingsOpen && !isJobsDrawerOpen && !isAdminPanelOpen && (
-            <label className="hidden md:flex flex-1 max-w-[560px] h-14 rounded-[28px] bg-[var(--sf)] border border-[var(--bd)] items-center pl-5 pr-2.5 gap-3 text-[var(--sub)] focus-within:border-[#2563EB] transition-colors">
-              <Search size={20} className="shrink-0" />
-              <input
-                value={searchQuery}
-                onChange={e => setSearchQuery(e.target.value)}
-                placeholder={isTgDrive ? 'Search TG Drive files...' : 'Search in this drive'}
-                className="border-0 outline-0 flex-1 min-w-0 text-[15px] font-medium bg-transparent text-[var(--tx)] placeholder:text-[var(--sub)]"
-              />
-              {searchQuery && (
+            <div className="hidden md:flex items-center gap-2.5 flex-1 min-w-0 max-w-[740px]">
+              {accounts.length > 0 && (
                 <button
                   type="button"
-                  onClick={() => setSearchQuery('')}
-                  className="p-1.5 rounded-full hover:bg-[var(--bg)] text-[var(--sub)] hover:text-[var(--tx)]"
-                  aria-label="Clear search"
+                  onClick={() => setIsDrivesExpanded(prev => !prev)}
+                  className={`h-11 pl-2 pr-3 rounded-2xl border flex items-center gap-2 text-[13px] font-semibold transition-colors max-w-[220px] shrink-0 ${
+                    isDrivesExpanded
+                      ? 'bg-[var(--sel)] border-[#2563EB]/40 text-[var(--tx)]'
+                      : 'bg-[var(--sf)] border-[var(--bd)] text-[var(--tx)] hover:bg-[var(--hover)]'
+                  }`}
+                  title="Switch connected drive"
+                  aria-expanded={isDrivesExpanded}
                 >
-                  <X size={16} />
+                  {renderProviderBadge(selectedAccount?.accountType || 'google', 'sm')}
+                  <span className="truncate">
+                    {selectedAccount?.name || (isTgDrive ? 'TG Drive' : selectedAccount?.email || 'Select Drive')}
+                  </span>
+                  <ChevronDown
+                    size={14}
+                    className={`text-[var(--sub)] shrink-0 transition-transform duration-200 ${isDrivesExpanded ? 'rotate-180' : ''}`}
+                  />
                 </button>
               )}
-              <button
-                type="button"
-                onClick={() => setShowSearchFilters(prev => !prev)}
-                className={`w-9 h-9 rounded-full flex items-center justify-center transition-colors shrink-0 ${
-                  showSearchFilters || searchFilterType !== 'all'
-                    ? 'bg-[var(--pi)] text-[var(--pit)]'
-                    : 'text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--bg)]'
-                }`}
-                title="Filter by file type"
-                aria-label="Toggle type filters"
-                aria-pressed={showSearchFilters}
-              >
-                <SlidersHorizontal size={17} />
-              </button>
-            </label>
+
+              <label className="flex flex-1 min-w-0 h-11 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] items-center pl-3.5 pr-1.5 gap-2.5 text-[var(--sub)] focus-within:border-[#2563EB] transition-colors">
+                <Search size={17} className="shrink-0" />
+                <input
+                  value={searchQuery}
+                  onChange={e => setSearchQuery(e.target.value)}
+                  placeholder={isTgDrive ? 'Search TG Drive files...' : 'Search in this drive'}
+                  className="border-0 outline-0 flex-1 min-w-0 text-sm font-normal bg-transparent text-[var(--tx)] placeholder:text-[var(--sub)]"
+                />
+                {searchQuery && (
+                  <button
+                    type="button"
+                    onClick={() => setSearchQuery('')}
+                    className="p-1.5 rounded-xl hover:bg-[var(--hover)] text-[var(--sub)] hover:text-[var(--tx)]"
+                    aria-label="Clear search"
+                  >
+                    <X size={15} />
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setShowSearchFilters(prev => !prev)}
+                  className={`w-8 h-8 rounded-xl flex items-center justify-center transition-colors shrink-0 ${
+                    showSearchFilters || searchFilterType !== 'all'
+                      ? 'bg-[var(--pi)] text-[var(--pit)]'
+                      : 'text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--hover)]'
+                  }`}
+                  title="Filter by file type"
+                  aria-label="Toggle type filters"
+                  aria-pressed={showSearchFilters}
+                >
+                  <SlidersHorizontal size={15} />
+                </button>
+              </label>
+            </div>
           )}
 
-          <div className="ml-auto flex items-center gap-2.5 md:gap-3 shrink-0">
+          <div className="ml-auto flex items-center gap-2 md:gap-2.5 shrink-0">
             {/* Live Wavy Progress Pill (shown only during active upload or running transfers) */}
             {(uploadProgress || runningJobsCount > 0) && (
               <button
@@ -2736,10 +2933,10 @@ export default function App() {
                   setIsJobsDrawerOpen(true);
                   syncUrl({ page: 'jobs' });
                 }}
-                className="hidden sm:flex items-center gap-2.5 h-10 px-4 rounded-[20px] border border-[var(--bd)] bg-[var(--sf)] text-[13px] font-semibold text-[var(--tx)] hover:border-[#2563EB]/60 transition-colors tabular-nums whitespace-nowrap shrink-0"
+                className="hidden sm:flex items-center gap-2.5 h-9 px-3.5 rounded-2xl border border-[var(--bd)] bg-[var(--sf)] text-xs font-medium text-[var(--tx)] hover:border-[#2563EB]/60 transition-colors tabular-nums whitespace-nowrap shrink-0"
                 title="View active transfers and uploads"
               >
-                <svg width="48" height="12" viewBox="0 0 48 12" aria-hidden="true">
+                <svg width="44" height="10" viewBox="0 0 48 12" aria-hidden="true">
                   <path d="M2 6Q6 1 10 6T18 6T26 6T30 6" fill="none" stroke="#3B82F6" strokeWidth="3" strokeLinecap="round" />
                   <path d="M36 6H46" stroke="#64748B" strokeOpacity=".5" strokeWidth="3" strokeLinecap="round" />
                 </svg>
@@ -2759,7 +2956,7 @@ export default function App() {
                 className="md:hidden w-9 h-9 rounded-full bg-[var(--sf)] border border-[var(--bd)] text-[var(--sub)] flex items-center justify-center"
                 aria-label="Toggle search"
               >
-                {mobileSearchOpen ? <X size={18} /> : <Search size={18} />}
+                {mobileSearchOpen ? <X size={17} /> : <Search size={17} />}
               </button>
             )}
 
@@ -2767,10 +2964,10 @@ export default function App() {
             <button
               type="button"
               onClick={() => setIsDarkMode(!isDarkMode)}
-              className="w-9 h-9 md:w-10 md:h-10 rounded-full bg-[var(--sf)] border border-[var(--bd)] text-[var(--sub)] hover:text-[var(--tx)] flex items-center justify-center transition-colors shrink-0"
-              title={isDarkMode ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+              className="w-9 h-9 rounded-full bg-[var(--sf)] border border-[var(--bd)] text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--hover)] flex items-center justify-center transition-colors shrink-0"
+              title={isDarkMode ? 'Switch to light mode' : 'Switch to dark mode'}
             >
-              {isDarkMode ? <Sun size={18} /> : <Moon size={18} />}
+              {isDarkMode ? <Sun size={16} /> : <Moon size={16} />}
             </button>
 
             {/* Avatar Circle & Account Menu */}
@@ -2778,7 +2975,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setIsProfileMenuOpen(prev => !prev)}
-                className="w-9 h-9 md:w-10 md:h-10 rounded-full bg-[#2563EB] text-white text-[13px] md:text-sm font-extrabold flex items-center justify-center shadow-sm hover:opacity-90 transition-opacity shrink-0"
+                className="w-9 h-9 rounded-full bg-[#2563EB] text-white text-xs font-semibold flex items-center justify-center shadow-sm hover:opacity-90 transition-opacity shrink-0"
                 title={username ? `@${username}` : 'Account'}
               >
                 {userInitials}
@@ -2787,13 +2984,13 @@ export default function App() {
               {isProfileMenuOpen && (
                 <>
                   <div className="fixed inset-0 z-40" onClick={() => setIsProfileMenuOpen(false)} />
-                  <div className="absolute right-0 mt-2 w-60 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] shadow-2xl z-50 p-2 space-y-1">
+                  <div className="absolute right-0 mt-2 w-56 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] shadow-xl z-50 p-1.5 space-y-0.5">
                     <div className="px-3 py-2.5 border-b border-[var(--bd)]">
-                      <p className="text-sm font-extrabold text-[var(--tx)] truncate">
+                      <p className="text-sm font-semibold text-[var(--tx)] truncate">
                         {username ? `@${username}` : 'Account'}
                       </p>
-                      <p className="text-[11px] font-semibold text-[var(--sub)] uppercase tracking-wider mt-0.5">
-                        {isAdmin ? 'Administrator' : 'Cloudyte Member'}
+                      <p className="text-xs font-medium text-[var(--sub)] mt-0.5">
+                        {isAdmin ? 'Administrator' : 'Cloudyte member'}
                       </p>
                     </div>
                     <button
@@ -2806,9 +3003,9 @@ export default function App() {
                         setIsSettingsOpen(true);
                         syncUrl({ page: 'settings', settingsTab: 'general' });
                       }}
-                      className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-sm font-semibold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"
+                      className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-[13px] font-medium text-[var(--tx)] hover:bg-[var(--hover)] transition-colors"
                     >
-                      <Settings size={16} className="text-[var(--sub)]" />
+                      <Settings size={15} className="text-[var(--sub)]" />
                       <span>Settings</span>
                     </button>
                     <button
@@ -2821,10 +3018,10 @@ export default function App() {
                         window.history.replaceState(null, '', '/login');
                         window.location.reload();
                       }}
-                      className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-sm font-semibold text-rose-500 hover:bg-rose-500/10 transition-colors"
+                      className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-[13px] font-medium text-rose-500 hover:bg-rose-500/10 transition-colors"
                     >
-                      <LogOut size={16} />
-                      <span>Log Out</span>
+                      <LogOut size={15} />
+                      <span>Sign out</span>
                     </button>
                   </div>
                 </>
@@ -3109,8 +3306,8 @@ export default function App() {
                     <Settings size={20} />
                   </div>
                   <div>
-                    <h1 className="text-xl sm:text-2xl font-black text-[var(--tx)] tracking-tight">Settings</h1>
-                    <p className="text-xs sm:text-sm text-[var(--sub)] font-medium">Manage preferences, active sessions, access tokens, and shared links</p>
+                    <h1 className="text-xl sm:text-2xl font-bold text-[var(--tx)] tracking-tight">Settings</h1>
+                    <p className="text-xs sm:text-sm text-[var(--sub)]">Manage preferences, active sessions, access tokens, and shared links</p>
                   </div>
                 </div>
               </div>
@@ -3150,9 +3347,9 @@ export default function App() {
                     onToast={showToast}
                   />
                 ) : !userProfile ? (
-                  <div className="flex flex-col items-center justify-center p-12 space-y-4 bg-[var(--sf)] border border-[var(--bd)] rounded-[24px]">
-                    <RefreshCw size={24} className="animate-spin text-blue-500" />
-                    <p className="text-xs font-bold text-[var(--sub)]">Loading profile...</p>
+                  <div className="flex flex-col items-center justify-center p-12 space-y-4 bg-[var(--sf)] border border-[var(--bd)] rounded-2xl">
+                    <RefreshCw size={22} className="animate-spin text-blue-500" />
+                    <p className="text-xs font-medium text-[var(--sub)]">Loading profile...</p>
                   </div>
                 ) : (
                   <div className="space-y-6">
@@ -3166,105 +3363,171 @@ export default function App() {
                           setIsAdminPanelOpen(true);
                           syncUrl({ page: 'admin', adminTab: 'overview', adminUserId: null });
                         }}
-                        className="p-5 sm:p-6 bg-[var(--sf)] border border-[var(--bd)] hover:border-[#2563EB] rounded-[24px] flex items-center justify-between gap-4 cursor-pointer transition-colors group"
+                        className="p-5 sm:p-6 bg-[var(--sf)] border border-[var(--bd)] hover:border-[#2563EB] rounded-2xl flex items-center justify-between gap-4 cursor-pointer transition-colors group"
                       >
                         <div className="flex items-center gap-4 min-w-0">
-                          <div className="w-12 h-12 rounded-2xl bg-blue-600 text-white flex items-center justify-center shadow-lg shadow-blue-600/20 shrink-0">
-                            <Shield size={22} />
+                          <div className="w-11 h-11 rounded-2xl bg-blue-600 text-white flex items-center justify-center shadow-sm shrink-0">
+                            <Shield size={20} />
                           </div>
                           <div className="min-w-0">
                             <div className="flex items-center gap-2">
-                              <h2 className="text-base font-extrabold text-[var(--tx)]">Admin Control Center</h2>
-                              <span className="px-2 py-0.5 rounded-full bg-[var(--pi)] text-[var(--pit)] text-[10px] font-black uppercase tracking-wider">Admin</span>
+                              <h2 className="text-[15px] font-semibold text-[var(--tx)]">Admin Control Center</h2>
+                              <span className="px-2 py-0.5 rounded-full bg-[var(--pi)] text-[var(--pit)] text-[11px] font-semibold">Admin</span>
                             </div>
-                            <p className="text-xs text-[var(--sub)] font-medium mt-0.5 truncate">
+                            <p className="text-xs text-[var(--sub)] mt-0.5 truncate">
                               Manage users, registration permissions, system metrics &amp; audit logs
                             </p>
                           </div>
                         </div>
-                        <span className="h-9 px-4 rounded-[18px] bg-[var(--pi)] text-[var(--pit)] text-xs font-bold flex items-center gap-1.5 shrink-0 group-hover:opacity-90">
+                        <span className="h-9 px-3.5 rounded-xl bg-[var(--pi)] text-[var(--pit)] text-xs font-semibold flex items-center gap-1 shrink-0 group-hover:opacity-90">
                           <span>Open</span>
                           <ChevronRight size={15} />
                         </span>
                       </div>
                     )}
 
-                    <div className="space-y-3">
-                      <h3 className="text-[11px] font-black uppercase text-[var(--sub)] tracking-[0.18em] px-1">Identity &amp; Access</h3>
-                      <div className="p-5 sm:p-6 bg-[var(--sf)] border border-[var(--bd)] rounded-[24px] space-y-4">
-                        <div className="flex items-center gap-4">
-                          <div className="w-12 h-12 bg-[#2563EB] rounded-2xl flex items-center justify-center text-white font-black text-xl shadow-lg shadow-blue-600/20">
+                    <div className="space-y-2.5">
+                      <h3 className="text-xs font-semibold text-[var(--sub)] px-1">Identity &amp; access</h3>
+                      <div className="p-5 sm:p-6 bg-[var(--sf)] border border-[var(--bd)] rounded-2xl space-y-4">
+                        <div className="flex items-center gap-3.5">
+                          <div className="w-11 h-11 bg-[#2563EB] rounded-2xl flex items-center justify-center text-white font-bold text-lg">
                             {userProfile?.username?.[0]?.toUpperCase()}
                           </div>
                           <div>
-                            <p className="text-sm font-black text-[var(--tx)]">@{userProfile?.username}</p>
-                            <p className="text-[10px] text-[var(--sub)] font-bold uppercase tracking-wider">Cloudyte ID</p>
+                            <p className="text-sm font-semibold text-[var(--tx)]">@{userProfile?.username}</p>
+                            <p className="text-xs text-[var(--sub)]">Cloudyte ID</p>
                           </div>
                         </div>
 
-                        <div className="pt-4 border-t border-[var(--bd)] space-y-3">
-                          <p className="text-[10px] font-black text-[var(--sub)] uppercase tracking-widest">Linked Telegram accounts</p>
+                        <div className="pt-4 border-t border-[var(--bd)] space-y-2.5">
+                          <p className="text-xs font-medium text-[var(--sub)]">Linked Telegram accounts</p>
                           <div className="flex flex-wrap gap-2">
                             {userProfile?.tgIds?.length > 0 ? (
                               userProfile.tgIds.map((tid: string) => (
-                                <span key={tid} className="px-3 py-1 bg-[var(--pi)] text-[var(--pit)] text-[10px] font-black rounded-lg">
+                                <span key={tid} className="px-2.5 py-1 bg-[var(--pi)] text-[var(--pit)] text-xs font-mono font-medium rounded-lg">
                                   ID: {tid}
                                 </span>
                               ))
                             ) : (
-                              <p className="text-xs text-[var(--sub)] font-medium italic">No Telegram accounts linked</p>
+                              <p className="text-xs text-[var(--sub)]">No Telegram accounts linked</p>
                             )}
                           </div>
-                          <div className="bg-[var(--bg)] p-3.5 rounded-2xl border border-[var(--bd)]">
-                            <p className="text-xs text-[var(--sub)] font-semibold">To link/unlink Telegram, use the bot's /login and /logout commands.</p>
+                          <div className="bg-[var(--bg)] p-3 rounded-xl border border-[var(--bd)]">
+                            <p className="text-xs text-[var(--sub)]">To link or unlink Telegram, use the bot's <span className="font-mono text-[var(--tx)]">/login</span> and <span className="font-mono text-[var(--tx)]">/logout</span> commands.</p>
                           </div>
                         </div>
                       </div>
                     </div>
 
-                    <div className="space-y-3">
-                      <h3 className="text-[11px] font-black uppercase text-[var(--sub)] tracking-[0.18em] px-1">Appearance &amp; Behavior</h3>
-                      <div className="flex items-center justify-between p-5 bg-[var(--sf)] border border-[var(--bd)] rounded-[24px]">
+                    <div className="space-y-2.5">
+                      <h3 className="text-xs font-semibold text-[var(--sub)] px-1">Appearance &amp; behavior</h3>
+                      <div className="flex items-center justify-between p-5 bg-[var(--sf)] border border-[var(--bd)] rounded-2xl">
                         <div className="flex items-center gap-3">
-                          <div className="w-10 h-10 bg-purple-500/15 rounded-xl flex items-center justify-center text-purple-500"><Eye size={20} /></div>
+                          <div className="w-10 h-10 bg-purple-500/12 rounded-xl flex items-center justify-center text-purple-500"><Eye size={18} /></div>
                           <div>
-                            <p className="text-sm font-bold text-[var(--tx)]">Image Thumbnails</p>
+                            <p className="text-sm font-semibold text-[var(--tx)]">Image thumbnails</p>
                             <p className="text-xs text-[var(--sub)]">Show inline previews for image files</p>
                           </div>
                         </div>
-                        <button type="button" onClick={() => updateUserSettings({ showThumbnails: !(userSettings?.showThumbnails ?? true) })} className={`w-12 h-6 rounded-full transition-all relative ${(userSettings?.showThumbnails ?? true) ? 'bg-purple-600' : 'bg-slate-300 dark:bg-slate-700'}`}>
-                          <div className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-all ${(userSettings?.showThumbnails ?? true) ? 'left-7' : 'left-1'}`} />
+                        <button type="button" onClick={() => updateUserSettings({ showThumbnails: !(userSettings?.showThumbnails ?? true) })} className={`w-11 h-6 rounded-full transition-all relative ${(userSettings?.showThumbnails ?? true) ? 'bg-purple-600' : 'bg-slate-300 dark:bg-slate-700'}`}>
+                          <div className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-all ${(userSettings?.showThumbnails ?? true) ? 'left-6' : 'left-1'}`} />
                         </button>
                       </div>
                     </div>
 
-                    <div className="space-y-3">
-                      <h3 className="text-[11px] font-black uppercase text-[var(--sub)] tracking-[0.18em] px-1">Sync &amp; Automation</h3>
-                      <div className="p-5 bg-[var(--sf)] border border-[var(--bd)] rounded-[24px] space-y-4">
+                    <div className="space-y-2.5">
+                      <h3 className="text-xs font-semibold text-[var(--sub)] px-1">Sync &amp; automation</h3>
+                      <div className="p-5 bg-[var(--sf)] border border-[var(--bd)] rounded-2xl space-y-4">
                         <div className="flex items-center justify-between">
                           <div className="flex items-center gap-3">
-                            <div className="w-10 h-10 bg-blue-500/15 rounded-xl flex items-center justify-center text-blue-500"><RefreshCw size={20} /></div>
+                            <div className="w-10 h-10 bg-blue-500/12 rounded-xl flex items-center justify-center text-blue-500"><RefreshCw size={18} /></div>
                             <div>
-                              <p className="text-sm font-bold text-[var(--tx)]">Auto-Mirror (Backup)</p>
-                              <p className="text-xs text-[var(--sub)]">Mirror bot uploads to backup drive</p>
+                              <p className="text-sm font-semibold text-[var(--tx)]">Auto-mirror backup</p>
+                              <p className="text-xs text-[var(--sub)]">Mirror bot uploads to a backup drive</p>
                             </div>
                           </div>
-                          <button type="button" onClick={() => updateUserSettings({ backupEnabled: !userSettings?.backupEnabled })} className={`w-12 h-6 rounded-full transition-all relative ${userSettings?.backupEnabled ? 'bg-blue-600' : 'bg-slate-300 dark:bg-slate-700'}`}>
-                            <div className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-all ${userSettings?.backupEnabled ? 'left-7' : 'left-1'}`} />
+                          <button type="button" onClick={() => updateUserSettings({ backupEnabled: !userSettings?.backupEnabled })} className={`w-11 h-6 rounded-full transition-all relative ${userSettings?.backupEnabled ? 'bg-[#2563EB]' : 'bg-slate-300 dark:bg-slate-700'}`}>
+                            <div className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-all ${userSettings?.backupEnabled ? 'left-6' : 'left-1'}`} />
                           </button>
                         </div>
-                        <div className="space-y-2 pt-2 border-t border-[var(--bd)]">
-                          <label className="text-xs font-bold text-[var(--sub)] px-1">Backup Account</label>
-                          <select value={userSettings?.backupAccId || ''} onChange={e => updateUserSettings({ backupAccId: e.target.value })} className="w-full bg-[var(--bg)] border border-[var(--bd)] p-3.5 rounded-2xl text-sm font-bold text-[var(--tx)] outline-none focus:border-[#2563EB]">
-                            <option value="">Select Backup Account</option>
-                            {accounts.map(acc => <option key={acc.id} value={acc.id}>{acc.accountType === 'tgdrive' ? `📡 TG Drive (${acc.channelId})` : acc.email}</option>)}
-                          </select>
+                        <div className="space-y-1.5 pt-3 border-t border-[var(--bd)]">
+                          <span className="block text-xs font-medium text-[var(--sub)] px-0.5">Backup destination</span>
+                          {(() => {
+                            const selectedBackup = accounts.find(a => a.id === userSettings?.backupAccId);
+                            const selectedLabel = selectedBackup
+                              ? (selectedBackup.name || (selectedBackup.accountType === 'tgdrive' ? `TG Drive (${selectedBackup.channelId})` : selectedBackup.email))
+                              : 'Select a backup drive';
+                            return (
+                              <div className="relative">
+                                <button
+                                  type="button"
+                                  onClick={() => setIsBackupDropdownOpen(prev => !prev)}
+                                  className="w-full h-11 px-3.5 rounded-xl bg-[var(--bg)] border border-[var(--bd)] hover:border-[var(--sub)]/50 flex items-center justify-between gap-2 text-sm text-[var(--tx)] transition-colors"
+                                >
+                                  <span className="flex items-center gap-2.5 min-w-0">
+                                    {selectedBackup && renderProviderBadge(selectedBackup.accountType, 'sm')}
+                                    <span className={`truncate ${selectedBackup ? 'font-medium text-[var(--tx)]' : 'text-[var(--sub)]'}`}>
+                                      {selectedLabel}
+                                    </span>
+                                  </span>
+                                  <ChevronDown size={15} className={`text-[var(--sub)] shrink-0 transition-transform ${isBackupDropdownOpen ? 'rotate-180' : ''}`} />
+                                </button>
+                                {isBackupDropdownOpen && (
+                                  <>
+                                    <div className="fixed inset-0 z-40" onClick={() => setIsBackupDropdownOpen(false)} />
+                                    <div className="absolute left-0 right-0 mt-1.5 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] shadow-xl z-50 p-1.5 max-h-60 overflow-y-auto space-y-0.5">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          updateUserSettings({ backupAccId: '' });
+                                          setIsBackupDropdownOpen(false);
+                                        }}
+                                        className={`w-full flex items-center justify-between gap-2 px-3 py-2 rounded-xl text-xs font-medium transition-colors ${
+                                          !userSettings?.backupAccId
+                                            ? 'bg-[var(--sel)] text-[var(--tx)]'
+                                            : 'text-[var(--sub)] hover:bg-[var(--hover)] hover:text-[var(--tx)]'
+                                        }`}
+                                      >
+                                        <span>None (disabled)</span>
+                                        {!userSettings?.backupAccId && <Check size={14} className="text-[#2563EB]" />}
+                                      </button>
+                                      {accounts.map(acc => {
+                                        const isActive = userSettings?.backupAccId === acc.id;
+                                        const label = acc.name || (acc.accountType === 'tgdrive' ? `TG Drive (${acc.channelId})` : acc.email);
+                                        return (
+                                          <button
+                                            key={acc.id}
+                                            type="button"
+                                            onClick={() => {
+                                              updateUserSettings({ backupAccId: acc.id });
+                                              setIsBackupDropdownOpen(false);
+                                            }}
+                                            className={`w-full flex items-center justify-between gap-2.5 px-3 py-2 rounded-xl text-xs font-medium transition-colors ${
+                                              isActive
+                                                ? 'bg-[var(--sel)] text-[var(--tx)]'
+                                                : 'text-[var(--tx)] hover:bg-[var(--hover)]'
+                                            }`}
+                                          >
+                                            <span className="flex items-center gap-2.5 min-w-0">
+                                              {renderProviderBadge(acc.accountType, 'sm')}
+                                              <span className="truncate">{label}</span>
+                                            </span>
+                                            {isActive && <Check size={14} className="text-[#2563EB] shrink-0" />}
+                                          </button>
+                                        );
+                                      })}
+                                    </div>
+                                  </>
+                                )}
+                              </div>
+                            );
+                          })()}
                         </div>
                       </div>
                     </div>
 
-                    <div className="space-y-3">
-                      <h3 className="text-[11px] font-black uppercase text-[var(--sub)] tracking-[0.18em] px-1">Connected Accounts</h3>
+                    <div className="space-y-2.5">
+                      <h3 className="text-xs font-semibold text-[var(--sub)] px-1">Connected accounts</h3>
                       <div className="space-y-3">
                         {accounts.map(acc => {
                           const isMenuOpen = openAccountMenuId === acc.id;
@@ -3391,14 +3654,16 @@ export default function App() {
               }}
             />
           ) : loading && accounts.length === 0 ? (
-            <div className="space-y-6">
-              <div className="h-12 w-72 bg-[var(--sf)] border border-[var(--bd)] rounded-[24px] animate-pulse" />
-              <div className="space-y-1">
-                {[...Array(8)].map((_, i) => (
-                  <div
-                    key={i}
-                    className={`h-16 bg-[var(--sf)] border border-[var(--bd)] animate-pulse ${getRowRadiusClass(i, 8)}`}
-                  />
+            <div className="space-y-4 pt-1">
+              <div className="h-8 w-44 bg-[var(--sf)] border border-[var(--bd)] rounded-xl animate-pulse" />
+              <div className="rounded-2xl bg-[var(--sf)] border border-[var(--bd)] divide-y divide-[var(--bd)]/60 overflow-hidden">
+                {[...Array(7)].map((_, i) => (
+                  <div key={i} className="h-[52px] px-4 flex items-center gap-4">
+                    <div className="w-8 h-8 rounded-lg bg-[var(--bg)] animate-pulse shrink-0" />
+                    <div className="h-3.5 rounded-md bg-[var(--bg)] animate-pulse flex-1 max-w-[260px]" />
+                    <div className="hidden md:block h-3 w-20 rounded-md bg-[var(--bg)] animate-pulse ml-auto" />
+                    <div className="hidden md:block h-3 w-14 rounded-md bg-[var(--bg)] animate-pulse" />
+                  </div>
                 ))}
               </div>
             </div>
@@ -3408,10 +3673,10 @@ export default function App() {
                 <div className="w-16 h-16 rounded-[22px] bg-[#2563EB] text-white flex items-center justify-center mx-auto shadow-xl shadow-blue-600/25">
                   <Cloud size={32} fill="currentColor" />
                 </div>
-                <h1 className="text-2xl sm:text-3xl font-black text-[var(--tx)] tracking-tight">
+                <h1 className="text-2xl sm:text-3xl font-bold text-[var(--tx)] tracking-tight">
                   Welcome to Cloudyte
                 </h1>
-                <p className="text-sm text-[var(--sub)] font-medium max-w-md mx-auto leading-relaxed">
+                <p className="text-sm text-[var(--sub)] max-w-md mx-auto leading-relaxed">
                   Connect your first cloud storage drive to browse, preview, upload, and transfer files across providers from one workspace.
                 </p>
               </div>
@@ -3451,7 +3716,7 @@ export default function App() {
                     >
                       {opt.badge}
                       <div className="flex-1 min-w-0">
-                        <p className="text-sm font-extrabold text-[var(--tx)]">{opt.title}</p>
+                        <p className="text-sm font-semibold text-[var(--tx)]">{opt.title}</p>
                         <p className="text-xs text-[var(--sub)] truncate mt-0.5">{opt.subtitle}</p>
                       </div>
                       <span
@@ -3480,7 +3745,7 @@ export default function App() {
                         syncUrl({ modal: 'tg-drive' });
                       }
                     }}
-                    className="w-full h-12 rounded-[24px] bg-[#2563EB] hover:bg-blue-700 text-white text-sm font-bold flex items-center justify-center gap-2 shadow-lg shadow-blue-600/20 active:scale-[0.99] transition-all"
+                    className="w-full h-11 rounded-2xl bg-[#2563EB] hover:bg-blue-700 text-white text-sm font-semibold flex items-center justify-center gap-2 shadow-sm active:scale-[0.99] transition-all"
                   >
                     <span>
                       {welcomeProvider === 'google'
@@ -3495,10 +3760,15 @@ export default function App() {
               </div>
             </div>
           ) : (
-            <div className="space-y-4">
+            <div
+              className="space-y-3.5"
+              onClick={(e) => {
+                if (e.target === e.currentTarget) setFocusedFileId(null);
+              }}
+            >
               {/* Breadcrumbs & Toolbar */}
               <div className="flex flex-wrap items-center gap-2">
-                <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar max-w-full py-1">
+                <div className="flex items-center gap-1 overflow-x-auto no-scrollbar max-w-full py-1">
                   {path.map((item, idx) => {
                     const isLast = !isTrashView && idx === path.length - 1;
                     return (
@@ -3508,15 +3778,15 @@ export default function App() {
                           onClick={() => {
                             navigateUp(idx);
                           }}
-                          className={`flex items-center gap-2 py-1 px-1 text-[15px] md:text-base whitespace-nowrap shrink-0 transition-colors ${
+                          className={`flex items-center gap-2 py-1 px-1.5 rounded-lg text-[15px] whitespace-nowrap shrink-0 transition-colors ${
                             isLast
-                              ? 'text-[var(--tx)] font-extrabold'
-                              : 'font-semibold text-[var(--sub)] hover:text-[var(--tx)]'
+                              ? 'text-[var(--tx)] font-semibold'
+                              : 'font-medium text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--hover)]'
                           }`}
                         >
                           {idx === 0 && (
                             <Folder
-                              size={19}
+                              size={18}
                               className={isLast ? 'text-[#2563EB] shrink-0' : 'text-[var(--sub)] shrink-0'}
                               fill={isLast ? 'currentColor' : 'none'}
                             />
@@ -3524,58 +3794,170 @@ export default function App() {
                           <span>{idx === 0 ? 'Files' : item.name}</span>
                         </button>
                         {idx < path.length - 1 && (
-                          <ChevronRight size={16} className="text-[var(--sub)] shrink-0" />
+                          <ChevronRight size={15} className="text-[var(--sub)] shrink-0" />
                         )}
                       </React.Fragment>
                     );
                   })}
                   {isTrashView && (
                     <>
-                      <ChevronRight size={16} className="text-[var(--sub)] shrink-0" />
-                      <span className="flex items-center gap-1.5 py-1 px-1 text-[15px] md:text-base font-extrabold text-rose-500 whitespace-nowrap shrink-0">
-                        <Trash2 size={16} />
+                      <ChevronRight size={15} className="text-[var(--sub)] shrink-0" />
+                      <span className="flex items-center gap-1.5 py-1 px-1.5 text-[15px] font-semibold text-rose-500 whitespace-nowrap shrink-0">
+                        <Trash2 size={15} />
                         <span>Trash</span>
                       </span>
                     </>
                   )}
                 </div>
 
-                <div className="ml-auto flex items-center gap-1.5 shrink-0">
+                <div className="ml-auto flex items-center gap-1 shrink-0">
+                  {/* Sort Menu (works for both List & Grid views) */}
+                  <div className="relative">
+                    <button
+                      type="button"
+                      onClick={() => setIsSortMenuOpen(prev => !prev)}
+                      className={`h-9 px-2.5 rounded-xl flex items-center gap-1.5 text-xs font-medium transition-colors ${
+                        isSortMenuOpen
+                          ? 'bg-[var(--pi)] text-[var(--pit)]'
+                          : 'text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--sf)]'
+                      }`}
+                      title="Sort files"
+                      aria-expanded={isSortMenuOpen}
+                    >
+                      {sortOrder === 'asc' ? <ArrowUp size={14} /> : <ArrowDown size={14} />}
+                      <span className="hidden sm:inline capitalize">{sortBy}</span>
+                      <ChevronDown size={13} className="opacity-70" />
+                    </button>
+                    {isSortMenuOpen && (
+                      <>
+                        <div className="fixed inset-0 z-40" onClick={() => setIsSortMenuOpen(false)} />
+                        <div className="absolute right-0 mt-1.5 w-44 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] shadow-xl z-50 p-1.5 space-y-0.5">
+                          <div className="px-2.5 py-1 text-[11px] font-medium text-[var(--sub)]">Sort by</div>
+                          {(
+                            [
+                              { id: 'name', label: 'Name' },
+                              { id: 'modified', label: 'Modified' },
+                              { id: 'size', label: 'Size' },
+                            ] as const
+                          ).map((opt) => (
+                            <button
+                              key={opt.id}
+                              type="button"
+                              onClick={() => {
+                                setSortBy(opt.id);
+                                setIsSortMenuOpen(false);
+                              }}
+                              className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-xl text-xs font-medium transition-colors ${
+                                sortBy === opt.id
+                                  ? 'bg-[var(--sel)] text-[var(--tx)]'
+                                  : 'text-[var(--tx)] hover:bg-[var(--hover)]'
+                              }`}
+                            >
+                              <span>{opt.label}</span>
+                              {sortBy === opt.id && <Check size={13} className="text-[#2563EB]" />}
+                            </button>
+                          ))}
+                          <div className="my-1 border-t border-[var(--bd)]" />
+                          <div className="px-2.5 py-1 text-[11px] font-medium text-[var(--sub)]">Direction</div>
+                          {(
+                            [
+                              { id: 'asc', label: 'Ascending', icon: <ArrowUp size={12} /> },
+                              { id: 'desc', label: 'Descending', icon: <ArrowDown size={12} /> },
+                            ] as const
+                          ).map((dir) => (
+                            <button
+                              key={dir.id}
+                              type="button"
+                              onClick={() => {
+                                setSortOrder(dir.id);
+                                setIsSortMenuOpen(false);
+                              }}
+                              className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-xl text-xs font-medium transition-colors ${
+                                sortOrder === dir.id
+                                  ? 'bg-[var(--sel)] text-[var(--tx)]'
+                                  : 'text-[var(--tx)] hover:bg-[var(--hover)]'
+                              }`}
+                            >
+                              <span className="flex items-center gap-1.5">
+                                {dir.icon}
+                                <span>{dir.label}</span>
+                              </span>
+                              {sortOrder === dir.id && <Check size={13} className="text-[#2563EB]" />}
+                            </button>
+                          ))}
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                  {/* Single Grid / List View Toggle */}
                   <button
                     type="button"
                     onClick={() => setViewMode(prev => (prev === 'list' ? 'grid' : 'list'))}
-                    className="w-10 h-10 rounded-[20px] flex items-center justify-center text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--sf)] transition-colors"
-                    title={viewMode === 'list' ? 'Switch to Grid View' : 'Switch to List View'}
-                    aria-label={viewMode === 'list' ? 'Switch to Grid View' : 'Switch to List View'}
+                    className="w-9 h-9 rounded-xl flex items-center justify-center text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--sf)] transition-colors"
+                    title={viewMode === 'list' ? 'Switch to grid view' : 'Switch to list view'}
+                    aria-label={viewMode === 'list' ? 'Switch to grid view' : 'Switch to list view'}
                   >
-                    {viewMode === 'list' ? <LayoutGrid size={20} /> : <ListIcon size={20} />}
+                    {viewMode === 'list' ? <LayoutGrid size={18} /> : <ListIcon size={18} />}
                   </button>
+
+                  {/* Details Inspector Toggle */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (selectedFile) {
+                        openFileInspector(null);
+                        return;
+                      }
+                      const candidate =
+                        displayedFiles.find(f => f.id === focusedFileId) ||
+                        displayedFiles.find(f => selectedFileIds.has(f.id)) ||
+                        null;
+                      if (candidate) {
+                        openFileInspector(candidate);
+                      } else {
+                        showToast('Select a file to view its details');
+                      }
+                    }}
+                    className={`w-9 h-9 rounded-xl flex items-center justify-center transition-colors ${
+                      selectedFile
+                        ? 'bg-[var(--pi)] text-[var(--pit)]'
+                        : 'text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--sf)]'
+                    }`}
+                    title={selectedFile ? 'Hide details' : 'View details'}
+                    aria-label={selectedFile ? 'Hide details' : 'View details'}
+                    aria-pressed={Boolean(selectedFile)}
+                  >
+                    <Info size={17} />
+                  </button>
+
                   <button
                     type="button"
                     onClick={() => selectedAccountId && fetchFiles(selectedAccountId, currentFolderId, searchQuery, isTrashView)}
-                    className="w-10 h-10 rounded-[20px] flex items-center justify-center text-[var(--sub)] hover:bg-[var(--sf)] transition-colors"
+                    className="w-9 h-9 rounded-xl flex items-center justify-center text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--sf)] transition-colors"
                     title="Refresh"
                     aria-label="Refresh"
                   >
-                    <RefreshCw size={18} className={loading ? 'animate-spin' : ''} />
+                    <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
                   </button>
+
                   {isTrashView ? (
                     <div className="flex items-center gap-1.5 ml-1">
                       <button
                         type="button"
                         onClick={() => toggleTrashView(false)}
-                        className="h-10 px-4 rounded-[20px] bg-[var(--tonal)] text-[var(--tonalt)] text-sm font-bold flex items-center gap-2 hover:opacity-90 transition-opacity whitespace-nowrap shrink-0"
+                        className="h-9 px-3.5 rounded-xl bg-[var(--tonal)] text-[var(--tonalt)] text-xs font-semibold flex items-center gap-1.5 hover:opacity-90 transition-opacity whitespace-nowrap shrink-0"
                       >
-                        <ArrowLeft size={16} />
+                        <ArrowLeft size={15} />
                         <span className="hidden sm:inline">Back to Drive</span>
                       </button>
                       {files.length > 0 && (
                         <button
                           type="button"
                           onClick={handleEmptyTrash}
-                          className="h-10 px-4 rounded-[20px] bg-rose-600 text-white text-sm font-bold flex items-center gap-2 hover:bg-rose-700 transition-colors whitespace-nowrap shrink-0"
+                          className="h-9 px-3.5 rounded-xl bg-rose-600 text-white text-xs font-semibold flex items-center gap-1.5 hover:bg-rose-700 transition-colors whitespace-nowrap shrink-0"
                         >
-                          <Trash2 size={16} />
+                          <Trash2 size={15} />
                           <span>Empty Trash</span>
                         </button>
                       )}
@@ -3584,9 +3966,9 @@ export default function App() {
                     <button
                       type="button"
                       onClick={handleCreateFolder}
-                      className="h-10 px-4 md:px-5 rounded-[20px] bg-[var(--tonal)] text-[var(--tonalt)] text-sm font-bold flex items-center gap-2 ml-1 hover:opacity-90 transition-opacity whitespace-nowrap shrink-0"
+                      className="h-9 px-3.5 md:px-4 rounded-xl bg-[var(--tonal)] text-[var(--tonalt)] text-xs font-semibold flex items-center gap-1.5 ml-1 hover:opacity-90 transition-opacity whitespace-nowrap shrink-0"
                     >
-                      <FolderPlus size={18} />
+                      <FolderPlus size={16} />
                       <span className="hidden sm:inline">New folder</span>
                     </button>
                   )}
@@ -3595,7 +3977,7 @@ export default function App() {
 
               {/* Lightweight Search Type Filter Chips */}
               {(showSearchFilters || searchFilterType !== 'all') && (
-                <div className="flex items-center gap-2 overflow-x-auto no-scrollbar pb-1">
+                <div className="flex items-center gap-2 overflow-x-auto no-scrollbar pb-0.5">
                   {[
                     { id: 'all', label: 'All' },
                     { id: 'folder', label: 'Folders' },
@@ -3610,13 +3992,13 @@ export default function App() {
                         key={chip.id}
                         type="button"
                         onClick={() => setSearchFilterType(chip.id as any)}
-                        className={`h-8 px-3.5 rounded-[14px] text-xs font-bold flex items-center gap-1.5 border transition-colors whitespace-nowrap shrink-0 ${
+                        className={`h-8 px-3 rounded-xl text-xs font-medium flex items-center gap-1.5 border transition-colors whitespace-nowrap shrink-0 ${
                           isActive
                             ? 'bg-[var(--pi)] text-[var(--pit)] border-transparent'
                             : 'bg-[var(--sf)] text-[var(--sub)] border-[var(--bd)] hover:text-[var(--tx)]'
                         }`}
                       >
-                        {isActive && <Check size={13} strokeWidth={2.75} />}
+                        {isActive && <Check size={13} strokeWidth={2.5} />}
                         <span>{chip.label}</span>
                       </button>
                     );
@@ -3628,7 +4010,7 @@ export default function App() {
                         setSearchFilterType('all');
                         setSearchQuery('');
                       }}
-                      className="h-8 px-2.5 rounded-[14px] text-xs font-semibold text-[var(--sub)] hover:text-[var(--tx)] whitespace-nowrap shrink-0"
+                      className="h-8 px-2.5 rounded-xl text-xs font-medium text-[var(--sub)] hover:text-[var(--tx)] whitespace-nowrap shrink-0"
                     >
                       Reset
                     </button>
@@ -3638,16 +4020,16 @@ export default function App() {
 
               {/* Inline Non-Blocking Account & Storage Alert Banners */}
               {!isTrashView && selectedAccount?.error && (
-                <div className="rounded-[20px] px-4 py-3 bg-rose-500/12 border border-rose-500/30 text-rose-600 dark:text-rose-400 flex flex-wrap items-center justify-between gap-3">
+                <div className="rounded-2xl px-4 py-3 bg-rose-500/10 border border-rose-500/25 text-rose-600 dark:text-rose-400 flex flex-wrap items-center justify-between gap-3">
                   <div className="flex items-center gap-3 min-w-0">
                     <span className="w-8 h-8 rounded-xl bg-rose-500/15 flex items-center justify-center shrink-0">
-                      <AlertTriangle size={17} />
+                      <AlertTriangle size={16} />
                     </span>
                     <div className="min-w-0">
-                      <p className="text-xs sm:text-sm font-extrabold truncate">
+                      <p className="text-xs sm:text-sm font-semibold truncate">
                         {selectedAccount.name || selectedAccount.email || 'This drive'} needs to reconnect
                       </p>
-                      <p className="text-[11px] opacity-85 truncate">
+                      <p className="text-xs opacity-85 truncate">
                         Refresh authorization to continue browsing and uploading files.
                       </p>
                     </div>
@@ -3662,7 +4044,7 @@ export default function App() {
                         handleConnect(selectedAccount.accountType === 'onedrive' ? 'onedrive' : 'google');
                       }
                     }}
-                    className="h-8 px-3.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold shrink-0 transition-colors"
+                    className="h-8 px-3.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold shrink-0 transition-colors"
                   >
                     Reconnect
                   </button>
@@ -3670,16 +4052,16 @@ export default function App() {
               )}
 
               {!isTrashView && !selectedAccount?.error && selectedAccount?.accountType !== 'tgdrive' && Number(selectedAccount?.percentage || 0) >= 90 && (
-                <div className="rounded-[20px] px-4 py-3 bg-amber-500/12 border border-amber-500/30 text-amber-700 dark:text-amber-300 flex flex-wrap items-center justify-between gap-3">
+                <div className="rounded-2xl px-4 py-3 bg-amber-500/10 border border-amber-500/25 text-amber-700 dark:text-amber-300 flex flex-wrap items-center justify-between gap-3">
                   <div className="flex items-center gap-3 min-w-0">
                     <span className="w-8 h-8 rounded-xl bg-amber-500/15 flex items-center justify-center shrink-0">
-                      <AlertTriangle size={17} />
+                      <AlertTriangle size={16} />
                     </span>
                     <div className="min-w-0">
-                      <p className="text-xs sm:text-sm font-extrabold truncate">
+                      <p className="text-xs sm:text-sm font-semibold truncate">
                         {selectedAccount.name || selectedAccount.email} is {selectedAccount.percentage}% full
                       </p>
-                      <p className="text-[11px] opacity-85 truncate">
+                      <p className="text-xs opacity-85 truncate">
                         {selectedAccount.usage} of {selectedAccount.total} used — move or archive files to another drive to free up space.
                       </p>
                     </div>
@@ -3687,9 +4069,9 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => setIsDrivesExpanded(true)}
-                    className="h-8 px-3.5 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 text-amber-800 dark:text-amber-200 text-xs font-bold shrink-0 transition-colors"
+                    className="h-8 px-3.5 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 text-amber-800 dark:text-amber-200 text-xs font-semibold shrink-0 transition-colors"
                   >
-                    Switch Drive
+                    Switch drive
                   </button>
                 </div>
               )}
@@ -3697,7 +4079,7 @@ export default function App() {
               {/* File list / grid */}
               <div className="relative">
                 {loading && displayedFiles.length > 0 && (
-                  <div className="mb-2 h-1 bg-[var(--pi)] rounded-full overflow-hidden">
+                  <div className="mb-2 h-0.5 bg-[var(--pi)] rounded-full overflow-hidden">
                     <motion.div
                       initial={{ width: '0%', x: '-100%' }}
                       animate={{ width: '100%', x: '100%' }}
@@ -3708,18 +4090,42 @@ export default function App() {
                 )}
 
                 {loading && displayedFiles.length === 0 ? (
-                  <div className="flex flex-col items-center justify-center py-32 text-[var(--sub)] gap-4">
-                    <RefreshCw size={40} className="animate-spin text-[#2563EB]" />
-                    <p className="text-sm font-semibold">{isTrashView ? 'Loading trash...' : 'Loading files...'}</p>
-                  </div>
+                  viewMode === 'list' ? (
+                    <div className="rounded-2xl bg-[var(--sf)] border border-[var(--bd)] divide-y divide-[var(--bd)]/60 overflow-hidden">
+                      {[...Array(8)].map((_, i) => (
+                        <div key={i} className="h-[52px] px-4 flex items-center gap-3.5">
+                          <div className="hidden md:block w-4 h-4 rounded bg-[var(--bg)] animate-pulse shrink-0" />
+                          <div className="w-8 h-8 rounded-lg bg-[var(--bg)] animate-pulse shrink-0" />
+                          <div
+                            className="h-3.5 rounded-md bg-[var(--bg)] animate-pulse"
+                            style={{ width: `${140 + ((i * 37) % 160)}px` }}
+                          />
+                          <div className="hidden md:block h-3 w-20 rounded-md bg-[var(--bg)] animate-pulse ml-auto" />
+                          <div className="hidden md:block h-3 w-14 rounded-md bg-[var(--bg)] animate-pulse ml-6" />
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4">
+                      {[...Array(12)].map((_, i) => (
+                        <div key={i} className="p-4 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] flex flex-col items-center gap-3">
+                          <div className="w-20 h-20 rounded-2xl bg-[var(--bg)] animate-pulse" />
+                          <div className="w-full space-y-1.5 flex flex-col items-center">
+                            <div className="h-3.5 w-3/4 rounded-md bg-[var(--bg)] animate-pulse" />
+                            <div className="h-3 w-1/3 rounded-md bg-[var(--bg)] animate-pulse" />
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )
                 ) : displayedFiles.length === 0 ? (
                   isTrashView ? (
-                    <div className="flex flex-col items-center justify-center py-24 text-[var(--sub)] gap-5">
-                      <div className="w-20 h-20 rounded-3xl bg-[var(--sf)] border border-[var(--bd)] flex items-center justify-center">
-                        <Trash2 size={36} />
+                    <div className="flex flex-col items-center justify-center py-24 text-[var(--sub)] gap-4">
+                      <div className="w-16 h-16 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] flex items-center justify-center">
+                        <Trash2 size={28} />
                       </div>
-                      <div className="text-center space-y-1">
-                        <p className="text-lg font-bold text-[var(--tx)]">Trash is empty</p>
+                      <div className="text-center space-y-1 max-w-sm">
+                        <p className="text-base font-semibold text-[var(--tx)]">Trash is empty</p>
                         <p className="text-sm text-[var(--sub)]">
                           Deleted files from this drive will appear here for recovery or permanent removal.
                         </p>
@@ -3727,18 +4133,18 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => toggleTrashView(false)}
-                        className="h-10 px-6 rounded-[20px] bg-[var(--pi)] text-[var(--pit)] font-bold text-sm hover:opacity-90 transition-opacity"
+                        className="h-9 px-5 rounded-xl bg-[var(--pi)] text-[var(--pit)] font-semibold text-xs hover:opacity-90 transition-opacity"
                       >
                         Back to Drive
                       </button>
                     </div>
                   ) : (debouncedSearch.trim() || searchFilterType !== 'all') ? (
                     <div className="flex flex-col items-center justify-center py-24 text-[var(--sub)] gap-4">
-                      <div className="w-16 h-16 rounded-3xl bg-[var(--sf)] border border-[var(--bd)] flex items-center justify-center">
-                        <Search size={28} />
+                      <div className="w-14 h-14 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] flex items-center justify-center">
+                        <Search size={24} />
                       </div>
                       <div className="text-center space-y-1 max-w-sm">
-                        <p className="text-lg font-bold text-[var(--tx)]">
+                        <p className="text-base font-semibold text-[var(--tx)]">
                           {debouncedSearch.trim() ? `No results for "${debouncedSearch.trim()}"` : `No matching ${searchFilterType} files`}
                         </p>
                         <p className="text-sm text-[var(--sub)]">
@@ -3750,7 +4156,7 @@ export default function App() {
                           <button
                             type="button"
                             onClick={() => setSearchQuery('')}
-                            className="h-10 px-5 rounded-[20px] bg-[var(--pi)] text-[var(--pit)] font-bold text-sm hover:opacity-90 transition-opacity"
+                            className="h-9 px-4 rounded-xl bg-[var(--pi)] text-[var(--pit)] font-semibold text-xs hover:opacity-90 transition-opacity"
                           >
                             Clear search
                           </button>
@@ -3759,7 +4165,7 @@ export default function App() {
                           <button
                             type="button"
                             onClick={() => setSearchFilterType('all')}
-                            className="h-10 px-5 rounded-[20px] bg-[var(--sf)] border border-[var(--bd)] text-[var(--tx)] font-bold text-sm hover:border-[var(--sub)]/50 transition-colors"
+                            className="h-9 px-4 rounded-xl bg-[var(--sf)] border border-[var(--bd)] text-[var(--tx)] font-semibold text-xs hover:border-[var(--sub)]/50 transition-colors"
                           >
                             Show all types
                           </button>
@@ -3767,12 +4173,12 @@ export default function App() {
                       </div>
                     </div>
                   ) : (
-                    <div className="border-2 border-dashed border-[var(--bd)] rounded-[28px] bg-[var(--sf)]/50 flex flex-col items-center justify-center py-20 px-6 text-[var(--sub)] gap-4">
-                      <div className="w-16 h-16 rounded-3xl bg-[var(--sf)] border border-[var(--bd)] flex items-center justify-center text-[#2563EB]">
-                        {isTgDrive ? <TelegramIcon size={32} /> : <UploadCloud size={32} />}
+                    <div className="border border-dashed border-[var(--bd)] rounded-2xl bg-[var(--sf)]/50 flex flex-col items-center justify-center py-20 px-6 text-[var(--sub)] gap-4">
+                      <div className="w-14 h-14 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] flex items-center justify-center text-[#2563EB]">
+                        {isTgDrive ? <TelegramIcon size={28} /> : <UploadCloud size={28} />}
                       </div>
                       <div className="text-center space-y-1 max-w-sm">
-                        <p className="text-lg font-bold text-[var(--tx)]">This folder is empty</p>
+                        <p className="text-base font-semibold text-[var(--tx)]">This folder is empty</p>
                         <p className="text-sm text-[var(--sub)]">
                           {isTgDrive
                             ? 'Drop files here or upload to store them in this Telegram channel.'
@@ -3780,17 +4186,17 @@ export default function App() {
                         </p>
                       </div>
                       <div className="flex flex-wrap items-center justify-center gap-2.5 pt-1">
-                        <label className="h-10 px-6 rounded-[20px] bg-[#2563EB] text-white font-bold text-sm flex items-center gap-2 cursor-pointer hover:opacity-90 transition-opacity">
-                          <Upload size={16} />
-                          <span>Upload Files</span>
+                        <label className="h-9 px-4 rounded-xl bg-[#2563EB] text-white font-semibold text-xs flex items-center gap-2 cursor-pointer hover:bg-blue-700 transition-colors">
+                          <Upload size={15} />
+                          <span>Upload files</span>
                           <input type="file" className="hidden" onChange={handleUpload} multiple />
                         </label>
                         <button
                           type="button"
                           onClick={handleCreateFolder}
-                          className="h-10 px-5 rounded-[20px] bg-[var(--sf)] border border-[var(--bd)] text-[var(--tx)] font-bold text-sm flex items-center gap-2 hover:border-[var(--sub)]/50 transition-colors"
+                          className="h-9 px-4 rounded-xl bg-[var(--sf)] border border-[var(--bd)] text-[var(--tx)] font-semibold text-xs flex items-center gap-2 hover:bg-[var(--hover)] transition-colors"
                         >
-                          <FolderPlus size={16} />
+                          <FolderPlus size={15} />
                           <span>New folder</span>
                         </button>
                       </div>
@@ -3798,147 +4204,200 @@ export default function App() {
                   )
                 ) : viewMode === 'list' ? (
                   <>
-                    {/* Desktop List Header */}
-                    <div className="hidden md:grid grid-cols-[44px_1fr_140px_100px_140px] gap-4 items-center px-5 h-8 text-[10px] font-black uppercase tracking-[0.08em] text-[var(--sub)]">
-                      <div className="flex items-center justify-center">
-                        <input
-                          type="checkbox"
-                          aria-label="Select all files"
-                          className="w-4 h-4 rounded border-[var(--bd)] text-[#2563EB] focus:ring-[#2563EB] cursor-pointer"
-                          checked={displayedFiles.length > 0 && selectedFileIds.size === displayedFiles.length}
-                          onChange={(e) => {
-                            if (e.target.checked) setSelectedFileIds(new Set(displayedFiles.map(f => f.id)));
-                            else setSelectedFileIds(new Set());
-                          }}
-                        />
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => setSortOrder(prev => (prev === 'asc' ? 'desc' : 'asc'))}
-                        className="flex items-center gap-1 text-left text-[var(--tx)] font-black uppercase tracking-[0.08em]"
-                      >
-                        <span>Name</span>
-                        {sortOrder === 'asc' ? <ArrowUp size={13} /> : <ArrowDown size={13} />}
-                      </button>
-                      <span>Modified</span>
-                      <span>Size</span>
-                      <span />
-                    </div>
-
-                    {/* Desktop Connected Stack Rows */}
-                    <div className="hidden md:flex flex-col gap-[2px]">
-                      {displayedFiles.map((file, idx) => {
-                        const isChecked = selectedFileIds.has(file.id);
-                        const isFocused = selectedFile?.id === file.id;
-                        return (
-                          <div
-                            key={file.id}
-                            onClick={(e) => handleSingleClick(file, e)}
-                            onDoubleClick={(e) => handleDoubleClick(file, e)}
-                            className={`group grid grid-cols-[44px_1fr_140px_100px_140px] gap-4 items-center px-5 py-2.5 cursor-pointer transition-colors duration-150 ${getRowRadiusClass(idx, displayedFiles.length)} ${
-                              isChecked || isFocused ? 'bg-[var(--sel)]' : 'bg-[var(--sf)] hover:bg-[var(--sel)]/50'
-                            }`}
-                          >
-                            <div
-                              className="flex items-center justify-center relative"
-                              onClick={(e) => toggleSelection(e, file.id)}
-                              title={isChecked ? 'Deselect' : 'Select'}
-                            >
-                              <FileIcon
-                                file={file}
-                                type={file.type}
-                                isTg={file.isTgDrive}
-                                accountId={selectedAccountId}
-                                showThumbnails={userSettings?.showThumbnails !== false}
-                              />
-                              <span
-                                className={`absolute -top-1 -right-1 w-4 h-4 rounded-full flex items-center justify-center transition-opacity ${
-                                  isChecked
-                                    ? 'bg-[#2563EB] text-white ring-2 ring-[var(--sel)] opacity-100'
-                                    : 'bg-[var(--sf)] border border-[var(--bd)] text-[var(--sub)] opacity-0 group-hover:opacity-100'
+                    {/* Clean Hairline Desktop File Table */}
+                    <div className="hidden md:block rounded-2xl bg-[var(--sf)] border border-[var(--bd)] overflow-hidden">
+                      {/* Table Header */}
+                      <div className="grid grid-cols-[32px_38px_1fr_140px_100px_132px] gap-3 items-center px-4 h-10 bg-[var(--bg)]/45 border-b border-[var(--bd)] text-xs font-medium text-[var(--sub)] select-none">
+                        <div className="flex items-center justify-center">
+                          {(() => {
+                            const allSelected = displayedFiles.length > 0 && selectedFileIds.size === displayedFiles.length;
+                            const someSelected = selectedFileIds.size > 0 && !allSelected;
+                            return (
+                              <button
+                                type="button"
+                                role="checkbox"
+                                aria-checked={allSelected ? 'true' : someSelected ? 'mixed' : 'false'}
+                                aria-label="Select all files"
+                                onClick={() => {
+                                  if (allSelected) setSelectedFileIds(new Set());
+                                  else setSelectedFileIds(new Set(displayedFiles.map(f => f.id)));
+                                }}
+                                className={`w-4 h-4 rounded-[5px] border flex items-center justify-center transition-colors ${
+                                  allSelected || someSelected
+                                    ? 'bg-[#2563EB] border-[#2563EB] text-white'
+                                    : 'border-[var(--sub)]/45 hover:border-[#2563EB] bg-transparent'
                                 }`}
                               >
-                                <Check size={10} strokeWidth={3} />
-                              </span>
-                            </div>
+                                {allSelected ? (
+                                  <Check size={11} strokeWidth={3} />
+                                ) : someSelected ? (
+                                  <span className="w-2 h-0.5 rounded-full bg-white" />
+                                ) : null}
+                              </button>
+                            );
+                          })()}
+                        </div>
+                        <span />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (sortBy === 'name') setSortOrder(prev => (prev === 'asc' ? 'desc' : 'asc'));
+                            else { setSortBy('name'); setSortOrder('asc'); }
+                          }}
+                          className={`flex items-center gap-1 text-left transition-colors ${
+                            sortBy === 'name' ? 'text-[var(--tx)] font-semibold' : 'hover:text-[var(--tx)]'
+                          }`}
+                        >
+                          <span>Name</span>
+                          {sortBy === 'name' && (sortOrder === 'asc' ? <ArrowUp size={13} /> : <ArrowDown size={13} />)}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (sortBy === 'modified') setSortOrder(prev => (prev === 'asc' ? 'desc' : 'asc'));
+                            else { setSortBy('modified'); setSortOrder('desc'); }
+                          }}
+                          className={`flex items-center gap-1 text-left transition-colors ${
+                            sortBy === 'modified' ? 'text-[var(--tx)] font-semibold' : 'hover:text-[var(--tx)]'
+                          }`}
+                        >
+                          <span>Modified</span>
+                          {sortBy === 'modified' && (sortOrder === 'asc' ? <ArrowUp size={13} /> : <ArrowDown size={13} />)}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (sortBy === 'size') setSortOrder(prev => (prev === 'asc' ? 'desc' : 'asc'));
+                            else { setSortBy('size'); setSortOrder('desc'); }
+                          }}
+                          className={`flex items-center gap-1 text-left transition-colors ${
+                            sortBy === 'size' ? 'text-[var(--tx)] font-semibold' : 'hover:text-[var(--tx)]'
+                          }`}
+                        >
+                          <span>Size</span>
+                          {sortBy === 'size' && (sortOrder === 'asc' ? <ArrowUp size={13} /> : <ArrowDown size={13} />)}
+                        </button>
+                        <span />
+                      </div>
 
-                            <div className="min-w-0">
-                              <p className="text-[15px] font-semibold text-[var(--tx)] truncate">{file.name}</p>
-                            </div>
-
-                            <span className="text-sm font-medium text-[var(--sub)] truncate tabular-nums">{file.modified || '—'}</span>
-
-                            <span className="font-mono text-[13px] text-[var(--sub)] tabular-nums truncate">
-                              {file.type === 'folder' ? '—' : file.size}
-                            </span>
-
-                            <div className="flex items-center justify-end gap-1" onClick={(e) => e.stopPropagation()}>
-                              <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-                                {isTrashView ? (
-                                  <>
-                                    <button onClick={() => handleRestoreFile(file.id)} className="p-1.5 rounded-lg text-[var(--sub)] hover:text-emerald-500" title="Restore">
-                                      <RotateCcw size={15} />
-                                    </button>
-                                    <button onClick={() => handlePermanentDeleteFile(file.id)} className="p-1.5 rounded-lg text-[var(--sub)] hover:text-rose-500" title="Delete Forever">
-                                      <Trash2 size={15} />
-                                    </button>
-                                  </>
-                                ) : (
-                                  <>
-                                    {file.type !== 'folder' && (
-                                      <button onClick={() => openPreview(file)} className="p-1.5 rounded-lg text-[var(--sub)] hover:text-[#2563EB]" title="Preview">
-                                        <Eye size={15} />
-                                      </button>
-                                    )}
-                                    {file.type !== 'folder' && (
-                                      <button onClick={() => handleDownload(file.id)} className="p-1.5 rounded-lg text-[var(--sub)] hover:text-[#2563EB]" title="Download">
-                                        <Download size={15} />
-                                      </button>
-                                    )}
-                                    <button onClick={() => handleRename(file.id, file.name)} className="p-1.5 rounded-lg text-[var(--sub)] hover:text-[#2563EB]" title="Rename">
-                                      <Edit3 size={15} />
-                                    </button>
-                                  </>
-                                )}
-                              </div>
-                              {isChecked ? (
+                      {/* Table Rows */}
+                      <div className="divide-y divide-[var(--bd)]/60">
+                        {displayedFiles.map((file) => {
+                          const isChecked = selectedFileIds.has(file.id);
+                          const isFocused = focusedFileId === file.id || selectedFile?.id === file.id;
+                          const isHighlighted = isChecked || isFocused;
+                          return (
+                            <div
+                              key={file.id}
+                              onClick={(e) => handleSingleClick(file, e)}
+                              onDoubleClick={(e) => handleDoubleClick(file, e)}
+                              onContextMenu={(e) => handleRowContextMenu(file, e)}
+                              className={`group grid grid-cols-[32px_38px_1fr_140px_100px_132px] gap-3 items-center px-4 h-[52px] cursor-pointer transition-colors select-none ${
+                                isHighlighted
+                                  ? 'bg-[var(--sel)] shadow-[inset_3px_0_0_#2563EB]'
+                                  : 'hover:bg-[var(--hover)]'
+                              }`}
+                            >
+                              <div className="flex items-center justify-center" onClick={(e) => e.stopPropagation()}>
                                 <button
                                   type="button"
+                                  role="checkbox"
+                                  aria-checked={isChecked}
+                                  aria-label={isChecked ? `Deselect ${file.name}` : `Select ${file.name}`}
                                   onClick={(e) => toggleSelection(e, file.id)}
-                                  className="p-1 text-[#60A5FA] hover:opacity-80"
-                                  title="Selected"
+                                  className={`w-4 h-4 rounded-[5px] border flex items-center justify-center transition-all ${
+                                    isChecked
+                                      ? 'bg-[#2563EB] border-[#2563EB] text-white opacity-100'
+                                      : selectedFileIds.size > 0
+                                      ? 'border-[var(--sub)]/45 hover:border-[#2563EB] opacity-100'
+                                      : 'border-[var(--sub)]/45 hover:border-[#2563EB] opacity-0 group-hover:opacity-100 focus:opacity-100'
+                                  }`}
                                 >
-                                  <CheckCircle2 size={20} fill="currentColor" className="text-[#2563EB]" />
+                                  {isChecked && <Check size={11} strokeWidth={3} />}
                                 </button>
-                              ) : (
+                              </div>
+
+                              <div className="flex items-center justify-center">
+                                <FileIcon
+                                  file={file}
+                                  type={file.type}
+                                  isTg={file.isTgDrive}
+                                  accountId={selectedAccountId}
+                                  showThumbnails={userSettings?.showThumbnails !== false}
+                                />
+                              </div>
+
+                              <div className="min-w-0">
+                                <p className="text-sm font-medium text-[var(--tx)] truncate">{file.name}</p>
+                              </div>
+
+                              <span className="text-[13px] font-normal text-[var(--sub)] truncate tabular-nums">
+                                {file.modified || '—'}
+                              </span>
+
+                              <span className="font-mono text-xs text-[var(--sub)] tabular-nums truncate">
+                                {file.type === 'folder' ? '—' : file.size}
+                              </span>
+
+                              <div className="flex items-center justify-end gap-0.5" onClick={(e) => e.stopPropagation()}>
+                                <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+                                  {isTrashView ? (
+                                    <>
+                                      <button type="button" onClick={() => handleRestoreFile(file.id)} className="p-1.5 rounded-lg text-[var(--sub)] hover:text-emerald-500 hover:bg-[var(--bg)]/70" title="Restore">
+                                        <RotateCcw size={15} />
+                                      </button>
+                                      <button type="button" onClick={() => handlePermanentDeleteFile(file.id)} className="p-1.5 rounded-lg text-[var(--sub)] hover:text-rose-500 hover:bg-[var(--bg)]/70" title="Delete forever">
+                                        <Trash2 size={15} />
+                                      </button>
+                                    </>
+                                  ) : (
+                                    <>
+                                      {file.type !== 'folder' && (
+                                        <button type="button" onClick={() => openPreview(file)} className="p-1.5 rounded-lg text-[var(--sub)] hover:text-[#2563EB] hover:bg-[var(--bg)]/70" title="Preview">
+                                          <Eye size={15} />
+                                        </button>
+                                      )}
+                                      {file.type !== 'folder' && (
+                                        <button type="button" onClick={() => handleDownload(file.id)} className="p-1.5 rounded-lg text-[var(--sub)] hover:text-[#2563EB] hover:bg-[var(--bg)]/70" title="Download">
+                                          <Download size={15} />
+                                        </button>
+                                      )}
+                                      <button type="button" onClick={() => handleRename(file.id, file.name)} className="p-1.5 rounded-lg text-[var(--sub)] hover:text-[#2563EB] hover:bg-[var(--bg)]/70" title="Rename">
+                                        <Edit3 size={15} />
+                                      </button>
+                                    </>
+                                  )}
+                                </div>
                                 <button
                                   type="button"
                                   onClick={(e) => {
                                     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
                                     setContextMenu({ file, x: rect.left - 160, y: rect.bottom });
                                   }}
-                                  className="p-1 rounded-lg text-[var(--sub)] hover:text-[var(--tx)]"
+                                  className="p-1.5 rounded-lg text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--bg)]/70 transition-colors"
                                   title="More actions"
+                                  aria-label={`More actions for ${file.name}`}
                                 >
-                                  <MoreVertical size={18} />
+                                  <MoreVertical size={16} />
                                 </button>
-                              )}
+                              </div>
                             </div>
-                          </div>
-                        );
-                      })}
+                          );
+                        })}
+                      </div>
                     </div>
 
-                    {/* Mobile Connected Stack Rows (.l3) */}
-                    <div className="md:hidden flex flex-col gap-[2px]">
-                      {displayedFiles.map((file, idx) => {
+                    {/* Mobile Hairline List */}
+                    <div className="md:hidden rounded-2xl bg-[var(--sf)] border border-[var(--bd)] divide-y divide-[var(--bd)]/60 overflow-hidden">
+                      {displayedFiles.map((file) => {
                         const isChecked = selectedFileIds.has(file.id);
                         return (
                           <div
                             key={file.id}
                             onClick={(e) => handleSingleClick(file, e)}
-                            className={`grid grid-cols-[40px_1fr_28px] gap-3.5 items-center px-4 py-2.5 cursor-pointer transition-colors ${getRowRadiusClass(idx, displayedFiles.length)} ${
-                              isChecked ? 'bg-[var(--sel)]' : 'bg-[var(--sf)]'
+                            onContextMenu={(e) => handleRowContextMenu(file, e)}
+                            className={`grid grid-cols-[40px_1fr_28px] gap-3 items-center px-3.5 py-2.5 cursor-pointer transition-colors ${
+                              isChecked ? 'bg-[var(--sel)]' : 'active:bg-[var(--hover)]'
                             }`}
                           >
                             <div onClick={(e) => toggleSelection(e, file.id)}>
@@ -3951,8 +4410,8 @@ export default function App() {
                               />
                             </div>
                             <div className="min-w-0">
-                              <p className="text-[15px] font-semibold text-[var(--tx)] truncate">{file.name}</p>
-                              <p className="text-[12.5px] font-medium text-[var(--sub)] truncate mt-0.5">
+                              <p className="text-[14.5px] font-medium text-[var(--tx)] truncate">{file.name}</p>
+                              <p className="text-xs text-[var(--sub)] truncate mt-0.5 tabular-nums">
                                 {file.type === 'folder'
                                   ? `Folder · ${file.modified || '—'}`
                                   : `${file.modified || '—'} · ${file.size}`}
@@ -3972,7 +4431,7 @@ export default function App() {
                                   }}
                                   className="p-1 text-[var(--sub)]"
                                 >
-                                  <MoreVertical size={18} />
+                                  <MoreVertical size={17} />
                                 </button>
                               )}
                             </div>
@@ -3982,125 +4441,76 @@ export default function App() {
                     </div>
                   </>
                 ) : (
-                  <div className="space-y-5">
-                    {gridFolders.length > 0 && (
-                      <div>
-                        <div className="text-[10px] font-black uppercase tracking-[0.08em] text-[var(--sub)] mb-2">Folders</div>
-                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
-                          {gridFolders.map(folder => {
-                            const isChecked = selectedFileIds.has(folder.id);
-                            return (
-                              <div
-                                key={folder.id}
-                                onClick={(e) => handleSingleClick(folder, e)}
-                                onDoubleClick={(e) => handleDoubleClick(folder, e)}
-                                className={`group h-[60px] px-4 rounded-[20px] border flex items-center gap-3 cursor-pointer transition-colors ${
-                                  isChecked || selectedFile?.id === folder.id
-                                    ? 'bg-[var(--sel)] border-[#2563EB]'
-                                    : 'bg-[var(--sf)] border-[var(--bd)] hover:border-[var(--sub)]/50'
-                                }`}
-                              >
-                                <div onClick={(e) => toggleSelection(e, folder.id)} className="shrink-0 relative w-6 h-6 flex items-center justify-center">
-                                  {isChecked ? (
-                                    <span className="w-6 h-6 rounded-full bg-[#2563EB] text-white flex items-center justify-center">
-                                      <Check size={14} strokeWidth={3} />
-                                    </span>
-                                  ) : (
-                                    <>
-                                      <Folder size={24} className="text-[#F59E0B] group-hover:opacity-0 transition-opacity" fill="currentColor" />
-                                      <span className="w-6 h-6 rounded-full bg-[var(--bg)] border border-[var(--bd)] text-[var(--sub)] flex items-center justify-center absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity">
-                                        <Check size={13} strokeWidth={2.5} />
-                                      </span>
-                                    </>
-                                  )}
-                                </div>
-                                <div className="flex-1 min-w-0 text-sm font-bold text-[var(--tx)] truncate">{folder.name}</div>
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                                    setContextMenu({ file: folder, x: rect.left - 160, y: rect.bottom });
-                                  }}
-                                  className="p-1 text-[var(--sub)] hover:text-[var(--tx)] shrink-0"
-                                >
-                                  <MoreVertical size={18} />
-                                </button>
-                              </div>
-                            );
-                          })}
+                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4">
+                    {displayedFiles.map(file => {
+                      const isChecked = selectedFileIds.has(file.id);
+                      const isFocused = focusedFileId === file.id || selectedFile?.id === file.id;
+                      return (
+                        <div
+                          key={file.id}
+                          onClick={(e) => handleSingleClick(file, e)}
+                          onDoubleClick={(e) => handleDoubleClick(file, e)}
+                          onContextMenu={(e) => handleRowContextMenu(file, e)}
+                          className={`group relative rounded-2xl p-4 border flex flex-col items-center text-center cursor-pointer transition-all select-none ${
+                            isChecked || isFocused
+                              ? 'bg-[var(--sel)] border-[#2563EB] ring-1 ring-[#2563EB]/30'
+                              : 'bg-[var(--sf)] border-[var(--bd)] hover:border-[#2563EB]/45 hover:bg-[var(--hover)]/60'
+                          }`}
+                        >
+                          {/* Top-left selection checkbox */}
+                          <button
+                            type="button"
+                            onClick={(e) => toggleSelection(e, file.id)}
+                            aria-label={isChecked ? `Deselect ${file.name}` : `Select ${file.name}`}
+                            className={`absolute top-2.5 left-2.5 w-5 h-5 rounded-[6px] flex items-center justify-center z-10 transition-all ${
+                              isChecked
+                                ? 'bg-[#2563EB] text-white opacity-100 shadow-sm'
+                                : selectedFileIds.size > 0
+                                ? 'bg-[var(--sf)] border border-[var(--sub)]/45 text-transparent opacity-100'
+                                : 'bg-[var(--sf)]/90 border border-[var(--bd)] text-transparent opacity-0 group-hover:opacity-100'
+                            }`}
+                          >
+                            <Check size={12} strokeWidth={3} />
+                          </button>
+
+                          {/* Top-right actions menu */}
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                              setContextMenu({ file, x: rect.left - 160, y: rect.bottom });
+                            }}
+                            aria-label={`More actions for ${file.name}`}
+                            className="absolute top-2 right-2 p-1 rounded-lg text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--bg)]/80 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity z-10"
+                          >
+                            <MoreVertical size={16} />
+                          </button>
+
+                          {/* Centered Large Icon or Image Thumbnail */}
+                          <div className="mt-2 mb-3 flex items-center justify-center">
+                            <FileIcon
+                              file={file}
+                              type={file.type}
+                              size="lg"
+                              isTg={file.isTgDrive}
+                              accountId={selectedAccountId}
+                              showThumbnails={userSettings?.showThumbnails !== false}
+                            />
+                          </div>
+
+                          {/* Centered Name & Subtle Meta */}
+                          <div className="w-full min-w-0 space-y-0.5">
+                            <p className="text-[13.5px] font-semibold text-[var(--tx)] truncate" title={file.name}>
+                              {file.name}
+                            </p>
+                            <p className="text-[11.5px] text-[var(--sub)] truncate tabular-nums">
+                              {file.type === 'folder' ? 'Folder' : file.size || file.modified || '—'}
+                            </p>
+                          </div>
                         </div>
-                      </div>
-                    )}
-
-                    {gridFiles.length > 0 && (
-                      <div>
-                        <div className="text-[10px] font-black uppercase tracking-[0.08em] text-[var(--sub)] mb-2">Files</div>
-                        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-                          {gridFiles.map(file => {
-                            const isChecked = selectedFileIds.has(file.id);
-                            const isFocused = selectedFile?.id === file.id;
-                            return (
-                              <div
-                                key={file.id}
-                                onClick={(e) => handleSingleClick(file, e)}
-                                onDoubleClick={(e) => handleDoubleClick(file, e)}
-                                className={`rounded-[20px] overflow-hidden relative cursor-pointer transition-colors group ${
-                                  isChecked || isFocused
-                                    ? 'bg-[var(--sel)] border-2 border-[#2563EB]'
-                                    : 'bg-[var(--sf)] border border-[var(--bd)] hover:border-[var(--sub)]/50'
-                                }`}
-                              >
-                                <button
-                                  type="button"
-                                  onClick={(e) => toggleSelection(e, file.id)}
-                                  aria-label={isChecked ? 'Deselect file' : 'Select file'}
-                                  className={`absolute top-2.5 left-2.5 w-6 h-6 rounded-full flex items-center justify-center z-10 transition-opacity ${
-                                    isChecked
-                                      ? 'bg-[#2563EB] text-white opacity-100'
-                                      : 'bg-[var(--sf)]/80 border border-[var(--bd)] text-transparent opacity-0 group-hover:opacity-100'
-                                  }`}
-                                >
-                                  <Check size={14} strokeWidth={3} />
-                                </button>
-
-                                <FileIcon
-                                  file={file}
-                                  type={file.type}
-                                  size="card"
-                                  isTg={file.isTgDrive}
-                                  accountId={selectedAccountId}
-                                  showThumbnails={userSettings?.showThumbnails !== false}
-                                />
-
-                                <div className="flex items-center gap-2 px-3.5 py-3">
-                                  <span className="text-[var(--sub)] shrink-0">
-                                    {renderFileTypeGlyph(file.type, 18, file.isTgDrive)}
-                                  </span>
-                                  <div className="flex-1 min-w-0">
-                                    <p className="text-[13.5px] font-bold text-[var(--tx)] truncate">{file.name}</p>
-                                    <p className="text-xs font-medium text-[var(--sub)] truncate mt-0.5">
-                                      {file.modified || file.size}
-                                    </p>
-                                  </div>
-                                  <button
-                                    type="button"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                                      setContextMenu({ file, x: rect.left - 160, y: rect.bottom });
-                                    }}
-                                    className="p-1 text-[var(--sub)] hover:text-[var(--tx)] shrink-0"
-                                  >
-                                    <MoreVertical size={18} />
-                                  </button>
-                                </div>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    )}
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -4282,71 +4692,71 @@ export default function App() {
             <>
               <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => openFileInspector(null)} className="fixed inset-0 bg-slate-950/35 z-50 lg:bg-transparent" />
               <motion.div initial={{ x: '100%' }} animate={{ x: 0 }} exit={{ x: '100%' }} transition={{ type: 'spring', damping: 30, stiffness: 400 }} className="fixed top-0 right-0 h-full w-full max-w-sm bg-[var(--sf)] text-[var(--tx)] shadow-2xl z-[60] border-l border-[var(--bd)] flex flex-col">
-                <div className="p-6 flex items-center justify-between border-b border-[var(--bd)]">
-                  <h3 className="font-black text-[var(--sub)] uppercase tracking-widest text-xs">File Details</h3>
-                  <button onClick={() => openFileInspector(null)} className="p-2 hover:bg-[var(--bg)] rounded-lg text-[var(--sub)] hover:text-[var(--tx)]"><X size={18} /></button>
+                <div className="px-6 py-4 flex items-center justify-between border-b border-[var(--bd)]">
+                  <h3 className="font-semibold text-[var(--tx)] text-sm">File details</h3>
+                  <button type="button" onClick={() => openFileInspector(null)} className="p-1.5 hover:bg-[var(--hover)] rounded-xl text-[var(--sub)] hover:text-[var(--tx)] transition-colors"><X size={17} /></button>
                 </div>
-                <div className="flex-1 overflow-y-auto p-8 space-y-8">
-                  <div className="flex flex-col items-center text-center space-y-4">
+                <div className="flex-1 overflow-y-auto p-6 space-y-6">
+                  <div className="flex flex-col items-center text-center space-y-3">
                     <FileIcon file={selectedFile} type={selectedFile.type} size="lg" isTg={selectedFile.isTgDrive} accountId={selectedAccountId} showThumbnails={userSettings?.showThumbnails !== false} />
-                    <div className="space-y-1">
-                      <h4 className="font-bold text-[var(--tx)] break-all pr-4">{selectedFile.name}</h4>
-                      <p className="text-[10px] font-black text-[var(--sub)] uppercase tracking-widest tabular-nums">{selectedFile.size}</p>
-                      {selectedFile.isTgDrive && <p className="text-[10px] font-black text-sky-500 uppercase tracking-widest flex items-center justify-center gap-1"><TelegramIcon size={10} /> Telegram Storage</p>}
+                    <div className="space-y-1 max-w-full">
+                      <h4 className="font-semibold text-[15px] text-[var(--tx)] break-words">{selectedFile.name}</h4>
+                      <p className="text-xs font-mono text-[var(--sub)] tabular-nums">{selectedFile.type === 'folder' ? 'Folder' : selectedFile.size}</p>
+                      {selectedFile.isTgDrive && <p className="text-xs font-medium text-sky-500 flex items-center justify-center gap-1"><TelegramIcon size={11} /> Telegram storage</p>}
                     </div>
                   </div>
-                  <div className="space-y-6">
-                    <DetailRow label="Type" value={selectedFile.type.toUpperCase()} />
-                    <DetailRow label="Created" value={selectedFile.createdAt || '-'} />
-                    <DetailRow label="Modified" value={selectedFile.modified} />
+                  <div className="space-y-4">
+                    <DetailRow label="Type" value={selectedFile.type ? selectedFile.type.charAt(0).toUpperCase() + selectedFile.type.slice(1) : 'File'} />
+                    <DetailRow label="Created" value={selectedFile.createdAt || '—'} />
+                    <DetailRow label="Modified" value={selectedFile.modified || '—'} />
                     {selectedFile.folder !== undefined && <DetailRow label="Folder" value={selectedFile.folder || 'Root'} />}
                   </div>
-                  <div className="pt-8 grid grid-cols-2 gap-4">
+                  <div className="pt-2 grid grid-cols-2 gap-2.5">
                     {isTrashView ? (
                       <>
-                        <button onClick={() => handleRestoreFile(selectedFile.id)} className="flex flex-col items-center gap-2 p-4 bg-[var(--bg)] rounded-2xl hover:bg-emerald-500/15 text-[var(--sub)] hover:text-emerald-500 transition-all border border-[var(--bd)]">
-                          <RotateCcw size={20} /><span className="text-[10px] font-black uppercase tracking-widest">Restore</span>
+                        <button type="button" onClick={() => handleRestoreFile(selectedFile.id)} className="flex flex-col items-center gap-1.5 p-3.5 bg-[var(--bg)] rounded-xl hover:bg-emerald-500/12 text-[var(--sub)] hover:text-emerald-500 transition-colors border border-[var(--bd)]">
+                          <RotateCcw size={18} /><span className="text-xs font-medium">Restore</span>
                         </button>
-                        <button onClick={() => handlePermanentDeleteFile(selectedFile.id)} className="flex flex-col items-center gap-2 p-4 bg-[var(--bg)] rounded-2xl hover:bg-rose-500/15 text-[var(--sub)] hover:text-rose-500 transition-all border border-[var(--bd)]">
-                          <Trash2 size={20} /><span className="text-[10px] font-black uppercase tracking-widest">Delete Forever</span>
+                        <button type="button" onClick={() => handlePermanentDeleteFile(selectedFile.id)} className="flex flex-col items-center gap-1.5 p-3.5 bg-[var(--bg)] rounded-xl hover:bg-rose-500/12 text-[var(--sub)] hover:text-rose-500 transition-colors border border-[var(--bd)]">
+                          <Trash2 size={18} /><span className="text-xs font-medium">Delete forever</span>
                         </button>
                       </>
                     ) : (
                       <>
                         {selectedFile.type !== 'folder' && (
-                          <button onClick={() => handleDownload(selectedFile.id)} className="flex flex-col items-center gap-2 p-4 bg-[var(--bg)] rounded-2xl hover:bg-[var(--sel)] text-[var(--sub)] hover:text-[#2563EB] transition-all border border-[var(--bd)]">
-                            <Download size={20} /><span className="text-[10px] font-black uppercase tracking-widest">Download</span>
+                          <button type="button" onClick={() => handleDownload(selectedFile.id)} className="flex flex-col items-center gap-1.5 p-3.5 bg-[var(--bg)] rounded-xl hover:bg-[var(--sel)] text-[var(--sub)] hover:text-[#2563EB] transition-colors border border-[var(--bd)]">
+                            <Download size={18} /><span className="text-xs font-medium">Download</span>
                           </button>
                         )}
-                        <button onClick={() => handleRename(selectedFile.id, selectedFile.name)} className="flex flex-col items-center gap-2 p-4 bg-[var(--bg)] rounded-2xl hover:bg-[var(--sel)] text-[var(--sub)] hover:text-[#2563EB] transition-all border border-[var(--bd)]">
-                          <Edit3 size={20} /><span className="text-[10px] font-black uppercase tracking-widest">Rename</span>
+                        <button type="button" onClick={() => handleRename(selectedFile.id, selectedFile.name)} className="flex flex-col items-center gap-1.5 p-3.5 bg-[var(--bg)] rounded-xl hover:bg-[var(--sel)] text-[var(--sub)] hover:text-[#2563EB] transition-colors border border-[var(--bd)]">
+                          <Edit3 size={18} /><span className="text-xs font-medium">Rename</span>
                         </button>
                         {selectedFile.type !== 'folder' && (
-                          <button onClick={() => handleShare(selectedFile.id)} className="flex flex-col items-center gap-2 p-4 bg-[var(--bg)] rounded-2xl hover:bg-[var(--sel)] text-[var(--sub)] hover:text-[#2563EB] transition-all border border-[var(--bd)]">
-                            <Share2 size={20} /><span className="text-[10px] font-black uppercase tracking-widest">Share</span>
+                          <button type="button" onClick={() => handleShare(selectedFile.id)} className="flex flex-col items-center gap-1.5 p-3.5 bg-[var(--bg)] rounded-xl hover:bg-[var(--sel)] text-[var(--sub)] hover:text-[#2563EB] transition-colors border border-[var(--bd)]">
+                            <Share2 size={18} /><span className="text-xs font-medium">Share</span>
                           </button>
                         )}
                         {['image', 'video', 'audio', 'pdf'].includes(selectedFile.type) && (
-                          <button onClick={() => openPreview(selectedFile)} className="flex flex-col items-center gap-2 p-4 bg-[var(--bg)] rounded-2xl hover:bg-purple-500/15 text-[var(--sub)] hover:text-purple-500 transition-all border border-[var(--bd)]">
-                            <Eye size={20} /><span className="text-[10px] font-black uppercase tracking-widest">Preview</span>
+                          <button type="button" onClick={() => openPreview(selectedFile)} className="flex flex-col items-center gap-1.5 p-3.5 bg-[var(--bg)] rounded-xl hover:bg-purple-500/12 text-[var(--sub)] hover:text-purple-500 transition-colors border border-[var(--bd)]">
+                            <Eye size={18} /><span className="text-xs font-medium">Preview</span>
                           </button>
                         )}
                         {selectedFile.name.toLowerCase().endsWith('.zip') && (
-                          <button onClick={() => handleUnzip(selectedFile)} className="flex flex-col items-center gap-2 p-4 bg-[var(--bg)] rounded-2xl hover:bg-[var(--sel)] text-[var(--sub)] hover:text-[#2563EB] transition-all border border-[var(--bd)]">
-                            <FileArchive size={20} /><span className="text-[10px] font-black uppercase tracking-widest">Unzip</span>
+                          <button type="button" onClick={() => handleUnzip(selectedFile)} className="flex flex-col items-center gap-1.5 p-3.5 bg-[var(--bg)] rounded-xl hover:bg-[var(--sel)] text-[var(--sub)] hover:text-[#2563EB] transition-colors border border-[var(--bd)]">
+                            <FileArchive size={18} /><span className="text-xs font-medium">Unzip</span>
                           </button>
                         )}
-                        <button onClick={() => handleDeleteFile(selectedFile.id)} className="flex flex-col items-center gap-2 p-4 bg-[var(--bg)] rounded-2xl hover:bg-rose-500/15 text-[var(--sub)] hover:text-rose-500 transition-all border border-[var(--bd)]">
-                          <Trash2 size={20} /><span className="text-[10px] font-black uppercase tracking-widest">Trash</span>
+                        <button type="button" onClick={() => handleDeleteFile(selectedFile.id)} className="flex flex-col items-center gap-1.5 p-3.5 bg-[var(--bg)] rounded-xl hover:bg-rose-500/12 text-[var(--sub)] hover:text-rose-500 transition-colors border border-[var(--bd)]">
+                          <Trash2 size={18} /><span className="text-xs font-medium">Move to trash</span>
                         </button>
                       </>
                     )}
                   </div>
                   {/* Open in Google Drive / OneDrive link */}
                   {selectedFile.webViewLink && !selectedFile.isTgDrive && (
-                    <div className="pt-2">
-                      <a href={selectedFile.webViewLink} target="_blank" rel="noopener noreferrer" className="flex items-center justify-center gap-2 w-full py-4 bg-[var(--sel)] text-[#2563EB] dark:text-[#60A5FA] font-bold rounded-2xl hover:opacity-90 transition-all">
-                        <ExternalLink size={18} /><span>Open in {selectedAccount?.accountType === 'onedrive' ? 'OneDrive' : 'Google Drive'}</span>
+                    <div className="pt-1">
+                      <a href={selectedFile.webViewLink} target="_blank" rel="noopener noreferrer" className="flex items-center justify-center gap-2 w-full py-3 bg-[var(--sel)] text-[#2563EB] dark:text-[#60A5FA] text-sm font-semibold rounded-xl hover:opacity-90 transition-opacity">
+                        <ExternalLink size={16} /><span>Open in {selectedAccount?.accountType === 'onedrive' ? 'OneDrive' : 'Google Drive'}</span>
                       </a>
                     </div>
                   )}
@@ -4746,60 +5156,260 @@ export default function App() {
           })()}
         </AnimatePresence>
 
-        {/* Preview Modal */}
+        {/* Unified Immersive Lightbox Preview */}
         <AnimatePresence>
           {previewFile && (
-            <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
-              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => { setPreviewFile(null); syncUrl({ previewFileId: null }); }} className="absolute inset-0 bg-slate-950/80 backdrop-blur-sm" />
-              <motion.div initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.95, opacity: 0 }} className="relative z-10 bg-[var(--sf)] text-[var(--tx)] border border-[var(--bd)] rounded-[28px] shadow-2xl w-full max-w-3xl max-h-[90vh] flex flex-col overflow-hidden">
-                <div className="flex items-center justify-between px-6 py-4 border-b border-[var(--bd)] shrink-0">
-                  <div className="flex items-center gap-3 overflow-hidden">
-                    <FileIcon file={previewFile} type={previewFile.type} isTg={previewFile.isTgDrive} accountId={selectedAccountId} />
-                    <div className="overflow-hidden">
-                      <p className="font-extrabold text-[var(--tx)] text-sm truncate">{previewFile.name}</p>
-                      <p className="text-[10px] font-bold text-[var(--sub)] uppercase tracking-widest tabular-nums">{previewFile.size}</p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2 shrink-0">
-                    {['image', 'video', 'audio'].includes(previewFile.type) && <button onClick={() => openFullScreenGallery(previewFile)} className="p-2.5 rounded-xl bg-[var(--bg)] text-[var(--sub)] hover:text-[#2563EB] transition-colors" title="Full Screen Gallery"><Maximize size={18} /></button>}
-                    {previewFile.type !== 'folder' && <button onClick={() => handleDownload(previewFile.id)} className="p-2.5 rounded-xl bg-[var(--bg)] text-[var(--sub)] hover:text-[#2563EB] transition-colors" title="Download"><Download size={18} /></button>}
-                    {previewFile.type !== 'folder' && <button onClick={() => handleShare(previewFile.id)} className="p-2.5 rounded-xl bg-[var(--bg)] text-[var(--sub)] hover:text-[#2563EB] transition-colors" title="Share"><Share2 size={18} /></button>}
-                    <button onClick={() => { setPreviewFile(null); syncUrl({ previewFileId: null }); }} className="p-2.5 rounded-xl bg-[var(--bg)] text-[var(--sub)] hover:text-[var(--tx)] transition-colors"><X size={18} /></button>
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 z-[200] flex flex-col bg-slate-950/92 backdrop-blur-xl text-white"
+              onTouchStart={handleTouchStart}
+              onTouchMove={handleTouchMove}
+              onTouchEnd={handleTouchEnd}
+            >
+              {/* Lightbox Top Bar */}
+              <div className="h-16 px-4 sm:px-6 flex items-center justify-between gap-3 border-b border-white/10 bg-slate-950/50 shrink-0">
+                <div className="flex items-center gap-3 min-w-0">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPreviewFile(null);
+                      setPreviewInfoOpen(false);
+                      syncUrl({ previewFileId: null, galleryFileId: null });
+                    }}
+                    className="w-9 h-9 rounded-xl bg-white/10 hover:bg-white/15 text-white flex items-center justify-center transition-colors shrink-0"
+                    title="Close preview (Esc)"
+                    aria-label="Close preview"
+                  >
+                    <X size={18} />
+                  </button>
+                  <div className="min-w-0">
+                    <p className="text-sm font-semibold text-white truncate">{previewFile.name}</p>
+                    <p className="text-xs text-slate-400 tabular-nums truncate">
+                      {previewFile.size}
+                      {activePreviewIndex >= 0 && previewableFiles.length > 1
+                        ? ` · ${activePreviewIndex + 1} of ${previewableFiles.length}`
+                        : ''}
+                    </p>
                   </div>
                 </div>
-                <div className="flex-1 overflow-auto flex items-center justify-center p-6 bg-[var(--bg)] min-h-[300px]">
-                  {previewFile.type === 'image' ? (
-                    <img src={previewFile.url || `/api/download/${selectedAccountId}/${previewFile.id}?preview=1`} alt={previewFile.name} className="max-w-full max-h-[60vh] rounded-xl shadow-lg object-contain cursor-pointer transition-transform hover:scale-[1.02]" onClick={() => openFullScreenGallery(previewFile)} />
-                  ) : previewFile.type === 'video' ? (
-                    <div className="relative group cursor-pointer max-w-full max-h-[60vh]">
-                      <video controls autoPlay className="max-w-full max-h-[60vh] rounded-xl shadow-lg" src={previewFile.url || `/api/download/${selectedAccountId}/${previewFile.id}?preview=1`} />
-                    </div>
-                  ) : previewFile.type === 'audio' ? (
-                    <audio controls autoPlay className="w-full max-w-md" src={previewFile.url || `/api/download/${selectedAccountId}/${previewFile.id}?preview=1`} />
-                  ) : previewFile.type === 'pdf' && (previewFile.url || (previewFile.webViewLink && !previewFile.isTgDrive)) ? (
-                    <iframe src={previewFile.url || previewFile.webViewLink} className="w-full h-[60vh] rounded-xl border border-[var(--bd)]" title={previewFile.name} />
-                  ) : (
-                    <div className="text-center space-y-6">
-                      <div className="w-20 h-20 mx-auto"><FileIcon file={previewFile} type={previewFile.type} size="lg" isTg={previewFile.isTgDrive} accountId={selectedAccountId} /></div>
-                      <div className="space-y-2">
-                        <p className="font-bold text-[var(--tx)]">Preview not available in browser</p>
-                        <p className="text-sm text-[var(--sub)]">Download the file to view it.</p>
+
+                <div className="flex items-center gap-1.5 shrink-0">
+                  {previewFile.type !== 'folder' && (
+                    <button
+                      type="button"
+                      onClick={() => handleDownload(previewFile.id)}
+                      className="h-9 px-3 rounded-xl bg-white/10 hover:bg-white/15 text-white text-xs font-medium flex items-center gap-1.5 transition-colors"
+                      title="Download"
+                    >
+                      <Download size={15} />
+                      <span className="hidden sm:inline">Download</span>
+                    </button>
+                  )}
+                  {previewFile.type !== 'folder' && (
+                    <button
+                      type="button"
+                      onClick={() => handleShare(previewFile.id)}
+                      className="w-9 h-9 rounded-xl bg-white/10 hover:bg-white/15 text-white flex items-center justify-center transition-colors"
+                      title="Share"
+                      aria-label="Share"
+                    >
+                      <Share2 size={16} />
+                    </button>
+                  )}
+                  {previewFile.webViewLink && !previewFile.isTgDrive && (
+                    <a
+                      href={previewFile.webViewLink}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="w-9 h-9 rounded-xl bg-white/10 hover:bg-white/15 text-white flex items-center justify-center transition-colors"
+                      title="Open in Drive"
+                      aria-label="Open in Drive"
+                    >
+                      <ExternalLink size={16} />
+                    </a>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setPreviewInfoOpen(prev => !prev)}
+                    className={`w-9 h-9 rounded-xl flex items-center justify-center transition-colors ${
+                      previewInfoOpen
+                        ? 'bg-[#2563EB] text-white'
+                        : 'bg-white/10 hover:bg-white/15 text-white'
+                    }`}
+                    title="File details (I)"
+                    aria-label="Toggle file details"
+                    aria-pressed={previewInfoOpen}
+                  >
+                    <Info size={16} />
+                  </button>
+                </div>
+              </div>
+
+              {/* Lightbox Main Stage + Optional Inline Info Drawer */}
+              <div className="flex-1 min-h-0 flex relative overflow-hidden">
+                <div
+                  className="flex-1 min-w-0 relative flex items-center justify-center p-4 sm:p-8"
+                  onClick={() => {
+                    setPreviewFile(null);
+                    setPreviewInfoOpen(false);
+                    syncUrl({ previewFileId: null, galleryFileId: null });
+                  }}
+                >
+                  {hasPrevPreview && (
+                    <button
+                      type="button"
+                      onClick={(e) => navigatePreview('prev', e)}
+                      className="absolute left-3 sm:left-5 z-20 w-11 h-11 rounded-full bg-white/10 hover:bg-white/20 text-white backdrop-blur-md flex items-center justify-center transition-colors"
+                      title="Previous file (←)"
+                      aria-label="Previous file"
+                    >
+                      <ChevronLeft size={22} />
+                    </button>
+                  )}
+
+                  <div
+                    className="max-w-full max-h-full flex items-center justify-center"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    {previewFile.type === 'image' ? (
+                      <img
+                        src={previewFile.url || `/api/download/${selectedAccountId}/${previewFile.id}?preview=1`}
+                        alt={previewFile.name}
+                        className="max-w-full max-h-[82vh] rounded-xl shadow-2xl object-contain"
+                      />
+                    ) : previewFile.type === 'video' ? (
+                      <video
+                        controls
+                        autoPlay
+                        className="max-w-full max-h-[82vh] rounded-xl shadow-2xl bg-black"
+                        src={previewFile.url || `/api/download/${selectedAccountId}/${previewFile.id}?preview=1`}
+                      />
+                    ) : previewFile.type === 'audio' ? (
+                      <div className="w-full max-w-md rounded-2xl bg-slate-900/90 border border-white/10 p-6 space-y-5 text-center shadow-2xl">
+                        <div className="flex justify-center">
+                          <FileIcon file={previewFile} type={previewFile.type} size="lg" isTg={previewFile.isTgDrive} accountId={selectedAccountId} />
+                        </div>
+                        <p className="text-sm font-semibold text-white truncate">{previewFile.name}</p>
+                        <audio
+                          controls
+                          autoPlay
+                          className="w-full"
+                          src={previewFile.url || `/api/download/${selectedAccountId}/${previewFile.id}?preview=1`}
+                        />
                       </div>
-                      <div className="flex flex-col sm:flex-row gap-3 justify-center">
-                        {previewFile.webViewLink && !previewFile.isTgDrive && (
-                          <a href={previewFile.webViewLink} target="_blank" rel="noopener noreferrer" className="flex items-center justify-center gap-2 px-6 py-3 bg-[var(--sel)] text-[#2563EB] font-bold rounded-2xl hover:opacity-90 transition-all">
-                            <ExternalLink size={16} /> Open in Drive
-                          </a>
-                        )}
-                        <button onClick={() => handleDownload(previewFile.id)} className="flex items-center justify-center gap-2 px-6 py-3 bg-[var(--sf)] border border-[var(--bd)] text-[var(--tx)] font-bold rounded-2xl hover:border-[var(--sub)]/50 transition-all">
-                          <Download size={16} /> Download
-                        </button>
+                    ) : previewFile.type === 'pdf' && (previewFile.url || (previewFile.webViewLink && !previewFile.isTgDrive)) ? (
+                      <iframe
+                        src={previewFile.url || previewFile.webViewLink}
+                        className="w-[90vw] max-w-5xl h-[82vh] rounded-xl bg-white shadow-2xl border border-white/10"
+                        title={previewFile.name}
+                      />
+                    ) : (
+                      <div className="rounded-2xl bg-slate-900/90 border border-white/10 p-8 max-w-md text-center space-y-5 shadow-2xl">
+                        <div className="flex justify-center">
+                          <FileIcon file={previewFile} type={previewFile.type} size="lg" isTg={previewFile.isTgDrive} accountId={selectedAccountId} />
+                        </div>
+                        <div className="space-y-1.5">
+                          <p className="text-base font-semibold text-white">Preview isn't available</p>
+                          <p className="text-sm text-slate-400">
+                            Download this file to view it on your device.
+                          </p>
+                        </div>
+                        <div className="flex flex-wrap gap-2.5 justify-center pt-1">
+                          {previewFile.webViewLink && !previewFile.isTgDrive && (
+                            <a
+                              href={previewFile.webViewLink}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="h-10 px-4 rounded-xl bg-white/10 hover:bg-white/15 text-white text-sm font-medium inline-flex items-center gap-2 transition-colors"
+                            >
+                              <ExternalLink size={15} /> Open in Drive
+                            </a>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => handleDownload(previewFile.id)}
+                            className="h-10 px-5 rounded-xl bg-[#2563EB] hover:bg-blue-700 text-white text-sm font-semibold inline-flex items-center gap-2 transition-colors"
+                          >
+                            <Download size={15} /> Download
+                          </button>
+                        </div>
                       </div>
-                    </div>
+                    )}
+                  </div>
+
+                  {hasNextPreview && (
+                    <button
+                      type="button"
+                      onClick={(e) => navigatePreview('next', e)}
+                      className="absolute right-3 sm:right-5 z-20 w-11 h-11 rounded-full bg-white/10 hover:bg-white/20 text-white backdrop-blur-md flex items-center justify-center transition-colors"
+                      title="Next file (→)"
+                      aria-label="Next file"
+                    >
+                      <ChevronRight size={22} />
+                    </button>
                   )}
                 </div>
-              </motion.div>
-            </div>
+
+                {/* Inline Lightbox Details Panel */}
+                {previewInfoOpen && (
+                  <aside
+                    onClick={(e) => e.stopPropagation()}
+                    className="w-80 max-w-[85vw] shrink-0 bg-[#0d1322] border-l border-white/10 p-5 overflow-y-auto space-y-5"
+                  >
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-sm font-semibold text-white">File details</h3>
+                      <button
+                        type="button"
+                        onClick={() => setPreviewInfoOpen(false)}
+                        className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/10"
+                      >
+                        <X size={15} />
+                      </button>
+                    </div>
+                    <div className="space-y-3 text-xs">
+                      <div className="flex justify-between gap-3 py-2 border-b border-white/10">
+                        <span className="text-slate-400">Name</span>
+                        <span className="text-white font-medium text-right break-all">{previewFile.name}</span>
+                      </div>
+                      <div className="flex justify-between gap-3 py-2 border-b border-white/10">
+                        <span className="text-slate-400">Type</span>
+                        <span className="text-white font-medium capitalize">{previewFile.type || 'File'}</span>
+                      </div>
+                      <div className="flex justify-between gap-3 py-2 border-b border-white/10">
+                        <span className="text-slate-400">Size</span>
+                        <span className="text-white font-mono tabular-nums">{previewFile.size || '—'}</span>
+                      </div>
+                      <div className="flex justify-between gap-3 py-2 border-b border-white/10">
+                        <span className="text-slate-400">Modified</span>
+                        <span className="text-white tabular-nums">{previewFile.modified || '—'}</span>
+                      </div>
+                      <div className="flex justify-between gap-3 py-2 border-b border-white/10">
+                        <span className="text-slate-400">Created</span>
+                        <span className="text-white tabular-nums">{previewFile.createdAt || '—'}</span>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 pt-1">
+                      <button
+                        type="button"
+                        onClick={() => handleDownload(previewFile.id)}
+                        className="h-9 rounded-xl bg-white/10 hover:bg-white/15 text-white text-xs font-medium flex items-center justify-center gap-1.5 transition-colors"
+                      >
+                        <Download size={14} /> Download
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleShare(previewFile.id)}
+                        className="h-9 rounded-xl bg-white/10 hover:bg-white/15 text-white text-xs font-medium flex items-center justify-center gap-1.5 transition-colors"
+                      >
+                        <Share2 size={14} /> Share
+                      </button>
+                    </div>
+                  </aside>
+                )}
+              </div>
+            </motion.div>
           )}
         </AnimatePresence>
 
@@ -5021,47 +5631,7 @@ export default function App() {
           )}
         </AnimatePresence>
 
-        {/* Full Screen Gallery Modal */}
-        <AnimatePresence>
-          {fullScreenGalleryFile && (
-            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-[200] flex items-center justify-center bg-black/95 backdrop-blur-xl" onClick={() => { setFullScreenGalleryFile(null); syncUrl({ galleryFileId: null }); }} onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd}>
-              
-              <div className="absolute top-4 right-4 z-50">
-                <button onClick={(e) => { e.stopPropagation(); setFullScreenGalleryFile(null); syncUrl({ galleryFileId: null }); }} className="p-3 bg-white/10 hover:bg-white/20 text-white rounded-full backdrop-blur-md transition-all">
-                  <X size={24} />
-                </button>
-              </div>
 
-              <div className="absolute top-4 left-4 z-50 text-white/50 text-sm font-bold tracking-widest uppercase bg-black/40 px-4 py-2 rounded-xl backdrop-blur-md">
-                {currentGalleryIndex + 1} / {mediaFiles.length}
-              </div>
-
-              {hasPrevMedia && (
-                <button onClick={(e) => navigateGallery('prev', e)} className="absolute left-4 z-50 p-4 bg-white/5 hover:bg-white/10 text-white rounded-full backdrop-blur-md transition-all hidden sm:block">
-                  <ChevronLeft size={32} />
-                </button>
-              )}
-
-              <div className="relative w-full h-full flex flex-col items-center justify-center" onClick={e => e.stopPropagation()}>
-                {fullScreenGalleryFile.type === 'image' && (
-                  <img src={getMediaUrl(fullScreenGalleryFile)} className="w-full h-full object-contain pointer-events-none" alt={fullScreenGalleryFile.name} />
-                )}
-                {fullScreenGalleryFile.type === 'video' && (
-                  <video src={getMediaUrl(fullScreenGalleryFile)} controls autoPlay className="w-full h-full" />
-                )}
-                {fullScreenGalleryFile.type === 'audio' && (
-                  <audio src={getMediaUrl(fullScreenGalleryFile)} controls autoPlay className="w-full max-w-xl shadow-2xl" />
-                )}
-              </div>
-
-              {hasNextMedia && (
-                <button onClick={(e) => navigateGallery('next', e)} className="absolute right-4 z-50 p-4 bg-white/5 hover:bg-white/10 text-white rounded-full backdrop-blur-md transition-all hidden sm:block">
-                  <ChevronRight size={32} />
-                </button>
-              )}
-            </motion.div>
-          )}
-        </AnimatePresence>
 
         <ShareModal
           isOpen={Boolean(shareTargetFile)}

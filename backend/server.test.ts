@@ -2095,6 +2095,196 @@ test('Cloudyte E2EE Backend Suite (Tests 1-39)', async (t) => {
     assert.ok(Array.isArray(auditJson.logs));
     assert.ok(auditJson.logs.length > 0);
   });
+
+  await t.test('56. Downloads preserve Content-Length (no gzip stripping), support HEAD probes, HTTP Range 206 resume, If-Range, and 416', async () => {
+    // Upload a compressible >1KB text/plain file (> compression default 1024B threshold) to prove compression bypass works
+    const payloadStr = Array.from({ length: 64 }, (_, i) => `CLOUDYTE-CHUNK-${String(i).padStart(2, '0')}-0123456789ABCDEF`).join('');
+    const payload = Buffer.from(payloadStr, 'utf8');
+    assert.ok(payload.length > 1500, 'Payload must exceed 1024-byte compression threshold');
+    const sha256 = crypto.createHash('sha256').update(payload).digest('hex');
+
+    const initRes = await apiFetch(`/api/upload-sessions/${String(tgAccount1Id)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fileName: 'resumable-range-test.txt',
+        mimeType: 'text/plain',
+        totalBytes: payload.length,
+        chunkSize: payload.length,
+        folderId: 'root',
+        checksum: sha256,
+        idempotencyKey: `idem_range_test_${Date.now()}`,
+      }),
+    });
+    assert.equal(initRes.status, 201);
+    const { sessionId } = (await initRes.json()) as any;
+
+    const putChunkRes = await apiFetch(`/api/upload-sessions/${sessionId}/chunks`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': String(payload.length),
+        'X-Chunk-Offset': '0',
+      },
+      body: payload,
+    });
+    assert.equal(putChunkRes.status, 200);
+
+    const completeRes = await apiFetch(`/api/upload-sessions/${sessionId}/complete`, { method: 'POST' });
+    assert.equal(completeRes.status, 200);
+
+    const fileDoc = await mockDb.collection('tg_files').findOne({ accountId: tgAccount1Id, name: 'resumable-range-test.txt' });
+    assert.ok(fileDoc);
+
+    // 1. HEAD probe on a single-use ticket returns exact Content-Length & Accept-Ranges without burning the ticket
+    const oneTimeRes = await apiFetch('/api/download-tickets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        accountId: String(tgAccount1Id),
+        fileId: String(fileDoc._id),
+        singleUse: true,
+        ttlSeconds: 300,
+      }),
+    });
+    assert.equal(oneTimeRes.status, 201);
+    const { ticket: oneTimeTicket } = (await oneTimeRes.json()) as any;
+
+    const headOneTime = await fetch(`${baseUrl}/api/download/ticket/${oneTimeTicket}`, {
+      method: 'HEAD',
+      headers: { 'Accept-Encoding': 'gzip, deflate, br' },
+    });
+    assert.equal(headOneTime.status, 200);
+    assert.equal(headOneTime.headers.get('content-length'), String(payload.length));
+    assert.equal(headOneTime.headers.get('accept-ranges'), 'bytes');
+    assert.equal(headOneTime.headers.get('content-encoding'), null);
+    assert.ok((headOneTime.headers.get('cache-control') || '').includes('no-transform'));
+
+    // First GET on single-use ticket still succeeds after HEAD probe
+    const getOneTime = await fetch(`${baseUrl}/api/download/ticket/${oneTimeTicket}`, {
+      headers: { 'Accept-Encoding': 'gzip, deflate, br' },
+    });
+    assert.equal(getOneTime.status, 200);
+    assert.equal(getOneTime.headers.get('content-length'), String(payload.length));
+    assert.equal(getOneTime.headers.get('content-encoding'), null);
+    const oneTimeBody = Buffer.from(await getOneTime.arrayBuffer());
+    assert.equal(Buffer.compare(oneTimeBody, payload), 0);
+
+    // Second GET on single-use ticket is still rejected with 410
+    const replayOneTime = await fetch(`${baseUrl}/api/download/ticket/${oneTimeTicket}`);
+    assert.equal(replayOneTime.status, 410);
+
+    // 2. Resumable ticket (singleUse: false) supports multi-request byte-range resume, suffix ranges, If-Range, and 416
+    const resumableRes = await apiFetch('/api/download-tickets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        accountId: String(tgAccount1Id),
+        fileId: String(fileDoc._id),
+        singleUse: false,
+        ttlSeconds: 3600,
+      }),
+    });
+    assert.equal(resumableRes.status, 201);
+    const { ticket: resumableTicket } = (await resumableRes.json()) as any;
+
+    // Part 1: bytes=0-511
+    const part1Res = await fetch(`${baseUrl}/api/download/ticket/${resumableTicket}`, {
+      headers: { Range: 'bytes=0-511', 'Accept-Encoding': 'gzip, deflate, br' },
+    });
+    assert.equal(part1Res.status, 206);
+    assert.equal(part1Res.headers.get('accept-ranges'), 'bytes');
+    assert.equal(part1Res.headers.get('content-range'), `bytes 0-511/${payload.length}`);
+    assert.equal(part1Res.headers.get('content-length'), '512');
+    assert.equal(part1Res.headers.get('content-encoding'), null);
+    const etag = part1Res.headers.get('etag');
+    assert.ok(etag);
+    const part1Buf = Buffer.from(await part1Res.arrayBuffer());
+    assert.equal(Buffer.compare(part1Buf, payload.subarray(0, 512)), 0);
+
+    // Part 2 (Resume from offset 512 with matching If-Range)
+    const part2Res = await fetch(`${baseUrl}/api/download/ticket/${resumableTicket}`, {
+      headers: { Range: 'bytes=512-', 'If-Range': etag!, 'Accept-Encoding': 'gzip, deflate, br' },
+    });
+    assert.equal(part2Res.status, 206);
+    assert.equal(part2Res.headers.get('content-range'), `bytes 512-${payload.length - 1}/${payload.length}`);
+    assert.equal(part2Res.headers.get('content-length'), String(payload.length - 512));
+    const part2Buf = Buffer.from(await part2Res.arrayBuffer());
+    assert.equal(Buffer.compare(Buffer.concat([part1Buf, part2Buf]), payload), 0);
+
+    // Suffix byte-range: last 64 bytes
+    const suffixRes = await fetch(`${baseUrl}/api/download/ticket/${resumableTicket}`, {
+      headers: { Range: 'bytes=-64' },
+    });
+    assert.equal(suffixRes.status, 206);
+    assert.equal(suffixRes.headers.get('content-range'), `bytes ${payload.length - 64}-${payload.length - 1}/${payload.length}`);
+    assert.equal(suffixRes.headers.get('content-length'), '64');
+    const suffixBuf = Buffer.from(await suffixRes.arrayBuffer());
+    assert.equal(Buffer.compare(suffixBuf, payload.subarray(payload.length - 64)), 0);
+
+    // Stale If-Range must fall back to full 200 OK instead of returning corrupt partial bytes
+    const staleIfRangeRes = await fetch(`${baseUrl}/api/download/ticket/${resumableTicket}`, {
+      headers: { Range: 'bytes=0-127', 'If-Range': '"stale-etag-mismatch"' },
+    });
+    assert.equal(staleIfRangeRes.status, 200);
+    assert.equal(staleIfRangeRes.headers.get('content-length'), String(payload.length));
+    const staleBody = Buffer.from(await staleIfRangeRes.arrayBuffer());
+    assert.equal(Buffer.compare(staleBody, payload), 0);
+
+    // Out-of-bounds and malformed byte-range must return 416 Range Not Satisfiable
+    const oobRes = await fetch(`${baseUrl}/api/download/ticket/${resumableTicket}`, {
+      headers: { Range: `bytes=${payload.length + 100}-${payload.length + 200}` },
+    });
+    assert.equal(oobRes.status, 416);
+    assert.equal(oobRes.headers.get('content-range'), `bytes */${payload.length}`);
+
+    const malformedRangeRes = await fetch(`${baseUrl}/api/download/ticket/${resumableTicket}`, {
+      headers: { Range: 'bytes=not-a-number' },
+    });
+    assert.equal(malformedRangeRes.status, 416);
+
+    // 3. Public share download supports HEAD + byte-range resume without double-counting HEAD or resume chunks
+    const shareRes = await apiFetch('/api/share', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        accountId: String(tgAccount1Id),
+        fileId: String(fileDoc._id),
+        maxDownloads: 2,
+      }),
+    });
+    assert.equal(shareRes.status, 200);
+    const { shareId } = (await shareRes.json()) as any;
+
+    const publicHead = await fetch(`${baseUrl}/api/public/download/${shareId}`, {
+      method: 'HEAD',
+      headers: { 'Accept-Encoding': 'gzip, deflate, br' },
+    });
+    assert.equal(publicHead.status, 200);
+    assert.equal(publicHead.headers.get('content-length'), String(payload.length));
+    assert.equal(publicHead.headers.get('accept-ranges'), 'bytes');
+    assert.equal(publicHead.headers.get('content-encoding'), null);
+
+    const publicPart1 = await fetch(`${baseUrl}/api/public/download/${shareId}`, {
+      headers: { Range: 'bytes=0-511' },
+    });
+    assert.equal(publicPart1.status, 206);
+    assert.equal(publicPart1.headers.get('content-range'), `bytes 0-511/${payload.length}`);
+    assert.equal(publicPart1.headers.get('content-length'), '512');
+    const pubBuf1 = Buffer.from(await publicPart1.arrayBuffer());
+
+    const publicPart2 = await fetch(`${baseUrl}/api/public/download/${shareId}`, {
+      headers: { Range: 'bytes=512-' },
+    });
+    assert.equal(publicPart2.status, 206);
+    assert.equal(publicPart2.headers.get('content-range'), `bytes 512-${payload.length - 1}/${payload.length}`);
+    const pubBuf2 = Buffer.from(await publicPart2.arrayBuffer());
+    assert.equal(Buffer.compare(Buffer.concat([pubBuf1, pubBuf2]), payload), 0);
+
+    // Verify share downloadCount was only incremented once (HEAD + offset>0 resume chunk did not double-count)
+    const shareDoc = await mockDb.collection('shares').findOne({ shareId });
+    assert.equal(Number(shareDoc?.downloadCount || 0), 1);
+  });
 });
 
 

@@ -624,3 +624,77 @@ export function buildSafeContentDisposition(dispositionType: 'inline' | 'attachm
   return `${dispositionType}; filename="${asciiFallback}"; filename*=UTF-8''${encoded}`;
 }
 
+export type ParsedByteRange =
+  | { kind: 'none' }
+  | { kind: 'invalid' }
+  | { kind: 'range'; start: number; end: number; length: number; header: string };
+
+/**
+ * Strictly parses a single HTTP Range header (RFC 9110 §14.1.2).
+ * Supports `bytes=start-end`, `bytes=start-`, and `bytes=-suffix`.
+ * Rejects control characters, negative offsets, and unsatisfiable ranges.
+ */
+export function parseHttpByteRange(rawRange: unknown, totalSize: number): ParsedByteRange {
+  if (typeof rawRange !== 'string') return { kind: 'none' };
+  const trimmed = rawRange.trim();
+  if (!trimmed) return { kind: 'none' };
+  if (/[\r\n\x00-\x1f\x7f]/.test(trimmed)) return { kind: 'invalid' };
+  if (!/^bytes=/i.test(trimmed)) return { kind: 'none' };
+  if (!Number.isFinite(totalSize) || totalSize <= 0) return { kind: 'none' };
+
+  const spec = trimmed.slice(6).trim();
+  // Multi-range requests (comma-separated) fall back cleanly to full 200 OK per RFC 9110 §14.2
+  if (spec.includes(',')) return { kind: 'none' };
+
+  const match = spec.match(/^(\d*)-(\d*)$/);
+  if (!match) return { kind: 'invalid' };
+  const [, startStr, endStr] = match;
+  if (!startStr && !endStr) return { kind: 'invalid' };
+
+  let start: number;
+  let end: number;
+
+  if (!startStr) {
+    // Suffix byte range: bytes=-N (last N bytes)
+    const suffixLength = Number(endStr);
+    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return { kind: 'invalid' };
+    start = Math.max(0, totalSize - suffixLength);
+    end = totalSize - 1;
+  } else {
+    start = Number(startStr);
+    if (!Number.isSafeInteger(start) || start < 0 || start >= totalSize) return { kind: 'invalid' };
+    if (!endStr) {
+      end = totalSize - 1;
+    } else {
+      const requestedEnd = Number(endStr);
+      if (!Number.isSafeInteger(requestedEnd) || requestedEnd < start) return { kind: 'invalid' };
+      end = Math.min(requestedEnd, totalSize - 1);
+    }
+  }
+
+  return {
+    kind: 'range',
+    start,
+    end,
+    length: end - start + 1,
+    header: `bytes=${start}-${end}`,
+  };
+}
+
+/**
+ * Checks RFC 9110 §13.1.5 If-Range precondition against the current entity tag.
+ * If If-Range is present and does not strongly match the current ETag, returns false
+ * so the server serves the complete 200 OK representation instead of corrupting a resume.
+ */
+export function shouldHonorRangeHeader(headers: Record<string, any> | undefined, etag: string): boolean {
+  const rawIfRange = headers?.['if-range'];
+  if (typeof rawIfRange !== 'string' || !rawIfRange.trim()) return true;
+  const ifRange = rawIfRange.trim();
+  if (ifRange.startsWith('W/')) return false;
+  if (ifRange.startsWith('"') && ifRange.endsWith('"')) {
+    return Boolean(etag) && ifRange === etag;
+  }
+  return true;
+}
+
+

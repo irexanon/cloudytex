@@ -3,7 +3,7 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 @theme {
-  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
   --color-brand: #2563eb;
   --color-brand-dark: #1d4ed8;
@@ -14,6 +14,7 @@
   --bg: #f8fafc;
   --rail: #ffffff;
   --sf: #ffffff;
+  --hover: #f1f5f9;
   --bd: #e2e8f0;
   --tx: #0f172a;
   --sub: #64748b;
@@ -34,9 +35,10 @@
 }
 
 .dark {
-  --bg: #020617;
-  --rail: #020617;
+  --bg: #070b14;
+  --rail: #090e1a;
   --sf: #0f172a;
+  --hover: #162033;
   --bd: #1e293b;
   --tx: #f1f5f9;
   --sub: #94a3b8;
