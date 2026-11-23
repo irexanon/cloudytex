@@ -79,6 +79,7 @@ export default function App() {
   const [mobileSearchOpen, setMobileSearchOpen] = useState(false);
   const [runningJobsCount, setRunningJobsCount] = useState(0);
   const [runningJobsPct, setRunningJobsPct] = useState(0);
+  const [cachedJobs, setCachedJobs] = useState<any[] | null>(null);
   const [userSettings, setUserSettings]   = useState<any>(null);
   const [linkProviderModal, setLinkProviderModal] = useState(initialRoute.modal === 'link-account');
   const [tgDriveModal, setTgDriveModal]   = useState(initialRoute.modal === 'tg-drive');
@@ -1946,11 +1947,12 @@ export default function App() {
     return () => window.removeEventListener('popstate', handlePopState);
   }, [isAuthenticated, accounts, files, selectedAccountId, selectedAdminUserId, openPreview, openFullScreenGallery]);
 
-  // Lightweight running-jobs polling for header status pill
+  // Lightweight running-jobs polling for header status pill & instant Transfers cache
   useEffect(() => {
     if (!isAuthenticated) {
       setRunningJobsCount(0);
       setRunningJobsPct(0);
+      setCachedJobs(null);
       return;
     }
     let cancelled = false;
@@ -1960,6 +1962,7 @@ export default function App() {
         if (!res.ok) return;
         const list = await res.json();
         if (cancelled || !Array.isArray(list)) return;
+        setCachedJobs(list);
         const active = list.filter((j: any) => j.status === 'running' || j.status === 'queued');
         setRunningJobsCount(active.length);
         if (active.length > 0) {
@@ -3649,6 +3652,8 @@ export default function App() {
               onClose={() => { setIsJobsDrawerOpen(false); syncUrl({ page: 'drive' }); }}
               getAuthHeaders={getAuthHeaders}
               onToast={showToast}
+              initialJobs={cachedJobs}
+              onJobsSynced={setCachedJobs}
               onJobsChanged={() => {
                 if (selectedAccountId) fetchFiles(selectedAccountId, currentFolderId, debouncedSearch, isTrashView);
               }}

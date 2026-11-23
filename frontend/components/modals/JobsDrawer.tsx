@@ -8,6 +8,8 @@ export interface JobsDrawerProps {
   getAuthHeaders: () => Record<string, string>;
   onToast: (msg: string, type?: 'success' | 'error') => void;
   onJobsChanged?: () => void;
+  initialJobs?: any[] | null;
+  onJobsSynced?: (jobs: any[]) => void;
   variant?: 'page' | 'drawer';
 }
 
@@ -56,34 +58,51 @@ export default function JobsDrawer({
   getAuthHeaders,
   onToast,
   onJobsChanged,
+  initialJobs = null,
+  onJobsSynced,
   variant = 'drawer',
 }: JobsDrawerProps) {
-  const [jobs, setJobs] = useState<any[]>([]);
+  const [jobs, setJobs] = useState<any[]>(() => (Array.isArray(initialJobs) ? initialJobs : []));
+  const [hasLoaded, setHasLoaded] = useState<boolean>(() => Array.isArray(initialJobs));
   const [health, setHealth] = useState<any>(null);
-  const [loading, setLoading] = useState(false);
+  const [isManualRefreshing, setIsManualRefreshing] = useState(false);
   const [verifyingId, setVerifyingId] = useState<string | null>(null);
   const [restoringId, setRestoringId] = useState<string | null>(null);
 
-  const loadJobs = useCallback(async () => {
-    setLoading(true);
+  useEffect(() => {
+    if (!hasLoaded && Array.isArray(initialJobs)) {
+      setJobs(initialJobs);
+      setHasLoaded(true);
+    }
+  }, [initialJobs, hasLoaded]);
+
+  const loadJobs = useCallback(async (manual = false) => {
+    if (manual) setIsManualRefreshing(true);
     try {
       const [jobsRes, healthRes] = await Promise.all([
         fetch('/api/jobs', { headers: getAuthHeaders() }),
         fetch('/api/jobs/health', { headers: getAuthHeaders() }),
       ]);
-      if (jobsRes.ok) setJobs(await jobsRes.json());
+      if (jobsRes.ok) {
+        const list = await jobsRes.json();
+        if (Array.isArray(list)) {
+          setJobs(list);
+          onJobsSynced?.(list);
+        }
+        setHasLoaded(true);
+      }
       if (healthRes.ok) setHealth(await healthRes.json());
     } catch {
       /* ignore */
     } finally {
-      setLoading(false);
+      if (manual) setIsManualRefreshing(false);
     }
-  }, [getAuthHeaders]);
+  }, [getAuthHeaders, onJobsSynced]);
 
   useEffect(() => {
     if (!isOpen) return;
-    loadJobs();
-    const timer = setInterval(loadJobs, 4000);
+    loadJobs(false);
+    const timer = setInterval(() => loadJobs(false), 4000);
     return () => clearInterval(timer);
   }, [isOpen, loadJobs]);
 
@@ -162,7 +181,23 @@ export default function JobsDrawer({
 
   const jobsListContent = (
     <>
-      {jobs.length === 0 ? (
+      {!hasLoaded ? (
+        <div className="bg-[var(--sf)] border border-[var(--bd)] rounded-[22px] divide-y divide-[var(--bd)]/75 overflow-hidden">
+          {[0, 1, 2].map((i) => (
+            <div key={i} className="p-4 sm:px-5 sm:py-4 space-y-3">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl bg-[var(--bg)] animate-pulse shrink-0" />
+                <div className="flex-1 space-y-2">
+                  <div className="h-3.5 w-44 max-w-[60%] rounded-md bg-[var(--bg)] animate-pulse" />
+                  <div className="h-3 w-28 rounded-md bg-[var(--bg)] animate-pulse" />
+                </div>
+                <div className="h-3.5 w-8 rounded-md bg-[var(--bg)] animate-pulse shrink-0" />
+              </div>
+              <div className="h-1.5 w-full rounded-full bg-[var(--bg)] animate-pulse" />
+            </div>
+          ))}
+        </div>
+      ) : jobs.length === 0 ? (
         <div className="py-20 px-6 text-center space-y-3 bg-[var(--sf)] border border-[var(--bd)] rounded-[24px]">
           <div className="w-12 h-12 mx-auto rounded-2xl bg-[var(--pi)] text-[var(--pit)] flex items-center justify-center">
             <ArrowLeftRight size={22} />
@@ -355,10 +390,10 @@ export default function JobsDrawer({
           </div>
           <button
             type="button"
-            onClick={loadJobs}
+            onClick={() => loadJobs(true)}
             className="h-9 px-3.5 rounded-full bg-[var(--sf)] border border-[var(--bd)] text-xs font-semibold text-[var(--tx)] hover:bg-[var(--hover)] flex items-center gap-2 transition-colors"
           >
-            <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
+            <RefreshCw size={14} className={isManualRefreshing ? 'animate-spin' : ''} />
             <span>Refresh</span>
           </button>
         </div>
@@ -398,11 +433,11 @@ export default function JobsDrawer({
               <div className="flex items-center gap-1.5">
                 <button
                   type="button"
-                  onClick={loadJobs}
+                  onClick={() => loadJobs(true)}
                   className="w-8 h-8 rounded-full hover:bg-[var(--hover)] text-[var(--sub)] hover:text-[var(--tx)] flex items-center justify-center transition-colors"
                   title="Refresh"
                 >
-                  <RefreshCw size={15} className={loading ? 'animate-spin' : ''} />
+                  <RefreshCw size={15} className={isManualRefreshing ? 'animate-spin' : ''} />
                 </button>
                 <button
                   type="button"
