@@ -480,6 +480,13 @@ Because Telegram bots cannot iterate historical messages before they joined, imp
   }
   ```
 
+### 5.4.2 Bulk Export Telegram Drive Index (JSON)
+Downloads all non-trashed files, text notes, and Forum Topic folders of a Telegram Drive account as a portable `.json` file directly compatible with `POST /api/tgdrive/:accountId/import`.
+- **Method & Route:** `GET /api/tgdrive/:accountId/export`
+- **Auth Required:** Yes (`read` scope; owner of `:accountId`)
+- **Response Headers:** `Content-Type: application/json; charset=utf-8`, `Content-Disposition: attachment; filename="<drive-name>-export.json"`
+- **Response (200 OK):** `{ "exportedAt": "...", "driveName": "...", "channelId": "...", "isForum": true, "topics": [...], "files": [...] }`
+
 ---
 
 ### 5.5 Telegram Drive Database & Virtual Filesystem Architecture

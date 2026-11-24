@@ -1276,6 +1276,78 @@ app.post('/api/tgdrive/:accountId/import', requireAuth, async (req: any, res: an
   }
 });
 
+// ─── TG Drive JSON Export (Backup topics, files & notes for future re-import) ─
+app.get('/api/tgdrive/:accountId/export', requireAuth, async (req: any, res: any) => {
+  const { accountId } = req.params;
+  const userId = req.userId;
+  const database = req.db;
+
+  const { account, accessDenied } = await resolveAuthorizedAccount(database, accountId, userId, req.isAdmin);
+  if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
+  if (!account) return apiError(res, 404, STANDARD_ERROR_CODES.NOT_FOUND, 'Account not found', req.requestId);
+  if (account.accountType !== 'tgdrive') {
+    return apiError(res, 400, STANDARD_ERROR_CODES.BAD_REQUEST, 'JSON export is only supported for Telegram Drive accounts', req.requestId);
+  }
+
+  try {
+    const [folderDocs, fileDocs] = await Promise.all([
+      database.collection('tg_folders').find({ accountId: account._id }).sort({ createdAt: 1, path: 1 }).toArray(),
+      database.collection('tg_files').find({ accountId: account._id, trashed: { $ne: true } }).sort({ date: 1, messageId: 1 }).toArray(),
+    ]);
+
+    const topics = folderDocs.map((folder: any) => ({
+      ...(Number.isSafeInteger(Number(folder.threadId)) && Number(folder.threadId) > 0 ? { threadId: Number(folder.threadId) } : {}),
+      name: String(folder.name || folder.path || 'Folder'),
+      path: String(folder.path || folder.name || ''),
+      ...(folder.createdAt ? { createdAt: Number(folder.createdAt) } : {}),
+    }));
+
+    const files = fileDocs
+      .filter((f: any) => !f.isEncrypted && Number.isSafeInteger(Number(f.messageId)) && Number(f.messageId) > 0)
+      .map((f: any) => ({
+        messageId: Number(f.messageId),
+        ...(Number.isSafeInteger(Number(f.threadId)) && Number(f.threadId) > 0 ? { threadId: Number(f.threadId) } : {}),
+        ...(f.folder ? { folder: String(f.folder) } : {}),
+        name: String(f.name || `file_${f.messageId}`),
+        size: Number(f.size || 0),
+        mimeType: String(f.mimeType || 'application/octet-stream'),
+        ...(f.date ? { date: Number(f.date) } : {}),
+        ...(f.caption ? { caption: String(f.caption) } : {}),
+        ...(f.isNote ? { type: 'note', isNote: true } : {}),
+        ...(f.isNote && typeof f.textContent === 'string' ? { text: f.textContent } : {}),
+      }));
+
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      driveName: String(account.name || 'TG Drive'),
+      channelId: String(account.channelId || ''),
+      isForum: Boolean(account.isForum) || topics.some((t: any) => Number(t.threadId) > 1),
+      topics,
+      files,
+    };
+
+    const safeBaseName = sanitizeImportedSegment(account.name || 'tgdrive', 'tgdrive')
+      .replace(/\s+/g, '-')
+      .toLowerCase();
+    const downloadFileName = `${safeBaseName}-export.json`;
+
+    recordAuditEvent('tgdrive_json_exported', {
+      userId: String(userId || ''),
+      accountId: String(account._id),
+      topicCount: topics.length,
+      fileCount: files.length,
+    });
+
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Content-Disposition', buildSafeContentDisposition('attachment', downloadFileName));
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(JSON.stringify(payload, null, 2));
+  } catch (err: any) {
+    console.error('TG Drive JSON export error:', err);
+    return apiError(res, 500, STANDARD_ERROR_CODES.INTERNAL_ERROR, err.message || 'Export failed', req.requestId);
+  }
+});
+
 // ─── User settings ────────────────────────────────────────────────────────────
 app.post('/api/user/settings', requireAuth, async (req: any, res: any) => {
   const { backupEnabled, backupAccId, isDefaultAccId } = req.body || {};

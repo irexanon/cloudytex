@@ -838,6 +838,9 @@ export function normaliseTgFile(f: any, accountId?: string) {
   const isMedia = type === 'image' || type === 'video';
   const accIdStr = accountId || (f.accountId ? String(f.accountId) : '');
   const numericSize = f.size ? Number(f.size) : (f.isNote && typeof f.textContent === 'string' ? Buffer.byteLength(f.textContent, 'utf8') : 0);
+  const textPreview = (f.isNote || typeof f.textContent === 'string') && typeof f.textContent === 'string'
+    ? f.textContent.replace(/\s+\n/g, '\n').trim().slice(0, 240)
+    : undefined;
 
   return {
     id:                      idStr,
@@ -846,6 +849,7 @@ export function normaliseTgFile(f: any, accountId?: string) {
     type,
     mimeType:                f.mimeType,
     ...(f.isNote ? { isNote: true } : {}),
+    ...(textPreview !== undefined ? { textPreview } : {}),
     size:                    formatTgDisplaySize(numericSize),
     sizeBytes:               numericSize,
     isEncrypted:             false,

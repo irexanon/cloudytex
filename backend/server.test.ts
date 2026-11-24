@@ -2502,6 +2502,7 @@ test('Cloudyte E2EE Backend Suite (Tests 1-39)', async (t) => {
     assert.equal(note1.mimeType, 'text/plain');
     assert.equal(note1.type, 'doc');
     assert.equal(note1.isNote, true);
+    assert.ok(String(note1.textPreview || '').includes('Deployment Checklist'));
     assert.equal(note1.sizeBytes, expectedBytes);
 
     const note2 = items.find((i) => i.messageId === 802);
@@ -2539,6 +2540,77 @@ test('Cloudyte E2EE Backend Suite (Tests 1-39)', async (t) => {
     } finally {
       mockTgClient.getMessages = origGetMessages;
     }
+  });
+
+  await t.test('60. TG Drive JSON export returns topics, media, and notes in re-importable format', async () => {
+    const srcAccId = new ObjectId();
+    await mockDb.collection('accounts').insertOne({
+      _id: srcAccId,
+      userId: user1Id,
+      accountType: 'tgdrive',
+      channelId: '-100444333222',
+      name: 'Backup Export Drive',
+      email: 'Forum Group: -100444333222',
+      chatType: 'supergroup',
+      isForum: true,
+      createdAt: new Date(),
+    });
+
+    await apiFetch(`/api/tgdrive/${String(srcAccId)}/import`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        isForum: true,
+        topics: [{ threadId: 21, name: 'Archives' }],
+        files: [
+          { messageId: 901, threadId: 21, name: 'backup.zip', size: 20480, mimeType: 'application/zip', date: 1732200000 },
+          { messageId: 902, threadId: 21, text: 'Important backup note', date: 1732200100 },
+        ],
+      }),
+    });
+
+    // Other user must not export this account
+    const deniedRes = await apiFetch(`/api/tgdrive/${String(srcAccId)}/export`, {}, token2);
+    assert.equal(deniedRes.status, 403);
+
+    const exportRes = await apiFetch(`/api/tgdrive/${String(srcAccId)}/export`);
+    assert.equal(exportRes.status, 200);
+    assert.ok((exportRes.headers.get('content-disposition') || '').includes('backup-export-drive-export.json'));
+    const exported: any = await exportRes.json();
+
+    assert.equal(exported.isForum, true);
+    assert.equal(exported.driveName, 'Backup Export Drive');
+    assert.equal(exported.topics.length, 1);
+    assert.equal(exported.topics[0].threadId, 21);
+    assert.equal(exported.topics[0].name, 'Archives');
+    assert.equal(exported.files.length, 2);
+    const exportedNote = exported.files.find((f: any) => f.messageId === 902);
+    assert.equal(exportedNote.isNote, true);
+    assert.equal(exportedNote.text, 'Important backup note');
+
+    // Round-trip: import exported JSON into a brand new TG Drive account
+    const dstAccId = new ObjectId();
+    await mockDb.collection('accounts').insertOne({
+      _id: dstAccId,
+      userId: user1Id,
+      accountType: 'tgdrive',
+      channelId: '-100444333223',
+      name: 'Restored Drive',
+      email: 'Forum Group: -100444333223',
+      chatType: 'supergroup',
+      isForum: false,
+      createdAt: new Date(),
+    });
+
+    const reimportRes = await apiFetch(`/api/tgdrive/${String(dstAccId)}/import`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(exported),
+    });
+    assert.equal(reimportRes.status, 200);
+    const reimportData: any = await reimportRes.json();
+    assert.equal(reimportData.importedTopics, 1);
+    assert.equal(reimportData.importedFiles, 2);
   });
 });
 

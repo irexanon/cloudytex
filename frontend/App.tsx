@@ -722,6 +722,32 @@ export default function App() {
     }
   };
 
+  const handleExportTgJson = async (acc: any) => {
+    if (!acc?.id) return;
+    try {
+      const res = await fetch(`/api/tgdrive/${encodeURIComponent(acc.id)}/export`, {
+        headers: getAuthHeaders(),
+      });
+      if (!res.ok) {
+        let errMsg = 'Export failed';
+        try {
+          const j = await res.json();
+          if (j?.error) errMsg = j.error;
+        } catch {}
+        throw new Error(errMsg);
+      }
+      const blob = await res.blob();
+      const safeName = String(acc.name || 'tgdrive')
+        .toLowerCase()
+        .replace(/[^a-z0-9-_]+/g, '-')
+        .replace(/^-+|-+$/g, '') || 'tgdrive';
+      saveAs(blob, `${safeName}-export.json`);
+      showToast(`Exported ${acc.name || 'TG Drive'} JSON`);
+    } catch (err: any) {
+      showToast(err?.message || 'Failed to export JSON', 'error');
+    }
+  };
+
   const handleUnlink = async (accountOrId: any) => {
     const accObj = typeof accountOrId === 'string'
       ? accounts.find(a => a.id === accountOrId)
@@ -2223,8 +2249,8 @@ export default function App() {
       if (sortBy === 'size') {
         cmp = parseReadableSizeToBytes(a.sizeBytes ?? a.size) - parseReadableSizeToBytes(b.sizeBytes ?? b.size);
       } else if (sortBy === 'modified') {
-        const aTime = Date.parse(a.modifiedTime || a.modified || a.createdAt || '') || 0;
-        const bTime = Date.parse(b.modifiedTime || b.modified || b.createdAt || '') || 0;
+        const aTime = typeof a.updatedAt === 'number' ? a.updatedAt : (Date.parse(a.modifiedTime || a.modified || a.createdAt || '') || 0);
+        const bTime = typeof b.updatedAt === 'number' ? b.updatedAt : (Date.parse(b.modifiedTime || b.modified || b.createdAt || '') || 0);
         cmp = aTime - bTime;
       }
       if (cmp === 0) {
@@ -3801,17 +3827,30 @@ export default function App() {
                                           </button>
                                         )}
                                         {acc.accountType === 'tgdrive' && (
-                                          <button
-                                            type="button"
-                                            onClick={() => {
-                                              setOpenAccountMenuId(null);
-                                              openTgImportModal(acc);
-                                            }}
-                                            className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"
-                                          >
-                                            <Upload size={14} className="text-sky-500" />
-                                            <span>Import JSON</span>
-                                          </button>
+                                          <>
+                                            <button
+                                              type="button"
+                                              onClick={() => {
+                                                setOpenAccountMenuId(null);
+                                                openTgImportModal(acc);
+                                              }}
+                                              className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"
+                                            >
+                                              <Upload size={14} className="text-sky-500" />
+                                              <span>Import JSON</span>
+                                            </button>
+                                            <button
+                                              type="button"
+                                              onClick={() => {
+                                                setOpenAccountMenuId(null);
+                                                handleExportTgJson(acc);
+                                              }}
+                                              className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"
+                                            >
+                                              <Download size={14} className="text-sky-500" />
+                                              <span>Export JSON</span>
+                                            </button>
+                                          </>
                                         )}
                                         <button
                                           type="button"
@@ -4562,7 +4601,13 @@ export default function App() {
                               </div>
 
                               <div className="min-w-0">
-                                <p className="text-sm font-medium text-[var(--tx)] truncate">{file.name}</p>
+                                {file.isNote && file.textPreview ? (
+                                  <p className="text-sm font-normal text-[var(--tx)] truncate" title={file.textPreview}>
+                                    {file.textPreview.replace(/\s+/g, ' ')}
+                                  </p>
+                                ) : (
+                                  <p className="text-sm font-medium text-[var(--tx)] truncate">{file.name}</p>
+                                )}
                               </div>
 
                               <span className="text-[13px] font-normal text-[var(--sub)] truncate tabular-nums">
@@ -4644,7 +4689,13 @@ export default function App() {
                               />
                             </div>
                             <div className="min-w-0">
-                              <p className="text-[14.5px] font-medium text-[var(--tx)] truncate">{file.name}</p>
+                              {file.isNote && file.textPreview ? (
+                                <p className="text-[13.5px] font-normal text-[var(--tx)] line-clamp-2 leading-snug">
+                                  {file.textPreview}
+                                </p>
+                              ) : (
+                                <p className="text-[14.5px] font-medium text-[var(--tx)] truncate">{file.name}</p>
+                              )}
                               <p className="text-xs text-[var(--sub)] truncate mt-0.5 tabular-nums">
                                 {file.type === 'folder'
                                   ? `Folder · ${file.modified || '—'}`
@@ -4721,27 +4772,44 @@ export default function App() {
                             <MoreVertical size={16} />
                           </button>
 
-                          {/* Centered Large Icon or Image Thumbnail */}
-                          <div className="mt-2 mb-3 flex items-center justify-center">
-                            <FileIcon
-                              file={file}
-                              type={file.type}
-                              size="lg"
-                              isTg={file.isTgDrive}
-                              accountId={selectedAccountId}
-                              showThumbnails={userSettings?.showThumbnails !== false}
-                            />
-                          </div>
+                          {file.isNote && file.textPreview ? (
+                            <>
+                              <div className="mt-2 mb-3 w-full h-[92px] rounded-xl bg-[var(--bg)]/85 border border-[var(--bd)]/80 p-3 text-left overflow-hidden flex flex-col justify-start">
+                                <p className="text-[12px] leading-relaxed text-[var(--tx)] font-normal whitespace-pre-wrap break-words line-clamp-4">
+                                  {file.textPreview}
+                                </p>
+                              </div>
+                              <div className="w-full min-w-0 space-y-0.5">
+                                <p className="text-[11.5px] text-[var(--sub)] truncate tabular-nums">
+                                  {file.modified && file.modified !== '-' ? `${file.modified} · ${file.size}` : file.size || '—'}
+                                </p>
+                              </div>
+                            </>
+                          ) : (
+                            <>
+                              {/* Centered Large Icon or Image Thumbnail */}
+                              <div className="mt-2 mb-3 flex items-center justify-center">
+                                <FileIcon
+                                  file={file}
+                                  type={file.type}
+                                  size="lg"
+                                  isTg={file.isTgDrive}
+                                  accountId={selectedAccountId}
+                                  showThumbnails={userSettings?.showThumbnails !== false}
+                                />
+                              </div>
 
-                          {/* Centered Name & Subtle Meta */}
-                          <div className="w-full min-w-0 space-y-0.5">
-                            <p className="text-[13.5px] font-semibold text-[var(--tx)] truncate" title={file.name}>
-                              {file.name}
-                            </p>
-                            <p className="text-[11.5px] text-[var(--sub)] truncate tabular-nums">
-                              {file.type === 'folder' ? 'Folder' : file.size || file.modified || '—'}
-                            </p>
-                          </div>
+                              {/* Centered Name & Subtle Meta */}
+                              <div className="w-full min-w-0 space-y-0.5">
+                                <p className="text-[13.5px] font-semibold text-[var(--tx)] truncate" title={file.name}>
+                                  {file.name}
+                                </p>
+                                <p className="text-[11.5px] text-[var(--sub)] truncate tabular-nums">
+                                  {file.type === 'folder' ? 'Folder' : file.size || file.modified || '—'}
+                                </p>
+                              </div>
+                            </>
+                          )}
                         </div>
                       );
                     })}
