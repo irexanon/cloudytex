@@ -1182,3 +1182,83 @@ Clients may store an opaque PBKDF2-wrapped key backup per account. The server ne
 | `KEY_BACKUP_INVALID` | `400` | Invalid key backup envelope or weak KDF iteration count |
 | `KEY_BACKUP_TOO_LARGE` | `413` | Key backup exceeds 16 KiB |
 | `ACCOUNT_ACCESS_DENIED` | `403` | Authenticated user does not own the target account, file, or session |
+
+---
+
+## 12. Whole-Drive Manifest, Server-Side Drive Copy/Move & Multi-Bot Worker Pool
+
+### 12.1 Recursive Whole-Drive Manifest (Android / Desktop Native Downloads)
+Enumerates all non-trashed folders and files across an account (or a specific subfolder) with sanitized relative paths and byte sizes so native clients (such as the Cloudyte Android app) can queue whole-drive resumable downloads via HTTP `Range` requests.
+
+- **Method & Route:** `GET /api/accounts/:accountId/manifest`
+- **Auth Required:** Yes (account owner or admin)
+- **Query Parameters:**
+  - `folderId` *(optional)*: Scope manifest to a specific subfolder (relative paths are returned relative to this folder).
+  - `maxFiles` *(optional, default `25000`, max `25000`)*: Maximum number of file entries returned.
+- **Response (`200 OK`):**
+  ```json
+  {
+    "accountId": "67c1...",
+    "accountType": "tgdrive",
+    "driveName": "My TG Vault",
+    "rootFolderId": "root",
+    "generatedAt": "2026-11-24T10:00:00.000Z",
+    "truncated": false,
+    "totalFolders": 2,
+    "totalFiles": 3,
+    "totalBytes": 12408,
+    "folders": ["Docs", "Photos/2026"],
+    "files": [
+      {
+        "id": "67c2...",
+        "name": "trip.jpg",
+        "folderPath": "Photos/2026",
+        "relativePath": "Photos/2026/trip.jpg",
+        "sizeBytes": 4096,
+        "mimeType": "image/jpeg",
+        "updatedAt": "2026-11-24T09:15:00.000Z",
+        "isEncrypted": false,
+        "isNote": false
+      }
+    ]
+  }
+  ```
+
+### 12.2 Server-Side Whole-Drive Copy & Move
+Starts a durable background job (`type: "drive_transfer"`) that replicates the entire folder hierarchy and copies or moves all files from a source drive to a destination drive.
+- **TG Drive → TG Drive** uses zero-bandwidth Telegram server-side copy (`ForwardMessages` with `dropAuthor: true`) plus instant `.txt` note cloning, with automatic streaming fallback.
+- **Cross-Provider (TG ↔ Google Drive ↔ OneDrive)** streams file-by-file via the transfer queue.
+- **Move Safety:** Source files are deleted only after each file is verified at the destination; skipped or failed files remain untouched.
+- Progress is visible on both Web and Android via `GET /api/jobs` and `GET /api/jobs/:jobId`.
+
+- **Method & Route:** `POST /api/transfers/drive`
+- **Auth Required:** Yes (must own both source and destination accounts)
+- **Request Body (JSON):**
+  ```json
+  {
+    "sourceAccountId": "67c1...",
+    "targetAccountId": "67c2...",
+    "sourceFolderId": "root",
+    "targetFolderId": "Backups/OldDrive",
+    "isMove": false,
+    "conflictStrategy": "skip"
+  }
+  ```
+  - `conflictStrategy`: `"skip"` (default) | `"rename"` | `"overwrite"`
+- **Response (`202 Accepted`):**
+  ```json
+  {
+    "success": true,
+    "async": true,
+    "jobId": "ab12...",
+    "status": "queued"
+  }
+  ```
+
+### 12.3 Multi-Bot Telegram Worker Pool
+Configure `TELEGRAM_WORKER_BOT_TOKENS` (comma-, semicolon-, or newline-separated bot tokens) alongside `TELEGRAM_BOT_TOKEN` to add silent worker bots for parallel TG Drive uploads, downloads, thumbnail generation, and transfers:
+- **Load Balancing:** Routes heavy MTProto traffic to the least-loaded healthy bot, preferring silent workers while keeping the main bot responsive for interactive commands.
+- **`FLOOD_WAIT` Circuit Breaker:** Automatically puts any rate-limited bot on cooldown for its exact Telegram `FLOOD_WAIT` duration and immediately fails over to the next healthy bot.
+- **Per-Channel Auto-Routing:** If a worker bot is not an admin in a specific channel/group, the pool marks that worker ineligible for that channel and routes seamlessly to eligible bots or the main bot.
+- **Observability:** Safe, token-free pool metrics are exposed in `GET /api/admin/metrics` under `telegramBotPool`.
+

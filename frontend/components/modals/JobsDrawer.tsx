@@ -21,16 +21,21 @@ function formatBytes(bytes: number | null | undefined): string {
   return `${(n / 1024 ** i).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
-function formatJobTypeLabel(rawType: string | undefined): string {
+function formatJobTypeLabel(rawType: string | undefined, isMove?: boolean): string {
   switch (rawType) {
+    case 'drive_transfer':
+      return isMove ? 'Drive move' : 'Drive copy';
     case 'cross_account_move':
     case 'cross_drive_move':
       return 'Cross-drive move';
     case 'cross_account_copy':
     case 'cross_drive_copy':
       return 'Cross-drive copy';
+    case 'cross_account_transfer':
+      return isMove ? 'Cross-drive move' : 'Cross-drive copy';
     case 'batch_backup':
       return 'Batch backup';
+    case 'batch_restore':
     case 'backup_restore':
       return 'Backup restore';
     default:
@@ -220,8 +225,9 @@ export default function JobsDrawer({
             const activeEnd = pct <= 0 ? 0 : Math.min(waveWidth - 2, Math.max(8, (pct / 100) * (waveWidth - 4) + 2));
             const trackStart = pct <= 0 ? 2 : Math.min(waveWidth - 4, activeEnd + 6);
             const strokeColor = isFailed ? '#F43F5E' : isCompleted ? '#10B981' : '#2563EB';
-            const primaryName = job.fileName || job.payload?.fileName || formatJobTypeLabel(job.type);
+            const primaryName = job.fileName || job.payload?.fileName || formatJobTypeLabel(job.type, job.isMove);
             const showTypeSubtitle = Boolean(job.fileName || job.payload?.fileName);
+            const showItemProgress = job.type === 'drive_transfer' || Number(job.totalItems || 0) > 1;
 
             return (
               <div key={job.id || job.jobId || idx} className="p-4 sm:px-5 sm:py-4 space-y-3">
@@ -249,16 +255,32 @@ export default function JobsDrawer({
                       <p className="text-xs text-[var(--sub)] mt-0.5 tabular-nums flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
                         {showTypeSubtitle && (
                           <>
-                            <span>{formatJobTypeLabel(job.type)}</span>
+                            <span>{formatJobTypeLabel(job.type, job.isMove)}</span>
                             <span aria-hidden="true">·</span>
                           </>
                         )}
                         <span>{formatStatusLabel(job.status, job.stage)}</span>
+                        {showItemProgress && Number(job.totalItems || 0) > 0 && (
+                          <>
+                            <span aria-hidden="true">·</span>
+                            <span>
+                              {Number(job.itemsProcessed || 0)} / {Number(job.totalItems || 0)} files
+                            </span>
+                          </>
+                        )}
                         {job.totalBytes > 0 && (
                           <>
                             <span aria-hidden="true">·</span>
                             <span>
                               {formatBytes(job.bytesProcessed)} / {formatBytes(job.totalBytes)}
+                            </span>
+                          </>
+                        )}
+                        {Number(job.failedCount || 0) > 0 && (
+                          <>
+                            <span aria-hidden="true">·</span>
+                            <span className="text-amber-600 dark:text-amber-400 font-semibold">
+                              {job.failedCount} failed
                             </span>
                           </>
                         )}

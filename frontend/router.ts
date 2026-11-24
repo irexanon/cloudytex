@@ -1,5 +1,5 @@
 export type AppPage = 'drive' | 'settings' | 'jobs' | 'admin';
-export type SettingsTab = 'general' | 'sessions' | 'tokens' | 'shares';
+export type SettingsTab = 'general' | 'accounts' | 'sessions' | 'tokens' | 'shares';
 export type AdminTab = 'overview' | 'metrics' | 'audit';
 export type OverlayModal = 'link-account' | 'tg-drive' | 'move' | 'copy' | null;
 
@@ -25,7 +25,7 @@ export interface AppRouteState {
   modal: OverlayModal;
 }
 
-const VALID_SETTINGS_TABS = new Set<SettingsTab>(['general', 'sessions', 'tokens', 'shares']);
+const VALID_SETTINGS_TABS = new Set<SettingsTab>(['general', 'accounts', 'sessions', 'tokens', 'shares']);
 const VALID_ADMIN_TABS = new Set<AdminTab>(['overview', 'metrics', 'audit']);
 const VALID_MODALS = new Set<Exclude<OverlayModal, null>>(['link-account', 'tg-drive', 'move', 'copy']);
 

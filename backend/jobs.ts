@@ -39,6 +39,8 @@ import {
   markTgChannelInaccessible,
   resolvePeer,
   getTgClient,
+  withTgPoolClient,
+  tgFastCopyMessage,
   getDriveClient,
   getOneDriveClient,
   resolveAuthorizedAccount,
@@ -332,11 +334,20 @@ async function crossAccountTransfer(
           });
           await onProgress?.({ stage: 'downloading', bytesProcessed: noteBuf.length, totalBytes: noteBuf.length, progressPct: 50 });
         } else {
-          const telegram = await getTgClient();
+          let telegram: any = null;
           let messages: any;
           try {
-            const peer = await resolvePeer(telegram, sourceAccount.channelId);
-            messages = await telegram.getMessages(peer, { ids: [meta.messageId] });
+            const fetched = await withTgPoolClient(
+              sourceAccount.channelId,
+              async (tgc) => {
+                const peer = await resolvePeer(tgc, sourceAccount.channelId);
+                const msgs = await tgc.getMessages(peer, { ids: [meta.messageId] });
+                return { tgc, msgs };
+              },
+              { preferWorker: true }
+            );
+            telegram = fetched.tgc;
+            messages = fetched.msgs;
           } catch (tgErr: any) {
             if (isTgChannelAccessError(tgErr)) {
               markTgChannelInaccessible(sourceAccount.channelId, tgErr);
@@ -577,9 +588,10 @@ async function crossAccountTransfer(
     deleteThumbFiles(fileId, String(sourceAccount._id));
     if (sourceAccount.accountType === 'tgdrive') {
       if (sourceMeta) {
-        const telegram = await getTgClient();
-        const peer = await resolvePeer(telegram, sourceAccount.channelId);
-        try { await telegram.deleteMessages(peer, [sourceMeta.messageId], { revoke: true }); } catch { /* ignore */ }
+        await withTgPoolClient(sourceAccount.channelId, async (telegram) => {
+          const peer = await resolvePeer(telegram, sourceAccount.channelId);
+          try { await telegram.deleteMessages(peer, [sourceMeta.messageId], { revoke: true }); } catch { /* ignore */ }
+        });
         await database.collection('tg_files').deleteOne({ _id: sourceMeta._id });
       }
     } else if (sourceAccount.accountType === 'onedrive') {
@@ -759,8 +771,708 @@ async function executeBatchBackupOrRestore(
   invalidateDriveCache(targetAccountId);
 }
 
+// ─── Whole-Drive Manifest & Recursive Drive Copy / Move Engine ───────────────
+export interface ManifestFileItem {
+  id: string;
+  name: string;
+  relativePath: string;
+  folderPath: string;
+  sizeBytes: number;
+  mimeType: string;
+  updatedAt: string | null;
+  isEncrypted: boolean;
+  isNote: boolean;
+  messageId?: number | null;
+  textContent?: string | null;
+}
+
+export interface AccountManifest {
+  accountId: string;
+  accountType: string;
+  driveName: string;
+  rootFolderId: string;
+  generatedAt: string;
+  truncated: boolean;
+  totalFolders: number;
+  totalFiles: number;
+  totalBytes: number;
+  folders: string[];
+  files: ManifestFileItem[];
+}
+
+function sanitizeManifestSegment(raw: string, fallback = 'untitled'): string {
+  const cleaned = String(raw || '')
+    .replace(/[\\/\0]+/g, '_')
+    .replace(/^\.+$/, '')
+    .trim();
+  return cleaned || fallback;
+}
+
+function normalizeRelativeFolderPath(raw: string): string {
+  return String(raw || '')
+    .split('/')
+    .map((s) => s.trim())
+    .filter((s) => s && s !== '.' && s !== '..')
+    .join('/');
+}
+
+/**
+ * Recursively enumerates all non-trashed folders & files in an account (or subfolder).
+ * Powers both GET /api/accounts/:accountId/manifest (for native Android whole-drive downloads)
+ * and server-side whole-drive copy/move jobs.
+ */
+async function collectAccountManifest(
+  database: any,
+  account: any,
+  rootFolderId = '',
+  maxFiles = 25000,
+  includeNoteContent = false
+): Promise<AccountManifest> {
+  const accountId = String(account._id);
+  const driveName = account.name || account.email || (account.accountType === 'tgdrive' ? 'TG Drive' : 'Cloud Drive');
+  const foldersSet = new Set<string>();
+  const files: ManifestFileItem[] = [];
+  let totalBytes = 0;
+  let truncated = false;
+  const effectiveRoot = !rootFolderId || rootFolderId === 'root' ? '' : String(rootFolderId).trim();
+
+  if (account.accountType === 'tgdrive') {
+    const rootPrefix = normalizeRelativeFolderPath(effectiveRoot);
+    const tgFolders = await database.collection('tg_folders')
+      .find({ accountId: account._id })
+      .sort({ path: 1 })
+      .toArray();
+
+    for (const f of tgFolders) {
+      const fPath = normalizeRelativeFolderPath(String(f.path || ''));
+      if (!fPath) continue;
+      if (!rootPrefix) {
+        foldersSet.add(fPath);
+      } else if (fPath.startsWith(`${rootPrefix}/`)) {
+        const rel = fPath.slice(rootPrefix.length + 1);
+        if (rel) foldersSet.add(rel);
+      }
+    }
+
+    const tgFiles = await database.collection('tg_files')
+      .find({ accountId: account._id, trashed: { $ne: true } })
+      .sort({ folder: 1, date: 1, _id: 1 })
+      .limit(maxFiles + 1)
+      .toArray();
+
+    for (const doc of tgFiles) {
+      const rawFolder = normalizeRelativeFolderPath(String(doc.folder || ''));
+      let relFolder = rawFolder;
+      if (rootPrefix) {
+        if (rawFolder === rootPrefix) {
+          relFolder = '';
+        } else if (rawFolder.startsWith(`${rootPrefix}/`)) {
+          relFolder = rawFolder.slice(rootPrefix.length + 1);
+        } else {
+          continue;
+        }
+      }
+      if (files.length >= maxFiles) {
+        truncated = true;
+        break;
+      }
+      if (relFolder) foldersSet.add(relFolder);
+      const isEncrypted = doc.isEncrypted === true;
+      const isNote = doc.isNote === true;
+      const rawName = isEncrypted ? (doc.opaqueRemoteName || doc.name || 'encrypted.bin') : (doc.name || 'file');
+      const safeName = sanitizeManifestSegment(rawName, `file_${String(doc._id).slice(-6)}`);
+      const sizeBytes = Number(isEncrypted ? (doc.encryptedSizeBytes ?? doc.size ?? 0) : (doc.size ?? 0)) || 0;
+      const updatedMs = doc.updatedAt
+        ? new Date(doc.updatedAt).getTime()
+        : (doc.date ? Number(doc.date) * 1000 : null);
+
+      const item: ManifestFileItem = {
+        id: String(doc._id),
+        name: safeName,
+        folderPath: relFolder,
+        relativePath: relFolder ? `${relFolder}/${safeName}` : safeName,
+        sizeBytes,
+        mimeType: isEncrypted ? 'application/octet-stream' : (doc.mimeType || (isNote ? 'text/plain; charset=utf-8' : 'application/octet-stream')),
+        updatedAt: updatedMs && Number.isFinite(updatedMs) ? new Date(updatedMs).toISOString() : null,
+        isEncrypted,
+        isNote,
+        messageId: Number.isInteger(Number(doc.messageId)) ? Number(doc.messageId) : null,
+        ...(includeNoteContent && isNote && typeof doc.textContent === 'string' ? { textContent: doc.textContent } : {}),
+      };
+      files.push(item);
+      totalBytes += sizeBytes;
+    }
+  } else if (account.accountType === 'google') {
+    const drive = await getDriveClient(account.tokens || account.credentials, accountId);
+    const encMetaDocs = await database.collection('tg_files')
+      .find({ accountId: account._id, isEncrypted: true })
+      .toArray();
+    const encByProviderId = new Map<string, any>();
+    for (const m of encMetaDocs) {
+      if (m.providerFileId) encByProviderId.set(String(m.providerFileId), m);
+    }
+
+    const startId = effectiveRoot || 'root';
+    const queue: Array<{ id: string; relPath: string }> = [{ id: startId, relPath: '' }];
+    const visited = new Set<string>([startId]);
+
+    while (queue.length > 0 && !truncated) {
+      const current = queue.shift()!;
+      const safeParent = escapeDriveQueryValue(current.id);
+      let pageToken: string | undefined;
+      do {
+        const res: any = await withTransientRetry(
+          () => drive.files.list({
+            q: `'${safeParent}' in parents and trashed = false`,
+            fields: 'nextPageToken, files(id, name, mimeType, size, modifiedTime)',
+            pageSize: 200,
+            pageToken,
+          }),
+          undefined,
+          3,
+          { provider: 'google', operation: 'manifestList' }
+        );
+        const items: any[] = Array.isArray(res?.data?.files) ? res.data.files : [];
+        for (const f of items) {
+          const id = String(f.id || '');
+          if (!id) continue;
+          const safeName = sanitizeManifestSegment(String(f.name || ''), id);
+          if (f.mimeType === 'application/vnd.google-apps.folder') {
+            if (!visited.has(id)) {
+              visited.add(id);
+              const subRel = current.relPath ? `${current.relPath}/${safeName}` : safeName;
+              foldersSet.add(subRel);
+              queue.push({ id, relPath: subRel });
+            }
+          } else {
+            if (files.length >= maxFiles) {
+              truncated = true;
+              break;
+            }
+            const encMeta = encByProviderId.get(id);
+            const sizeBytes = Number(encMeta?.encryptedSizeBytes ?? f.size ?? 0) || 0;
+            files.push({
+              id,
+              name: safeName,
+              folderPath: current.relPath,
+              relativePath: current.relPath ? `${current.relPath}/${safeName}` : safeName,
+              sizeBytes,
+              mimeType: encMeta ? 'application/octet-stream' : (f.mimeType || 'application/octet-stream'),
+              updatedAt: f.modifiedTime ? new Date(f.modifiedTime).toISOString() : null,
+              isEncrypted: Boolean(encMeta),
+              isNote: false,
+            });
+            totalBytes += sizeBytes;
+          }
+        }
+        pageToken = res?.data?.nextPageToken || undefined;
+      } while (pageToken && !truncated);
+    }
+  } else if (account.accountType === 'onedrive') {
+    const c = await getOneDriveClient(account.tokens || account.credentials, accountId);
+    const encMetaDocs = await database.collection('tg_files')
+      .find({ accountId: account._id, isEncrypted: true })
+      .toArray();
+    const encByProviderId = new Map<string, any>();
+    for (const m of encMetaDocs) {
+      if (m.providerFileId) encByProviderId.set(String(m.providerFileId), m);
+    }
+
+    const startId = effectiveRoot || 'root';
+    const queue: Array<{ id: string; relPath: string }> = [{ id: startId, relPath: '' }];
+    const visited = new Set<string>([startId]);
+
+    while (queue.length > 0 && !truncated) {
+      const current = queue.shift()!;
+      let nextEndpoint: string | null = current.id === 'root'
+        ? '/me/drive/root/children?$top=200'
+        : `/me/drive/items/${current.id}/children?$top=200`;
+
+      while (nextEndpoint && !truncated) {
+        const res: any = await withTransientRetry(
+          () => c.api(nextEndpoint!).get(),
+          undefined,
+          3,
+          { provider: 'onedrive', operation: 'manifestList' }
+        );
+        const items: any[] = Array.isArray(res?.value) ? res.value : [];
+        for (const it of items) {
+          if (it.deleted) continue;
+          const id = String(it.id || '');
+          if (!id) continue;
+          const safeName = sanitizeManifestSegment(String(it.name || ''), id);
+          if (it.folder) {
+            if (!visited.has(id)) {
+              visited.add(id);
+              const subRel = current.relPath ? `${current.relPath}/${safeName}` : safeName;
+              foldersSet.add(subRel);
+              queue.push({ id, relPath: subRel });
+            }
+          } else {
+            if (files.length >= maxFiles) {
+              truncated = true;
+              break;
+            }
+            const encMeta = encByProviderId.get(id);
+            const sizeBytes = Number(encMeta?.encryptedSizeBytes ?? it.size ?? 0) || 0;
+            files.push({
+              id,
+              name: safeName,
+              folderPath: current.relPath,
+              relativePath: current.relPath ? `${current.relPath}/${safeName}` : safeName,
+              sizeBytes,
+              mimeType: encMeta ? 'application/octet-stream' : (it.file?.mimeType || 'application/octet-stream'),
+              updatedAt: it.lastModifiedDateTime ? new Date(it.lastModifiedDateTime).toISOString() : null,
+              isEncrypted: Boolean(encMeta),
+              isNote: false,
+            });
+            totalBytes += sizeBytes;
+          }
+        }
+        nextEndpoint = typeof res?.['@odata.nextLink'] === 'string' ? res['@odata.nextLink'] : null;
+      }
+    }
+  }
+
+  const folders = Array.from(foldersSet).sort();
+  return {
+    accountId,
+    accountType: String(account.accountType || ''),
+    driveName,
+    rootFolderId: effectiveRoot || 'root',
+    generatedAt: new Date().toISOString(),
+    truncated,
+    totalFolders: folders.length,
+    totalFiles: files.length,
+    totalBytes,
+    folders,
+    files,
+  };
+}
+
+async function ensureTargetFolderPath(
+  database: any,
+  targetAccount: any,
+  baseFolderId: string,
+  relativeFolderPath: string,
+  folderCache: Map<string, string>
+): Promise<string> {
+  const cleanRel = normalizeRelativeFolderPath(relativeFolderPath);
+  const cleanBase = !baseFolderId || baseFolderId === 'root' ? '' : String(baseFolderId).trim();
+
+  if (targetAccount.accountType === 'tgdrive') {
+    const cleanBasePath = normalizeRelativeFolderPath(cleanBase);
+    const fullPath = [cleanBasePath, cleanRel].filter(Boolean).join('/');
+    if (!fullPath) return '';
+    if (folderCache.has(fullPath)) return folderCache.get(fullPath)!;
+
+    const segments = fullPath.split('/');
+    let accum = '';
+    for (const seg of segments) {
+      const parent = accum;
+      accum = accum ? `${accum}/${seg}` : seg;
+      if (!folderCache.has(accum)) {
+        await database.collection('tg_folders').updateOne(
+          { accountId: targetAccount._id, path: accum },
+          {
+            $setOnInsert: {
+              accountId: targetAccount._id,
+              name: seg,
+              path: accum,
+              parent,
+              createdAt: new Date(),
+            },
+          },
+          { upsert: true }
+        );
+        folderCache.set(accum, accum);
+      }
+    }
+    return fullPath;
+  }
+
+  const rootId = cleanBase || 'root';
+  if (!cleanRel) return rootId;
+  if (folderCache.has(cleanRel)) return folderCache.get(cleanRel)!;
+
+  const segments = cleanRel.split('/');
+  let currentParentId = rootId;
+  let accumRel = '';
+
+  if (targetAccount.accountType === 'google') {
+    const drive = await getDriveClient(targetAccount.tokens || targetAccount.credentials, String(targetAccount._id));
+    for (const seg of segments) {
+      accumRel = accumRel ? `${accumRel}/${seg}` : seg;
+      const cached = folderCache.get(accumRel);
+      if (cached) {
+        currentParentId = cached;
+        continue;
+      }
+      const safeName = escapeDriveQueryValue(seg);
+      const safeParent = escapeDriveQueryValue(currentParentId);
+      const existing: any = await drive.files.list({
+        q: `name = '${safeName}' and '${safeParent}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+        fields: 'files(id,name)',
+        pageSize: 1,
+      });
+      let folderId = existing?.data?.files?.[0]?.id;
+      if (!folderId) {
+        const created: any = await drive.files.create({
+          requestBody: {
+            name: seg,
+            mimeType: 'application/vnd.google-apps.folder',
+            parents: [currentParentId],
+          },
+          fields: 'id',
+        });
+        folderId = created?.data?.id;
+      }
+      if (!folderId) throw new Error(`Failed to create folder '${seg}' in Google Drive`);
+      folderCache.set(accumRel, String(folderId));
+      currentParentId = String(folderId);
+    }
+    return currentParentId;
+  }
+
+  if (targetAccount.accountType === 'onedrive') {
+    const c = await getOneDriveClient(targetAccount.tokens || targetAccount.credentials, String(targetAccount._id));
+    for (const seg of segments) {
+      accumRel = accumRel ? `${accumRel}/${seg}` : seg;
+      const cached = folderCache.get(accumRel);
+      if (cached) {
+        currentParentId = cached;
+        continue;
+      }
+      const parentEndpoint = currentParentId === 'root'
+        ? '/me/drive/root/children'
+        : `/me/drive/items/${currentParentId}/children`;
+      let folderId: string | null = null;
+      try {
+        const children: any = await c.api(parentEndpoint).get();
+        const found = (Array.isArray(children?.value) ? children.value : []).find(
+          (it: any) => !it.deleted && it.folder && String(it.name || '') === seg
+        );
+        if (found?.id) folderId = String(found.id);
+      } catch { /* fallback to create */ }
+      if (!folderId) {
+        const created: any = await c.api(parentEndpoint).post({
+          name: seg,
+          folder: {},
+          '@microsoft.graph.conflictBehavior': 'rename',
+        });
+        folderId = created?.id ? String(created.id) : null;
+      }
+      if (!folderId) throw new Error(`Failed to create folder '${seg}' in OneDrive`);
+      folderCache.set(accumRel, folderId);
+      currentParentId = folderId;
+    }
+    return currentParentId;
+  }
+
+  return rootId;
+}
+
+async function executeDriveTransfer(
+  job: any,
+  database: any,
+  shouldCancel: () => Promise<boolean>
+) {
+  const p = job.payload || {};
+  const sourceAccountId = String(p.sourceAccountId || '');
+  const targetAccountId = String(p.targetAccountId || '');
+  const sourceFolderId = String(p.sourceFolderId || 'root');
+  const targetFolderId = String(p.targetFolderId || 'root');
+  const isMove = Boolean(p.isMove);
+  const conflictStrategy: ConflictStrategy =
+    p.conflictStrategy === 'skip' || p.conflictStrategy === 'rename' || p.conflictStrategy === 'overwrite'
+      ? p.conflictStrategy
+      : 'skip';
+  const jobId = String(job._id);
+
+  const { account: sourceAccount, accessDenied: srcDenied } = await resolveAuthorizedAccount(database, sourceAccountId, p.userId, !!p.isAdmin);
+  if (srcDenied || !sourceAccount) throw new Error('Source account not accessible');
+  const { account: targetAccount, accessDenied: dstDenied } = await resolveAuthorizedAccount(database, targetAccountId, p.userId, !!p.isAdmin);
+  if (dstDenied || !targetAccount) throw new Error('Target account not accessible');
+
+  await database.collection('jobs').updateOne(
+    { _id: job._id, status: 'running' },
+    { $set: { stage: 'scanning', leaseUntil: new Date(Date.now() + JOB_LEASE_MS), updatedAt: new Date() } }
+  );
+
+  const manifest = await collectAccountManifest(database, sourceAccount, sourceFolderId, 25000, true);
+  job.totalItems = manifest.totalFiles;
+  job.totalBytes = manifest.totalBytes;
+
+  await database.collection('jobs').updateOne(
+    { _id: job._id, status: 'running' },
+    {
+      $set: {
+        stage: manifest.folders.length > 0 ? 'creating_folders' : (isMove ? 'moving' : 'copying'),
+        totalItems: manifest.totalFiles,
+        totalBytes: manifest.totalBytes,
+        itemsProcessed: 0,
+        bytesProcessed: 0,
+        progressPct: manifest.totalFiles === 0 ? 100 : 2,
+        leaseUntil: new Date(Date.now() + JOB_LEASE_MS),
+        updatedAt: new Date(),
+      },
+    }
+  );
+
+  const folderCache = new Map<string, string>();
+  for (const folderRel of manifest.folders) {
+    if (await shouldCancel()) {
+      const cancelErr: any = new Error('Transfer job was cancelled');
+      cancelErr.code = 'JOB_CANCELLED';
+      throw cancelErr;
+    }
+    await ensureTargetFolderPath(database, targetAccount, targetFolderId, folderRel, folderCache);
+  }
+
+  const items: any[] = [];
+  const failedFiles: any[] = [];
+  let bytesProcessed = 0;
+  let processedCount = 0;
+  let fastCopiedCount = 0;
+  let skippedCount = 0;
+
+  for (let idx = 0; idx < manifest.files.length; idx++) {
+    if (await shouldCancel()) {
+      const cancelErr: any = new Error('Transfer job was cancelled');
+      cancelErr.code = 'JOB_CANCELLED';
+      throw cancelErr;
+    }
+
+    const fileItem = manifest.files[idx];
+    const destFolderId = await ensureTargetFolderPath(database, targetAccount, targetFolderId, fileItem.folderPath, folderCache);
+    const destTgFolder = destFolderId === 'root' ? '' : destFolderId;
+
+    try {
+      let handledFast = false;
+
+      if (sourceAccount.accountType === 'tgdrive' && targetAccount.accountType === 'tgdrive') {
+        const sourceMeta = ObjectId.isValid(fileItem.id)
+          ? await database.collection('tg_files').findOne({ _id: new ObjectId(fileItem.id), accountId: sourceAccount._id })
+          : null;
+
+        if (sourceMeta) {
+          const desiredName = sourceMeta.isEncrypted ? (sourceMeta.opaqueRemoteName || sourceMeta.name) : sourceMeta.name;
+          const resolution = await resolveNonConflictingFileName(
+            database,
+            targetAccount,
+            destTgFolder || 'root',
+            desiredName,
+            conflictStrategy
+          );
+
+          if (resolution.skipped) {
+            skippedCount++;
+            items.push({
+              sourceFileId: fileItem.id,
+              relativePath: fileItem.relativePath,
+              fileName: fileItem.name,
+              status: 'skipped_conflict',
+              sizeBytes: fileItem.sizeBytes,
+            });
+            handledFast = true;
+          } else if (sourceMeta.isNote === true && typeof sourceMeta.textContent === 'string') {
+            // Instant zero-network note clone between TG Drives
+            const clonedNote: any = { ...sourceMeta };
+            delete clonedNote._id;
+            clonedNote.accountId = targetAccount._id;
+            clonedNote.folder = destTgFolder;
+            clonedNote.name = resolution.resolvedName;
+            clonedNote.shareId = nanoid(6);
+            clonedNote.trashed = false;
+            delete clonedNote.trashedAt;
+            clonedNote.updatedAt = Date.now();
+            const ins = await database.collection('tg_files').insertOne(clonedNote);
+            if (isMove) {
+              await permanentlyDeleteSingleFile(database, sourceAccount, fileItem.id, p.userId, !!p.isAdmin);
+            }
+            fastCopiedCount++;
+            items.push({
+              sourceFileId: fileItem.id,
+              destinationFileId: String(ins?.insertedId || ''),
+              relativePath: fileItem.relativePath,
+              fileName: resolution.resolvedName,
+              mode: 'note_clone',
+              status: 'completed',
+              sizeBytes: fileItem.sizeBytes,
+            });
+            handledFast = true;
+          } else if (Number.isInteger(Number(sourceMeta.messageId)) && Number(sourceMeta.messageId) > 0) {
+            // Zero-bandwidth TG -> TG server-side fast copy
+            let targetThreadId: number | null = null;
+            if (destTgFolder) {
+              const topFolder = destTgFolder.split('/')[0];
+              const targetFolderDoc = await database.collection('tg_folders').findOne({
+                accountId: targetAccount._id,
+                $or: [{ path: destTgFolder }, { path: topFolder }],
+              });
+              if (targetFolderDoc && Number.isInteger(Number(targetFolderDoc.threadId)) && Number(targetFolderDoc.threadId) > 0) {
+                targetThreadId = Number(targetFolderDoc.threadId);
+              }
+            }
+            const newMsgId = await tgFastCopyMessage(
+              sourceAccount.channelId,
+              targetAccount.channelId,
+              Number(sourceMeta.messageId),
+              targetThreadId
+            );
+            if (newMsgId) {
+              const clonedDoc: any = { ...sourceMeta };
+              delete clonedDoc._id;
+              clonedDoc.accountId = targetAccount._id;
+              clonedDoc.messageId = newMsgId;
+              if (targetThreadId) clonedDoc.threadId = targetThreadId;
+              else delete clonedDoc.threadId;
+              clonedDoc.folder = destTgFolder;
+              clonedDoc.name = resolution.resolvedName;
+              if (clonedDoc.isEncrypted) clonedDoc.opaqueRemoteName = resolution.resolvedName;
+              clonedDoc.shareId = clonedDoc.isEncrypted ? null : nanoid(6);
+              clonedDoc.trashed = false;
+              delete clonedDoc.trashedAt;
+              clonedDoc.updatedAt = Date.now();
+              const ins = await database.collection('tg_files').insertOne(clonedDoc);
+              if (isMove) {
+                await permanentlyDeleteSingleFile(database, sourceAccount, fileItem.id, p.userId, !!p.isAdmin);
+              }
+              fastCopiedCount++;
+              items.push({
+                sourceFileId: fileItem.id,
+                destinationFileId: String(ins?.insertedId || ''),
+                relativePath: fileItem.relativePath,
+                fileName: resolution.resolvedName,
+                mode: 'tg_fast_copy',
+                status: 'completed',
+                sizeBytes: fileItem.sizeBytes,
+              });
+              handledFast = true;
+            }
+          }
+        }
+      }
+
+      if (!handledFast) {
+        const subJobKey = `${jobId}:${idx}`;
+        const res = await crossAccountTransfer(
+          sourceAccountId,
+          fileItem.id,
+          targetAccountId,
+          destFolderId || 'root',
+          p.userId,
+          !!p.isAdmin,
+          database,
+          isMove,
+          undefined,
+          subJobKey,
+          shouldCancel,
+          conflictStrategy
+        );
+        if (res?.skipped) skippedCount++;
+        items.push({
+          sourceFileId: fileItem.id,
+          destinationFileId: res?.destinationFileId || null,
+          relativePath: fileItem.relativePath,
+          fileName: res?.resolvedFileName || fileItem.name,
+          mode: 'stream',
+          status: res?.skipped ? 'skipped_conflict' : 'completed',
+          sizeBytes: Number(res?.sizeBytes ?? fileItem.sizeBytes ?? 0),
+        });
+      }
+    } catch (itemErr: any) {
+      if (itemErr?.code === 'JOB_CANCELLED') throw itemErr;
+      failedFiles.push({
+        fileId: fileItem.id,
+        relativePath: fileItem.relativePath,
+        error: itemErr?.message || 'Transfer failed',
+        code: itemErr?.code || STANDARD_ERROR_CODES.TRANSFER_FAILED,
+      });
+      items.push({
+        sourceFileId: fileItem.id,
+        relativePath: fileItem.relativePath,
+        fileName: fileItem.name,
+        status: 'failed',
+        error: itemErr?.message || 'Transfer failed',
+        sizeBytes: fileItem.sizeBytes,
+      });
+    }
+
+    processedCount = idx + 1;
+    bytesProcessed += fileItem.sizeBytes;
+    const progressPct = manifest.totalFiles > 0
+      ? Math.min(98, Math.max(2, Math.round((processedCount / manifest.totalFiles) * 98)))
+      : 100;
+    const now = new Date();
+    job.itemsProcessed = processedCount;
+    job.bytesProcessed = bytesProcessed;
+    job.failedCount = failedFiles.length;
+
+    await database.collection('jobs').updateOne(
+      { _id: job._id, status: 'running' },
+      {
+        $set: {
+          stage: `${isMove ? 'moving' : 'copying'}_${processedCount}_of_${manifest.totalFiles}`,
+          itemsProcessed: processedCount,
+          totalItems: manifest.totalFiles,
+          bytesProcessed,
+          totalBytes: manifest.totalBytes,
+          failedCount: failedFiles.length,
+          progressPct,
+          leaseUntil: new Date(Date.now() + JOB_LEASE_MS),
+          updatedAt: now,
+        },
+      }
+    );
+  }
+
+  const now = new Date();
+  await database.collection('transfer_manifests').updateOne(
+    { jobId },
+    {
+      $set: {
+        jobId,
+        type: 'drive_transfer',
+        isMove,
+        userId: p.userId ? String(p.userId) : null,
+        sourceAccountId,
+        targetAccountId,
+        sourceFolderId,
+        targetFolderId,
+        conflictStrategy,
+        totalFolders: manifest.totalFolders,
+        totalFiles: manifest.totalFiles,
+        totalBytes: manifest.totalBytes,
+        fastCopiedCount,
+        skippedCount,
+        succeededCount: items.filter((i) => i.status === 'completed' || i.status === 'skipped_conflict').length,
+        failedCount: failedFiles.length,
+        failedFiles,
+        items,
+        status: failedFiles.length === 0 ? 'completed' : (items.some((i) => i.status === 'completed') ? 'completed_with_errors' : 'failed'),
+        updatedAt: now,
+      },
+      $setOnInsert: { createdAt: now },
+    },
+    { upsert: true }
+  );
+
+  invalidateDriveCache(sourceAccountId);
+  invalidateDriveCache(targetAccountId);
+  return {
+    totalFiles: manifest.totalFiles,
+    totalFolders: manifest.totalFolders,
+    processedCount,
+    failedCount: failedFiles.length,
+    fastCopiedCount,
+    skippedCount,
+  };
+}
+
 export type QueueJobType =
   | 'cross_account_transfer'
+  | 'drive_transfer'
   | 'batch_backup'
   | 'batch_restore'
   | 'trash_cleanup'
@@ -828,8 +1540,15 @@ function publicJob(job: any) {
     status: job.status,
     stage: job.stage || job.status,
     priority: job.priority || 0,
+    fileName: p.displayName || p.fileName || null,
+    isMove: Boolean(p.isMove),
+    sourceAccountName: p.sourceAccountName || null,
+    targetAccountName: p.targetAccountName || null,
+    conflictStrategy: p.conflictStrategy || null,
+    failedCount: typeof job.failedCount === 'number' ? job.failedCount : 0,
     source: {
       accountId: p.sourceAccountId || p.accountId || null,
+      folderId: p.sourceFolderId || null,
       fileId: p.fileId || null,
       fileIds: Array.isArray(p.fileIds) ? p.fileIds : null,
     },
@@ -864,6 +1583,7 @@ const MAX_CONCURRENT_JOBS = Math.max(1, Number(process.env.MAX_CONCURRENT_JOBS |
 let activeJobWorkers = 0;
 const SUPPORTED_JOB_TYPES: QueueJobType[] = [
   'cross_account_transfer',
+  'drive_transfer',
   'batch_backup',
   'batch_restore',
   'trash_cleanup',
@@ -914,7 +1634,15 @@ async function runJobWorker() {
         return !current || current.status === 'cancelled' || current.cancelRequested === true || (current.leaseOwner && current.leaseOwner !== WORKER_ID);
       };
 
-      if (job.type === 'batch_backup' || job.type === 'batch_restore') {
+      let finalStatus: 'completed' | 'completed_with_errors' = 'completed';
+      if (job.type === 'drive_transfer') {
+        const driveSummary = await providerLimit(`transfer:${p.sourceAccountId}:${p.targetAccountId}`, 1)(() =>
+          executeDriveTransfer(job, db, shouldCancel)
+        );
+        if (driveSummary.failedCount > 0) {
+          finalStatus = 'completed_with_errors';
+        }
+      } else if (job.type === 'batch_backup' || job.type === 'batch_restore') {
         await providerLimit(`transfer:${p.sourceAccountId}:${p.targetAccountId}`, 1)(() =>
           executeBatchBackupOrRestore(job, db, shouldCancel)
         );
@@ -987,12 +1715,18 @@ async function runJobWorker() {
         { _id: job._id, status: 'running' },
         {
           $set: {
-            status: 'completed',
-            stage: 'completed',
+            status: finalStatus,
+            stage: finalStatus,
             progressPct: 100,
-            itemsProcessed: job.totalItems || 1,
+            itemsProcessed: typeof job.itemsProcessed === 'number' && job.type === 'drive_transfer'
+              ? job.itemsProcessed
+              : (job.totalItems || 1),
+            totalItems: typeof job.totalItems === 'number' ? job.totalItems : 1,
+            ...(typeof job.bytesProcessed === 'number' && job.type === 'drive_transfer' ? { bytesProcessed: job.bytesProcessed } : {}),
+            ...(typeof job.totalBytes === 'number' && job.type === 'drive_transfer' ? { totalBytes: job.totalBytes } : {}),
+            ...(typeof job.failedCount === 'number' ? { failedCount: job.failedCount } : {}),
             destinationFileId: job.destinationFileId || null,
-            sourceDeleteApproved: Boolean(p.isMove),
+            sourceDeleteApproved: Boolean(p.isMove) && finalStatus === 'completed',
             completedAt: new Date(),
             updatedAt: new Date(),
           },
@@ -1083,6 +1817,8 @@ export {
   crossAccountTransfer,
   verifySingleBackupItem,
   executeBatchBackupOrRestore,
+  collectAccountManifest,
+  executeDriveTransfer,
   enqueueTransferJob,
   publicJob,
   MAX_CONCURRENT_JOBS,

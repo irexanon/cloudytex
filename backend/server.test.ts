@@ -27,7 +27,7 @@ const {
   runEncryptionMigration,
   TEMP_DIR,
 } = await import('./server.ts');
-const { clearTgChannelAccessCache } = await import('./provider.ts');
+const { clearTgChannelAccessCache, withTgPoolClient, getTgBotPoolStatus } = await import('./provider.ts');
 
 // ─── In-memory MongoDB Mock for Integration Tests ───────────────────────────
 function matchesQuery(doc: any, query: any): boolean {
@@ -2611,6 +2611,356 @@ test('Cloudyte E2EE Backend Suite (Tests 1-39)', async (t) => {
     const reimportData: any = await reimportRes.json();
     assert.equal(reimportData.importedTopics, 1);
     assert.equal(reimportData.importedFiles, 2);
+  });
+
+  await t.test('61. Multi-Bot Worker Pool handles FLOOD_WAIT cooldowns and per-channel ineligibility failover seamlessly', async () => {
+    const calls: string[] = [];
+    const mainClient = {
+      connected: true,
+      tag: 'main',
+    };
+    const worker1Client = {
+      connected: true,
+      tag: 'worker-1',
+    };
+    const worker2Client = {
+      connected: true,
+      tag: 'worker-2',
+    };
+
+    setTestDependencies({
+      tgWorkerPool: [
+        { id: 'main', role: 'main', client: mainClient },
+        { id: 'worker-1', role: 'worker', client: worker1Client },
+        { id: 'worker-2', role: 'worker', client: worker2Client },
+      ],
+    });
+
+    try {
+      // 1. Worker-1 hits FLOOD_WAIT_30; pool must immediately fail over to Worker-2 without failing caller
+      const res1 = await withTgPoolClient(
+        '-100777111000',
+        async (client, slotId) => {
+          calls.push(`op1:${slotId}`);
+          if (slotId === 'worker-1') {
+            const fw: any = new Error('FLOOD_WAIT_30');
+            fw.seconds = 30;
+            throw fw;
+          }
+          return { ok: true, slotId, tag: client.tag };
+        },
+        { preferWorker: true }
+      );
+      assert.equal(res1.ok, true);
+      assert.equal(res1.slotId, 'worker-2');
+
+      const statusAfterFlood = getTgBotPoolStatus();
+      assert.equal(statusAfterFlood.totalBots, 3);
+      assert.equal(statusAfterFlood.workerCount, 2);
+      assert.equal(statusAfterFlood.healthyBots, 2);
+      const w1Status = statusAfterFlood.bots.find((b) => b.id === 'worker-1');
+      assert.equal(w1Status?.coolingDown, true);
+      assert.ok((w1Status?.cooldownRemainingSec || 0) > 0);
+      // Ensure tokens are never exposed in pool status
+      assert.equal('token' in (w1Status as any), false);
+
+      // 2. Worker-2 is not an admin in private channel -100777222000 (CHANNEL_INVALID); pool remembers ineligibility and routes to main
+      const res2 = await withTgPoolClient(
+        '-100777222000',
+        async (_client, slotId) => {
+          calls.push(`op2:${slotId}`);
+          if (slotId === 'worker-2') {
+            const err: any = new Error('400: CHANNEL_INVALID');
+            err.errorMessage = 'CHANNEL_INVALID';
+            throw err;
+          }
+          return { ok: true, slotId };
+        },
+        { preferWorker: true }
+      );
+      assert.equal(res2.ok, true);
+      assert.equal(res2.slotId, 'main');
+
+      // 3. Subsequent call on the same private channel skips worker-2 directly and uses main
+      const res3 = await withTgPoolClient(
+        '-100777222000',
+        async (_client, slotId) => {
+          calls.push(`op3:${slotId}`);
+          return slotId;
+        },
+        { preferWorker: true }
+      );
+      assert.equal(res3, 'main');
+      assert.ok(!calls.includes('op3:worker-2'));
+    } finally {
+      setTestDependencies({ tgWorkerPool: null });
+    }
+  });
+
+  await t.test('62. GET /api/accounts/:accountId/manifest returns recursive folders/files for whole-drive Android downloads and enforces ownership', async () => {
+    const manifestAccId = new ObjectId();
+    await mockDb.collection('accounts').insertOne({
+      _id: manifestAccId,
+      userId: user1Id,
+      accountType: 'tgdrive',
+      channelId: '-100555666777',
+      name: 'Android Sync Drive',
+      email: 'Channel: -100555666777',
+      createdAt: new Date(),
+    });
+
+    for (const folderDoc of [
+      { accountId: manifestAccId, name: 'Photos', path: 'Photos', parent: '' },
+      { accountId: manifestAccId, name: '2026', path: 'Photos/2026', parent: 'Photos' },
+      { accountId: manifestAccId, name: 'Docs', path: 'Docs', parent: '' },
+    ]) {
+      await mockDb.collection('tg_folders').insertOne(folderDoc);
+    }
+
+    for (const fileDoc of [
+      { accountId: manifestAccId, messageId: 1001, name: 'readme.txt', folder: '', size: 120, mimeType: 'text/plain', date: 1733000000, isNote: true, textContent: 'hello' },
+      { accountId: manifestAccId, messageId: 1002, name: 'trip.jpg', folder: 'Photos/2026', size: 4096, mimeType: 'image/jpeg', date: 1733000100 },
+      { accountId: manifestAccId, messageId: 1003, name: 'invoice.pdf', folder: 'Docs', size: 8192, mimeType: 'application/pdf', date: 1733000200 },
+      { accountId: manifestAccId, messageId: 1004, name: 'deleted.bin', folder: 'Docs', size: 999, mimeType: 'application/octet-stream', date: 1733000300, trashed: true },
+    ]) {
+      await mockDb.collection('tg_files').insertOne(fileDoc);
+    }
+
+    // Cross-user access must be denied
+    const denied = await apiFetch(`/api/accounts/${String(manifestAccId)}/manifest`, {}, token2);
+    assert.equal(denied.status, 403);
+
+    // Whole-drive manifest excludes trashed files and returns exact relative paths & byte totals
+    const res = await apiFetch(`/api/accounts/${String(manifestAccId)}/manifest`);
+    assert.equal(res.status, 200);
+    const manifest: any = await res.json();
+    assert.equal(manifest.accountId, String(manifestAccId));
+    assert.equal(manifest.driveName, 'Android Sync Drive');
+    assert.equal(manifest.totalFiles, 3);
+    assert.equal(manifest.totalBytes, 120 + 4096 + 8192);
+    assert.deepEqual(manifest.folders, ['Docs', 'Photos', 'Photos/2026']);
+    const relPaths = manifest.files.map((f: any) => f.relativePath).sort();
+    assert.deepEqual(relPaths, ['Docs/invoice.pdf', 'Photos/2026/trip.jpg', 'readme.txt']);
+
+    // Subfolder-scoped manifest returns relative paths inside Photos/
+    const subRes = await apiFetch(`/api/accounts/${String(manifestAccId)}/manifest?folderId=Photos`);
+    assert.equal(subRes.status, 200);
+    const subManifest: any = await subRes.json();
+    assert.equal(subManifest.totalFiles, 1);
+    assert.deepEqual(subManifest.folders, ['2026']);
+    assert.equal(subManifest.files[0].relativePath, '2026/trip.jpg');
+  });
+
+  await t.test('63. POST /api/transfers/drive executes server-side whole-drive copy & move with folder replication, TG->TG fast-copy, note clone, and conflict skip', async () => {
+    const srcDriveId = new ObjectId();
+    const dstDriveId = new ObjectId();
+    for (const accDoc of [
+      {
+        _id: srcDriveId,
+        userId: user1Id,
+        accountType: 'tgdrive',
+        channelId: '-100888111001',
+        name: 'Source TG Vault',
+        email: 'Channel: -100888111001',
+        createdAt: new Date(),
+      },
+      {
+        _id: dstDriveId,
+        userId: user1Id,
+        accountType: 'tgdrive',
+        channelId: '-100888111002',
+        name: 'Target TG Vault',
+        email: 'Channel: -100888111002',
+        createdAt: new Date(),
+      },
+    ]) {
+      await mockDb.collection('accounts').insertOne(accDoc);
+    }
+
+    await mockDb.collection('tg_folders').insertOne({
+      accountId: srcDriveId,
+      name: 'Work',
+      path: 'Work',
+      parent: '',
+    });
+
+    for (const fileDoc of [
+      {
+        accountId: srcDriveId,
+        messageId: 2001,
+        name: 'report.pdf',
+        folder: 'Work',
+        size: 5000,
+        mimeType: 'application/pdf',
+        date: 1733100000,
+      },
+      {
+        accountId: srcDriveId,
+        messageId: 2002,
+        name: 'meeting-notes.txt',
+        folder: 'Work',
+        size: 19,
+        mimeType: 'text/plain; charset=utf-8',
+        isNote: true,
+        textContent: 'Action items: ship!',
+        textPreview: 'Action items: ship!',
+        date: 1733100100,
+      },
+    ]) {
+      await mockDb.collection('tg_files').insertOne(fileDoc);
+    }
+
+    // Same-account root-to-root must be rejected with 400
+    const badRes = await apiFetch('/api/transfers/drive', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceAccountId: String(srcDriveId),
+        targetAccountId: String(srcDriveId),
+        isMove: false,
+      }),
+    });
+    assert.equal(badRes.status, 400);
+
+    // Cross-user target account must be rejected with 403
+    const otherUserAccId = new ObjectId();
+    await mockDb.collection('accounts').insertOne({
+      _id: otherUserAccId,
+      userId: user2Id,
+      accountType: 'tgdrive',
+      channelId: '-100888999999',
+      name: 'Other User Vault',
+      email: 'Channel: -100888999999',
+      createdAt: new Date(),
+    });
+    const forbiddenRes = await apiFetch('/api/transfers/drive', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceAccountId: String(srcDriveId),
+        targetAccountId: String(otherUserAccId),
+        isMove: false,
+      }),
+    });
+    assert.equal(forbiddenRes.status, 403);
+
+    // Mock GramJS ForwardMessages zero-bandwidth fast-copy
+    let forwardedCount = 0;
+    const origInvoke = (mockTgClient as any).invoke;
+    (mockTgClient as any).invoke = async () => {
+      forwardedCount++;
+      return { updates: [{ id: 9000 + forwardedCount }] };
+    };
+
+    try {
+      // 1. Whole-drive COPY with target subfolder & fast-copy
+      const copyRes = await apiFetch('/api/transfers/drive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sourceAccountId: String(srcDriveId),
+          targetAccountId: String(dstDriveId),
+          targetFolderId: 'Mirrored',
+          isMove: false,
+          conflictStrategy: 'skip',
+        }),
+      });
+      assert.equal(copyRes.status, 202);
+      const copyJson: any = await copyRes.json();
+      assert.ok(copyJson.jobId);
+
+      // Wait for worker completion
+      let jobState: any = null;
+      for (let i = 0; i < 40; i++) {
+        await runJobWorker();
+        const jRes = await apiFetch(`/api/jobs/${copyJson.jobId}`);
+        jobState = await jRes.json();
+        if (jobState.status === 'completed' || jobState.status === 'failed') break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.equal(jobState.status, 'completed');
+      assert.equal(jobState.type, 'drive_transfer');
+      assert.equal(jobState.totalItems, 2);
+      assert.equal(jobState.itemsProcessed, 2);
+      assert.equal(forwardedCount, 1);
+
+      // Verify folders and files exist in destination under Mirrored/Work
+      const dstFolders = await mockDb.collection('tg_folders').find({ accountId: dstDriveId }).toArray();
+      assert.ok(dstFolders.some((f: any) => f.path === 'Mirrored/Work'));
+      const dstFiles = await mockDb.collection('tg_files').find({ accountId: dstDriveId }).toArray();
+      assert.equal(dstFiles.length, 2);
+      const dstPdf = dstFiles.find((f: any) => f.name === 'report.pdf');
+      assert.equal(dstPdf.folder, 'Mirrored/Work');
+      assert.equal(dstPdf.messageId, 9001);
+      const dstNote = dstFiles.find((f: any) => f.name === 'meeting-notes.txt');
+      assert.equal(dstNote.folder, 'Mirrored/Work');
+      assert.equal(dstNote.isNote, true);
+      assert.equal(dstNote.textContent, 'Action items: ship!');
+
+      // Source files remain untouched on COPY
+      const srcFilesAfterCopy = await mockDb.collection('tg_files').find({ accountId: srcDriveId }).toArray();
+      assert.equal(srcFilesAfterCopy.length, 2);
+
+      // 2. Re-running COPY with conflictStrategy='skip' must skip both existing files (zero duplicates)
+      const skipRes = await apiFetch('/api/transfers/drive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sourceAccountId: String(srcDriveId),
+          targetAccountId: String(dstDriveId),
+          targetFolderId: 'Mirrored',
+          isMove: false,
+          conflictStrategy: 'skip',
+        }),
+      });
+      assert.equal(skipRes.status, 202);
+      const skipJson: any = await skipRes.json();
+      let skipState: any = null;
+      for (let i = 0; i < 40; i++) {
+        await runJobWorker();
+        const jRes = await apiFetch(`/api/jobs/${skipJson.jobId}`);
+        skipState = await jRes.json();
+        if (skipState.status === 'completed' || skipState.status === 'failed') break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.equal(skipState.status, 'completed');
+      const dstFilesAfterSkip = await mockDb.collection('tg_files').find({ accountId: dstDriveId }).toArray();
+      assert.equal(dstFilesAfterSkip.length, 2);
+
+      // 3. Whole-drive MOVE into 'MovedHere' transfers both files and removes them from source
+      const moveRes = await apiFetch('/api/transfers/drive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sourceAccountId: String(srcDriveId),
+          targetAccountId: String(dstDriveId),
+          targetFolderId: 'MovedHere',
+          isMove: true,
+          conflictStrategy: 'overwrite',
+        }),
+      });
+      assert.equal(moveRes.status, 202);
+      const moveJson: any = await moveRes.json();
+      let moveState: any = null;
+      for (let i = 0; i < 40; i++) {
+        await runJobWorker();
+        const jRes = await apiFetch(`/api/jobs/${moveJson.jobId}`);
+        moveState = await jRes.json();
+        if (moveState.status === 'completed' || moveState.status === 'failed') break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.equal(moveState.status, 'completed');
+      assert.equal(moveState.isMove, true);
+      assert.equal(moveState.sourceDeleteApproved, true);
+
+      const srcFilesAfterMove = await mockDb.collection('tg_files').find({ accountId: srcDriveId }).toArray();
+      assert.equal(srcFilesAfterMove.length, 0);
+      const movedDstFiles = await mockDb.collection('tg_files').find({ accountId: dstDriveId, folder: 'MovedHere/Work' }).toArray();
+      assert.equal(movedDstFiles.length, 2);
+    } finally {
+      if (origInvoke) (mockTgClient as any).invoke = origInvoke;
+      else delete (mockTgClient as any).invoke;
+    }
   });
 });
 

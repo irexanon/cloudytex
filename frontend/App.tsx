@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { 
   Plus, Search, Trash2, RotateCcw, Edit3, Download, Folder, FolderPlus, File as FileIconLucide, ChevronRight, ChevronLeft, ChevronDown, 
   LogOut, Cloud, HardDrive, X, RefreshCw, Check, CheckCircle2, LayoutGrid, 
-  List as ListIcon, Info, Moon, Sun, Eye, Settings, MoreVertical, 
+  List as ListIcon, Info, Moon, Sun, Eye, Settings, MoreVertical, MoreHorizontal, 
   Share2, Send, ArrowLeft, ArrowUp, ArrowDown, ExternalLink, Archive, FileArchive, Copy,
   Upload, ArrowLeftRight, Shield, SlidersHorizontal, AlertTriangle, UploadCloud, FolderOpen, Pause, Play, ChevronUp
 } from 'lucide-react';
@@ -26,6 +26,7 @@ import {
   type AppRouteState,
   type BreadcrumbItem,
   type OverlayModal,
+  type SettingsTab,
 } from "./router";
 
 export default function App() {
@@ -110,7 +111,9 @@ export default function App() {
     sessionId?: string | null;
   }>>([]);
   const [isUploadQueueMinimized, setIsUploadQueueMinimized] = useState(false);
-  const [uploadMenuAnchor, setUploadMenuAnchor] = useState<'rail' | 'mobile' | null>(null);
+  const [uploadMenuAnchor, setUploadMenuAnchor] = useState<'toolbar' | 'mobile' | null>(null);
+  const [isBreadcrumbMenuOpen, setIsBreadcrumbMenuOpen] = useState(false);
+  const [isMobileFolderMenuOpen, setIsMobileFolderMenuOpen] = useState(false);
   const fileUploadInputRef = useRef<HTMLInputElement | null>(null);
   const folderUploadInputRef = useRef<HTMLInputElement | null>(null);
   const uploadControlRef = useRef<{
@@ -159,7 +162,12 @@ export default function App() {
   const [selectedFileIds, setSelectedFileIds] = useState<Set<string>>(new Set());
   const [isDragging, setIsDragging] = useState(false);
   const [shareTargetFile, setShareTargetFile] = useState<any | null>(null);
-  const [settingsTab, setSettingsTab] = useState<'general' | 'sessions' | 'tokens' | 'shares'>(initialRoute.settingsTab);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>(initialRoute.settingsTab);
+  const [driveTransferModal, setDriveTransferModal] = useState<{ sourceAccount: any; isMove: boolean } | null>(null);
+  const [driveTransferTargetId, setDriveTransferTargetId] = useState<string>('');
+  const [driveTransferTargetFolder, setDriveTransferTargetFolder] = useState<string>('');
+  const [driveTransferConflict, setDriveTransferConflict] = useState<'skip' | 'rename' | 'overwrite'>('skip');
+  const [driveTransferSubmitting, setDriveTransferSubmitting] = useState<boolean>(false);
   const [isJobsDrawerOpen, setIsJobsDrawerOpen] = useState(initialRoute.page === 'jobs');
   const [adminTab, setAdminTab] = useState<'overview' | 'metrics' | 'audit'>(initialRoute.adminTab);
 
@@ -745,6 +753,55 @@ export default function App() {
       showToast(`Exported ${acc.name || 'TG Drive'} JSON`);
     } catch (err: any) {
       showToast(err?.message || 'Failed to export JSON', 'error');
+    }
+  };
+
+  const openDriveTransferModal = (sourceAccount: any, isMove: boolean) => {
+    const otherAccounts = accounts.filter((a) => a.id !== sourceAccount.id);
+    setDriveTransferTargetId(otherAccounts[0]?.id || '');
+    setDriveTransferTargetFolder('');
+    setDriveTransferConflict('skip');
+    setDriveTransferSubmitting(false);
+    setDriveTransferModal({ sourceAccount, isMove });
+  };
+
+  const handleStartDriveTransfer = async () => {
+    if (!driveTransferModal?.sourceAccount?.id) return;
+    if (!driveTransferTargetId) {
+      showToast('Please select a destination drive', 'error');
+      return;
+    }
+    const cleanTargetFolder = driveTransferTargetFolder.trim().replace(/^\/+|\/+$/g, '') || 'root';
+    if (driveTransferTargetId === driveTransferModal.sourceAccount.id && cleanTargetFolder === 'root') {
+      showToast('Choose a different destination drive or enter a subfolder path', 'error');
+      return;
+    }
+    setDriveTransferSubmitting(true);
+    try {
+      const res = await fetch('/api/transfers/drive', {
+        method: 'POST',
+        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sourceAccountId: driveTransferModal.sourceAccount.id,
+          targetAccountId: driveTransferTargetId,
+          sourceFolderId: 'root',
+          targetFolderId: cleanTargetFolder,
+          isMove: driveTransferModal.isMove,
+          conflictStrategy: driveTransferConflict,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Failed to start drive transfer');
+      const actionWord = driveTransferModal.isMove ? 'move' : 'copy';
+      showToast(`Whole-drive ${actionWord} started in background`);
+      setDriveTransferModal(null);
+      setIsSettingsOpen(false);
+      setIsJobsDrawerOpen(true);
+      syncUrl({ page: 'jobs' });
+    } catch (err: any) {
+      showToast(err?.message || 'Failed to start drive transfer', 'error');
+    } finally {
+      setDriveTransferSubmitting(false);
     }
   };
 
@@ -2291,11 +2348,13 @@ export default function App() {
       }
 
       if (isTyping || !isAuthenticated) return;
-      if (confirmModal?.isOpen || promptModal?.isOpen || isMoveModalOpen || linkProviderModal || tgDriveModal || tgImportAccount || shareTargetFile) return;
+      if (confirmModal?.isOpen || promptModal?.isOpen || isMoveModalOpen || linkProviderModal || tgDriveModal || tgImportAccount || driveTransferModal || shareTargetFile) return;
 
       if (e.key === 'Escape') {
         if (contextMenu) { setContextMenu(null); return; }
         if (isSortMenuOpen) { setIsSortMenuOpen(false); return; }
+        if (isBreadcrumbMenuOpen) { setIsBreadcrumbMenuOpen(false); return; }
+        if (isMobileFolderMenuOpen) { setIsMobileFolderMenuOpen(false); return; }
         if (uploadMenuAnchor) { setUploadMenuAnchor(null); return; }
         if (selectedFile) { openFileInspector(null); return; }
         if (selectedFileIds.size > 0) { setSelectedFileIds(new Set()); return; }
@@ -2363,9 +2422,12 @@ export default function App() {
     linkProviderModal,
     tgDriveModal,
     tgImportAccount,
+    driveTransferModal,
     shareTargetFile,
     contextMenu,
     isSortMenuOpen,
+    isBreadcrumbMenuOpen,
+    isMobileFolderMenuOpen,
     uploadMenuAnchor,
     selectedFile,
     openFileInspector,
@@ -2560,6 +2622,9 @@ export default function App() {
       ? 'trash'
       : 'files';
 
+  const isMobileSubfolderHeader =
+    !isSettingsOpen && !isJobsDrawerOpen && !isAdminPanelOpen && !isTrashView && path.length > 1;
+
 
 
 
@@ -2638,7 +2703,7 @@ export default function App() {
                 key={acc.id}
                 onClick={() => {
                   selectAccount(acc.id, false);
-                  if (isMobileDrawer) setIsDrivesExpanded(false);
+                  setIsDrivesExpanded(false);
                 }}
                 title={acc.email || displayName}
                 className={`group rounded-[14px] px-2.5 py-2 border cursor-pointer transition-colors duration-150 ${
@@ -2829,75 +2894,6 @@ export default function App() {
             disabled={isTrashView}
           />
 
-          <div className={`relative transition-all duration-200 ${isDrivesExpanded ? 'mt-1 mb-2' : 'mt-2 mb-3'}`}>
-            <button
-              type="button"
-              disabled={isTrashView || accounts.length === 0}
-              onClick={() => setUploadMenuAnchor(prev => (prev === 'rail' ? null : 'rail'))}
-              title={isTrashView ? 'Switch out of Trash to upload' : 'Upload or create folder'}
-              className={`bg-[var(--pi)] text-[var(--pit)] flex items-center justify-center hover:opacity-90 active:scale-95 transition-all duration-200 shrink-0 ${
-                isDrivesExpanded ? 'w-10 h-10 rounded-[13px]' : 'w-14 h-14 rounded-2xl'
-              } ${
-                isTrashView || accounts.length === 0 ? 'opacity-40 pointer-events-none' : ''
-              }`}
-            >
-              <Upload size={isDrivesExpanded ? 18 : 22} />
-            </button>
-
-            {uploadMenuAnchor === 'rail' && (
-              <>
-                <div className="fixed inset-0 z-40" onClick={() => setUploadMenuAnchor(null)} />
-                <div
-                  className={`fixed top-[92px] w-64 rounded-[22px] bg-[var(--sf)] border border-[var(--bd)] shadow-2xl z-50 p-2 space-y-1 ${
-                    isDrivesExpanded ? 'left-[68px]' : 'left-[104px]'
-                  }`}
-                >
-                  <div className="px-3 py-2 border-b border-[var(--bd)]">
-                    <p className="text-[10px] font-black uppercase tracking-wider text-[var(--sub)]">Upload to</p>
-                    <p className="text-xs font-extrabold text-[var(--tx)] truncate mt-0.5">
-                      {(selectedAccount?.name || (isTgDrive ? 'TG Drive' : selectedAccount?.email || 'Drive'))}
-                      {path.length > 1 ? ` › ${path.slice(1).map(p => p.name).join(' › ')}` : ' › Files'}
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setUploadMenuAnchor(null);
-                      fileUploadInputRef.current?.click();
-                    }}
-                    className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"
-                  >
-                    <UploadCloud size={16} className="text-[#2563EB]" />
-                    <span>Upload files</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setUploadMenuAnchor(null);
-                      folderUploadInputRef.current?.click();
-                    }}
-                    className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"
-                  >
-                    <FolderOpen size={16} className="text-[#F59E0B]" />
-                    <span>Upload folder</span>
-                  </button>
-                  <div className="my-1 border-t border-[var(--bd)]" />
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setUploadMenuAnchor(null);
-                      handleCreateFolder();
-                    }}
-                    className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"
-                  >
-                    <FolderPlus size={16} className="text-[var(--sub)]" />
-                    <span>New folder</span>
-                  </button>
-                </div>
-              </>
-            )}
-          </div>
-
           {/* Primary Rail Items */}
           <button
             type="button"
@@ -3062,8 +3058,29 @@ export default function App() {
 
         {/* Top Header */}
         <header className="h-16 md:h-[68px] px-4 md:px-7 flex items-center gap-3 sticky top-0 z-40 bg-[var(--bg)]/95 backdrop-blur-md shrink-0">
-          {/* Mobile Drive Switcher Pill (or Back to Drive on sub-pages) */}
-          {!isSettingsOpen && !isJobsDrawerOpen && !isAdminPanelOpen ? (
+          {/* Mobile Header Left: Subfolder Back + Name (GDrive style), Drive Switcher Pill, or Sub-page Title */}
+          {isMobileSubfolderHeader ? (
+            <div className="md:hidden flex items-center gap-1.5 min-w-0 flex-1">
+              <button
+                type="button"
+                onClick={() => {
+                  setIsMobileFolderMenuOpen(false);
+                  navigateUp(path.length - 2);
+                }}
+                className="w-9 h-9 -ml-1.5 rounded-full flex items-center justify-center text-[var(--tx)] hover:bg-[var(--sf)] active:scale-95 transition-all shrink-0"
+                aria-label="Go back"
+                title="Back"
+              >
+                <ArrowLeft size={20} />
+              </button>
+              <span
+                className="text-[17px] font-semibold text-[var(--tx)] truncate leading-tight"
+                title={path[path.length - 1]?.name}
+              >
+                {path[path.length - 1]?.name}
+              </span>
+            </div>
+          ) : !isSettingsOpen && !isJobsDrawerOpen && !isAdminPanelOpen ? (
             <button
               type="button"
               onClick={() => setIsDrivesExpanded(true)}
@@ -3178,26 +3195,114 @@ export default function App() {
             {!isSettingsOpen && !isJobsDrawerOpen && !isAdminPanelOpen && (
               <button
                 type="button"
-                onClick={() => setMobileSearchOpen(prev => !prev)}
-                className="md:hidden w-9 h-9 rounded-full bg-[var(--sf)] border border-[var(--bd)] text-[var(--sub)] flex items-center justify-center"
+                onClick={() => {
+                  setIsMobileFolderMenuOpen(false);
+                  setMobileSearchOpen(prev => !prev);
+                }}
+                className={
+                  isMobileSubfolderHeader
+                    ? 'md:hidden w-9 h-9 rounded-full text-[var(--tx)] hover:bg-[var(--sf)] flex items-center justify-center transition-colors'
+                    : 'md:hidden w-9 h-9 rounded-full bg-[var(--sf)] border border-[var(--bd)] text-[var(--sub)] flex items-center justify-center'
+                }
                 aria-label="Toggle search"
               >
-                {mobileSearchOpen ? <X size={17} /> : <Search size={17} />}
+                {mobileSearchOpen ? <X size={19} /> : <Search size={19} />}
               </button>
+            )}
+
+            {/* Mobile Subfolder 3-Dot Menu (native GDrive style) */}
+            {isMobileSubfolderHeader && (
+              <div className="md:hidden relative">
+                <button
+                  type="button"
+                  onClick={() => setIsMobileFolderMenuOpen(prev => !prev)}
+                  className="w-9 h-9 -mr-1 rounded-full text-[var(--tx)] hover:bg-[var(--sf)] flex items-center justify-center transition-colors"
+                  aria-label="Folder options"
+                  aria-expanded={isMobileFolderMenuOpen}
+                >
+                  <MoreVertical size={19} />
+                </button>
+                {isMobileFolderMenuOpen && (
+                  <>
+                    <div className="fixed inset-0 z-40" onClick={() => setIsMobileFolderMenuOpen(false)} />
+                    <div className="absolute right-0 mt-2 w-60 max-w-[82vw] rounded-2xl bg-[var(--sf)] border border-[var(--bd)] shadow-2xl z-50 p-1.5 space-y-0.5 max-h-[75vh] overflow-y-auto">
+                      <div className="px-2.5 py-1 text-[10px] font-black uppercase tracking-wider text-[var(--sub)]">
+                        Folder path
+                      </div>
+                      {path.slice(0, -1).map((ancestor, idx) => (
+                        <button
+                          key={`mobile-path-${ancestor.id ?? 'root'}-${idx}`}
+                          type="button"
+                          onClick={() => {
+                            setIsMobileFolderMenuOpen(false);
+                            navigateUp(idx);
+                          }}
+                          className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-xl text-xs font-semibold text-[var(--tx)] hover:bg-[var(--hover)] transition-colors text-left"
+                        >
+                          <Folder
+                            size={15}
+                            className={idx === 0 ? 'text-[#2563EB] shrink-0' : 'text-[#F59E0B] shrink-0'}
+                            fill={idx === 0 ? 'none' : 'currentColor'}
+                          />
+                          <span className="truncate">{idx === 0 ? 'Files' : ancestor.name}</span>
+                        </button>
+                      ))}
+                      <div className="my-1 border-t border-[var(--bd)]" />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsMobileFolderMenuOpen(false);
+                          setIsDrivesExpanded(true);
+                        }}
+                        className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-xl text-xs font-semibold text-[var(--tx)] hover:bg-[var(--hover)] transition-colors"
+                      >
+                        <HardDrive size={15} className="text-[var(--sub)] shrink-0" />
+                        <span>Switch drive</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsMobileFolderMenuOpen(false);
+                          setIsDarkMode(!isDarkMode);
+                        }}
+                        className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-xl text-xs font-semibold text-[var(--tx)] hover:bg-[var(--hover)] transition-colors"
+                      >
+                        {isDarkMode ? <Sun size={15} className="text-[var(--sub)] shrink-0" /> : <Moon size={15} className="text-[var(--sub)] shrink-0" />}
+                        <span>{isDarkMode ? 'Light mode' : 'Dark mode'}</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsMobileFolderMenuOpen(false);
+                          setIsJobsDrawerOpen(false);
+                          setIsAdminPanelOpen(false);
+                          setSettingsTab('general');
+                          setIsSettingsOpen(true);
+                          syncUrl({ page: 'settings', settingsTab: 'general' });
+                        }}
+                        className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-xl text-xs font-semibold text-[var(--tx)] hover:bg-[var(--hover)] transition-colors"
+                      >
+                        <Settings size={15} className="text-[var(--sub)] shrink-0" />
+                        <span>Settings</span>
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
             )}
 
             {/* Theme Toggle Circle */}
             <button
               type="button"
               onClick={() => setIsDarkMode(!isDarkMode)}
-              className="w-9 h-9 rounded-full bg-[var(--sf)] border border-[var(--bd)] text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--hover)] flex items-center justify-center transition-colors shrink-0"
+              className={`${isMobileSubfolderHeader ? 'hidden md:flex' : 'flex'} w-9 h-9 rounded-full bg-[var(--sf)] border border-[var(--bd)] text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--hover)] items-center justify-center transition-colors shrink-0`}
               title={isDarkMode ? 'Switch to light mode' : 'Switch to dark mode'}
             >
               {isDarkMode ? <Sun size={16} /> : <Moon size={16} />}
             </button>
 
             {/* Avatar Circle & Account Menu */}
-            <div className="relative">
+            <div className={`${isMobileSubfolderHeader ? 'hidden md:block' : 'block'} relative`}>
               <button
                 type="button"
                 onClick={() => setIsProfileMenuOpen(prev => !prev)}
@@ -3541,6 +3646,7 @@ export default function App() {
               <div className="flex items-center gap-1 p-1 bg-[var(--sf)] border border-[var(--bd)] rounded-2xl overflow-x-auto no-scrollbar w-fit max-w-full">
                 {[
                   { id: 'general', label: 'General' },
+                  { id: 'accounts', label: `Accounts (${accounts.length})` },
                   { id: 'sessions', label: 'Active Sessions' },
                   { id: 'tokens', label: 'Access Tokens' },
                   { id: 'shares', label: 'Shared Links' },
@@ -3549,7 +3655,7 @@ export default function App() {
                     key={tab.id}
                     type="button"
                     onClick={() => {
-                      const nextTab = tab.id as any;
+                      const nextTab = tab.id as SettingsTab;
                       setSettingsTab(nextTab);
                       syncUrl({ page: 'settings', settingsTab: nextTab });
                     }}
@@ -3565,7 +3671,200 @@ export default function App() {
               </div>
 
               <div className="space-y-6">
-                {settingsTab !== 'general' ? (
+                {settingsTab === 'accounts' ? (
+                  <div className="space-y-4">
+                    <div className="flex flex-wrap items-center justify-between gap-3 px-1">
+                      <div>
+                        <h3 className="text-sm font-bold text-[var(--tx)]">Connected Drives</h3>
+                        <p className="text-xs text-[var(--sub)] mt-0.5">
+                          Manage cloud drives, copy or move an entire drive server-side, or import/export TG Drive backups.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => { setIsSettingsOpen(false); setLinkProviderModal(true); syncUrl({ page: 'drive', modal: 'link-account' }); }}
+                        className="h-9 px-4 rounded-xl bg-[#2563EB] hover:bg-blue-700 text-white text-xs font-bold flex items-center gap-1.5 transition-colors shadow-sm shrink-0"
+                      >
+                        <Plus size={15} />
+                        <span>Connect New Drive</span>
+                      </button>
+                    </div>
+
+                    {accounts.length === 0 ? (
+                      <div className="p-10 text-center bg-[var(--sf)] border border-[var(--bd)] rounded-[22px] space-y-3">
+                        <div className="w-12 h-12 mx-auto rounded-2xl bg-[var(--pi)] text-[var(--pit)] flex items-center justify-center">
+                          <HardDrive size={22} />
+                        </div>
+                        <p className="text-sm font-bold text-[var(--tx)]">No connected drives yet</p>
+                        <p className="text-xs text-[var(--sub)] max-w-sm mx-auto">
+                          Link Google Drive, Microsoft OneDrive, or a Telegram Channel / Forum Group to get started.
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="space-y-3">
+                        {accounts.map(acc => {
+                          const isMenuOpen = openAccountMenuId === acc.id;
+                          const displayName = acc.name || (acc.accountType === 'tgdrive' ? 'TG Drive' : 'Account');
+                          return (
+                            <div key={acc.id} className="flex items-center justify-between gap-3 p-4 bg-[var(--sf)] border border-[var(--bd)] rounded-[22px] relative">
+                              <div className="flex items-center gap-3 min-w-0">
+                                {renderProviderBadge(acc.accountType, 'md')}
+                                <div className="min-w-0">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <p className="text-sm font-bold truncate text-[var(--tx)]">{displayName}</p>
+                                    {acc.isDefault && (
+                                      <span className="px-2 py-0.5 rounded-full bg-[var(--pi)] text-[var(--pit)] text-[10px] font-extrabold uppercase tracking-wider shrink-0">
+                                        Default
+                                      </span>
+                                    )}
+                                    {acc.error && (
+                                      <span className="px-2 py-0.5 rounded-full bg-rose-500/15 text-rose-500 text-[10px] font-extrabold uppercase tracking-wider shrink-0">
+                                        Needs reconnect
+                                      </span>
+                                    )}
+                                  </div>
+                                  <p className="text-xs text-[var(--sub)] truncate mt-0.5">{acc.email}</p>
+                                  {acc.error && acc.errorMessage && (
+                                    <p className="text-xs text-rose-500 font-medium mt-1 break-words">{acc.errorMessage}</p>
+                                  )}
+                                </div>
+                              </div>
+
+                              <div className="flex items-center gap-1 shrink-0">
+                                {acc.error && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      if (acc.accountType === 'tgdrive') {
+                                        setTgDriveModal(true);
+                                        syncUrl({ modal: 'tg-drive' });
+                                      } else {
+                                        handleConnect(acc.accountType === 'onedrive' ? 'onedrive' : 'google');
+                                      }
+                                    }}
+                                    className="px-3 h-8 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold transition-colors"
+                                  >
+                                    Reconnect
+                                  </button>
+                                )}
+                                <div className="relative">
+                                  <button
+                                    type="button"
+                                    onClick={() => setOpenAccountMenuId(prev => (prev === acc.id ? null : acc.id))}
+                                    className="w-9 h-9 rounded-xl text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--bg)] flex items-center justify-center transition-colors"
+                                    aria-label={`Account actions for ${displayName}`}
+                                  >
+                                    <MoreVertical size={17} />
+                                  </button>
+                                  {isMenuOpen && (
+                                    <>
+                                      <div className="fixed inset-0 z-40" onClick={() => setOpenAccountMenuId(null)} />
+                                      <div className="absolute right-0 mt-1.5 w-52 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] shadow-2xl z-50 p-1.5 space-y-0.5">
+                                        {!acc.isDefault && (
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              setOpenAccountMenuId(null);
+                                              handleSetDefaultAccount(acc.id);
+                                            }}
+                                            className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"
+                                          >
+                                            <Check size={14} className="text-[#2563EB]" />
+                                            <span>Set as default</span>
+                                          </button>
+                                        )}
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setOpenAccountMenuId(null);
+                                            openDriveTransferModal(acc, false);
+                                          }}
+                                          className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"
+                                        >
+                                          <Copy size={14} className="text-[#2563EB]" />
+                                          <span>Copy Drive</span>
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setOpenAccountMenuId(null);
+                                            openDriveTransferModal(acc, true);
+                                          }}
+                                          className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"
+                                        >
+                                          <ArrowLeftRight size={14} className="text-amber-500" />
+                                          <span>Move Drive</span>
+                                        </button>
+                                        {acc.accountType === 'tgdrive' && (
+                                          <>
+                                            <div className="my-1 border-t border-[var(--bd)]" />
+                                            <button
+                                              type="button"
+                                              onClick={() => {
+                                                setOpenAccountMenuId(null);
+                                                openTgImportModal(acc);
+                                              }}
+                                              className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"
+                                            >
+                                              <Upload size={14} className="text-sky-500" />
+                                              <span>Import JSON</span>
+                                            </button>
+                                            <button
+                                              type="button"
+                                              onClick={() => {
+                                                setOpenAccountMenuId(null);
+                                                handleExportTgJson(acc);
+                                              }}
+                                              className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"
+                                            >
+                                              <Download size={14} className="text-sky-500" />
+                                              <span>Export JSON</span>
+                                            </button>
+                                          </>
+                                        )}
+                                        <div className="my-1 border-t border-[var(--bd)]" />
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setOpenAccountMenuId(null);
+                                            if (acc.accountType === 'tgdrive') {
+                                              setTgDriveModal(true);
+                                              syncUrl({ modal: 'tg-drive' });
+                                            } else {
+                                              handleConnect(acc.accountType === 'onedrive' ? 'onedrive' : 'google');
+                                            }
+                                          }}
+                                          className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"
+                                        >
+                                          <RefreshCw size={14} className="text-[var(--sub)]" />
+                                          <span>Reconnect</span>
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setOpenAccountMenuId(null);
+                                            handleUnlink(acc);
+                                          }}
+                                          className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-bold text-rose-500 hover:bg-rose-500/10 transition-colors"
+                                        >
+                                          <Trash2 size={14} />
+                                          <span>Disconnect</span>
+                                        </button>
+                                      </div>
+                                    </>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                        <button type="button" onClick={() => { setIsSettingsOpen(false); setLinkProviderModal(true); syncUrl({ page: 'drive', modal: 'link-account' }); }} className="w-full flex items-center justify-center gap-2 py-3.5 border-2 border-dashed border-[var(--bd)] rounded-[22px] text-sm font-bold text-[var(--sub)] hover:text-[#2563EB] hover:border-[#2563EB] transition-all">
+                          <Plus size={16} /><span>Link Another Account</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                ) : settingsTab !== 'general' ? (
                   <SecuritySettingsTabs
                     activeTab={settingsTab}
                     accounts={accounts}
@@ -3751,148 +4050,6 @@ export default function App() {
                         </div>
                       </div>
                     </div>
-
-                    <div className="space-y-2.5">
-                      <h3 className="text-xs font-semibold text-[var(--sub)] px-1">Connected accounts</h3>
-                      <div className="space-y-3">
-                        {accounts.map(acc => {
-                          const isMenuOpen = openAccountMenuId === acc.id;
-                          const displayName = acc.name || (acc.accountType === 'tgdrive' ? 'TG Drive' : 'Account');
-                          return (
-                            <div key={acc.id} className="flex items-center justify-between gap-3 p-4 bg-[var(--sf)] border border-[var(--bd)] rounded-[22px] relative">
-                              <div className="flex items-center gap-3 min-w-0">
-                                {renderProviderBadge(acc.accountType, 'md')}
-                                <div className="min-w-0">
-                                  <div className="flex items-center gap-2 flex-wrap">
-                                    <p className="text-sm font-bold truncate text-[var(--tx)]">{displayName}</p>
-                                    {acc.isDefault && (
-                                      <span className="px-2 py-0.5 rounded-full bg-[var(--pi)] text-[var(--pit)] text-[10px] font-extrabold uppercase tracking-wider shrink-0">
-                                        Default
-                                      </span>
-                                    )}
-                                    {acc.error && (
-                                      <span className="px-2 py-0.5 rounded-full bg-rose-500/15 text-rose-500 text-[10px] font-extrabold uppercase tracking-wider shrink-0">
-                                        Needs reconnect
-                                      </span>
-                                    )}
-                                  </div>
-                                  <p className="text-xs text-[var(--sub)] truncate mt-0.5">{acc.email}</p>
-                                  {acc.error && acc.errorMessage && (
-                                    <p className="text-xs text-rose-500 font-medium mt-1 break-words">{acc.errorMessage}</p>
-                                  )}
-                                </div>
-                              </div>
-
-                              <div className="flex items-center gap-1 shrink-0">
-                                {acc.error && (
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      if (acc.accountType === 'tgdrive') {
-                                        setTgDriveModal(true);
-                                        syncUrl({ modal: 'tg-drive' });
-                                      } else {
-                                        handleConnect(acc.accountType === 'onedrive' ? 'onedrive' : 'google');
-                                      }
-                                    }}
-                                    className="px-3 h-8 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold transition-colors"
-                                  >
-                                    Reconnect
-                                  </button>
-                                )}
-                                <div className="relative">
-                                  <button
-                                    type="button"
-                                    onClick={() => setOpenAccountMenuId(prev => (prev === acc.id ? null : acc.id))}
-                                    className="w-9 h-9 rounded-xl text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--bg)] flex items-center justify-center transition-colors"
-                                    aria-label={`Account actions for ${displayName}`}
-                                  >
-                                    <MoreVertical size={17} />
-                                  </button>
-                                  {isMenuOpen && (
-                                    <>
-                                      <div className="fixed inset-0 z-40" onClick={() => setOpenAccountMenuId(null)} />
-                                      <div className="absolute right-0 mt-1.5 w-48 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] shadow-2xl z-50 p-1.5 space-y-0.5">
-                                        {!acc.isDefault && (
-                                          <button
-                                            type="button"
-                                            onClick={() => {
-                                              setOpenAccountMenuId(null);
-                                              handleSetDefaultAccount(acc.id);
-                                            }}
-                                            className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"
-                                          >
-                                            <Check size={14} className="text-[#2563EB]" />
-                                            <span>Set as default</span>
-                                          </button>
-                                        )}
-                                        {acc.accountType === 'tgdrive' && (
-                                          <>
-                                            <button
-                                              type="button"
-                                              onClick={() => {
-                                                setOpenAccountMenuId(null);
-                                                openTgImportModal(acc);
-                                              }}
-                                              className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"
-                                            >
-                                              <Upload size={14} className="text-sky-500" />
-                                              <span>Import JSON</span>
-                                            </button>
-                                            <button
-                                              type="button"
-                                              onClick={() => {
-                                                setOpenAccountMenuId(null);
-                                                handleExportTgJson(acc);
-                                              }}
-                                              className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"
-                                            >
-                                              <Download size={14} className="text-sky-500" />
-                                              <span>Export JSON</span>
-                                            </button>
-                                          </>
-                                        )}
-                                        <button
-                                          type="button"
-                                          onClick={() => {
-                                            setOpenAccountMenuId(null);
-                                            if (acc.accountType === 'tgdrive') {
-                                              setTgDriveModal(true);
-                                              syncUrl({ modal: 'tg-drive' });
-                                            } else {
-                                              handleConnect(acc.accountType === 'onedrive' ? 'onedrive' : 'google');
-                                            }
-                                          }}
-                                          className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"
-                                        >
-                                          <RefreshCw size={14} className="text-[var(--sub)]" />
-                                          <span>Reconnect</span>
-                                        </button>
-                                        <div className="my-1 border-t border-[var(--bd)]" />
-                                        <button
-                                          type="button"
-                                          onClick={() => {
-                                            setOpenAccountMenuId(null);
-                                            handleUnlink(acc);
-                                          }}
-                                          className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-bold text-rose-500 hover:bg-rose-500/10 transition-colors"
-                                        >
-                                          <Trash2 size={14} />
-                                          <span>Disconnect</span>
-                                        </button>
-                                      </div>
-                                    </>
-                                  )}
-                                </div>
-                              </div>
-                            </div>
-                          );
-                        })}
-                        <button type="button" onClick={() => { setIsSettingsOpen(false); setLinkProviderModal(true); syncUrl({ page: 'drive', modal: 'link-account' }); }} className="w-full flex items-center justify-center gap-2 py-3.5 border-2 border-dashed border-[var(--bd)] rounded-[22px] text-sm font-bold text-[var(--sub)] hover:text-[#2563EB] hover:border-[#2563EB] transition-all">
-                          <Plus size={16} /><span>Link Another Account</span>
-                        </button>
-                      </div>
-                    </div>
                   </div>
                 )}
               </div>
@@ -4023,46 +4180,243 @@ export default function App() {
                 if (e.target === e.currentTarget) setFocusedFileId(null);
               }}
             >
-              {/* Breadcrumbs & Toolbar */}
-              <div className="flex flex-wrap items-center gap-2">
-                <div className="flex items-center gap-1 overflow-x-auto no-scrollbar max-w-full py-1">
-                  {path.map((item, idx) => {
-                    const isLast = !isTrashView && idx === path.length - 1;
-                    return (
-                      <React.Fragment key={idx}>
+              {/* Mobile Toolbar (Native Google Drive style: Grid + Refresh left, Sort right; Upload & New Folder hidden in favor of + FAB) */}
+              <div className="flex md:hidden items-center justify-between gap-2">
+                {isTrashView ? (
+                  <>
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <span className="flex items-center gap-1.5 py-1 text-[15px] font-semibold text-rose-500 whitespace-nowrap">
+                        <Trash2 size={15} />
+                        <span>Trash</span>
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => setViewMode(prev => (prev === 'list' ? 'grid' : 'list'))}
+                        className="w-9 h-9 rounded-xl flex items-center justify-center text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--sf)] transition-colors"
+                        aria-label={viewMode === 'list' ? 'Switch to grid view' : 'Switch to list view'}
+                      >
+                        {viewMode === 'list' ? <LayoutGrid size={18} /> : <ListIcon size={18} />}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => selectedAccountId && fetchFiles(selectedAccountId, currentFolderId, searchQuery, isTrashView)}
+                        className="w-9 h-9 rounded-xl flex items-center justify-center text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--sf)] transition-colors"
+                        aria-label="Refresh"
+                      >
+                        <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => toggleTrashView(false)}
+                        className="h-9 px-3 rounded-xl bg-[var(--tonal)] text-[var(--tonalt)] text-xs font-semibold flex items-center gap-1.5 shrink-0"
+                        aria-label="Back to Drive"
+                      >
+                        <ArrowLeft size={15} />
+                      </button>
+                      {files.length > 0 && (
                         <button
                           type="button"
-                          onClick={() => {
-                            navigateUp(idx);
-                          }}
-                          className={`flex items-center gap-2 py-1 px-1.5 rounded-lg text-[15px] whitespace-nowrap shrink-0 transition-colors ${
-                            isLast
-                              ? 'text-[var(--tx)] font-semibold'
-                              : 'font-medium text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--hover)]'
-                          }`}
+                          onClick={handleEmptyTrash}
+                          className="h-9 px-3 rounded-xl bg-rose-600 text-white text-xs font-semibold flex items-center gap-1.5 shrink-0"
                         >
-                          {idx === 0 && (
-                            <Folder
-                              size={18}
-                              className={isLast ? 'text-[#2563EB] shrink-0' : 'text-[var(--sub)] shrink-0'}
-                              fill={isLast ? 'currentColor' : 'none'}
-                            />
-                          )}
-                          <span>{idx === 0 ? 'Files' : item.name}</span>
+                          <Trash2 size={14} />
+                          <span>Empty</span>
                         </button>
-                        {idx < path.length - 1 && (
-                          <ChevronRight size={15} className="text-[var(--sub)] shrink-0" />
-                        )}
-                      </React.Fragment>
-                    );
-                  })}
-                  {isTrashView && (
+                      )}
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    {/* Left: Grid/List toggle + Refresh icon */}
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => setViewMode(prev => (prev === 'list' ? 'grid' : 'list'))}
+                        className="w-9 h-9 rounded-xl flex items-center justify-center text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--sf)] transition-colors"
+                        title={viewMode === 'list' ? 'Switch to grid view' : 'Switch to list view'}
+                        aria-label={viewMode === 'list' ? 'Switch to grid view' : 'Switch to list view'}
+                      >
+                        {viewMode === 'list' ? <LayoutGrid size={18} /> : <ListIcon size={18} />}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => selectedAccountId && fetchFiles(selectedAccountId, currentFolderId, searchQuery, isTrashView)}
+                        className="w-9 h-9 rounded-xl flex items-center justify-center text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--sf)] transition-colors"
+                        title="Refresh"
+                        aria-label="Refresh"
+                      >
+                        <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
+                      </button>
+                    </div>
+
+                    {/* Right: Name Sort selector */}
+                    <div className="relative">
+                      <button
+                        type="button"
+                        onClick={() => setIsSortMenuOpen(prev => !prev)}
+                        className={`h-9 px-2.5 rounded-xl flex items-center gap-1.5 text-xs font-semibold transition-colors ${
+                          isSortMenuOpen
+                            ? 'bg-[var(--pi)] text-[var(--pit)]'
+                            : 'text-[var(--tx)] hover:bg-[var(--sf)]'
+                        }`}
+                        title="Sort files"
+                        aria-expanded={isSortMenuOpen}
+                      >
+                        {sortOrder === 'asc' ? <ArrowUp size={14} /> : <ArrowDown size={14} />}
+                        <span className="capitalize">{sortBy}</span>
+                        <ChevronDown size={13} className="opacity-70" />
+                      </button>
+                      {isSortMenuOpen && (
+                        <>
+                          <div className="fixed inset-0 z-40" onClick={() => setIsSortMenuOpen(false)} />
+                          <div className="absolute right-0 mt-1.5 w-44 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] shadow-xl z-50 p-1.5 space-y-0.5">
+                            <div className="px-2.5 py-1 text-[11px] font-medium text-[var(--sub)]">Sort by</div>
+                            {(
+                              [
+                                { id: 'name', label: 'Name' },
+                                { id: 'modified', label: 'Modified' },
+                                { id: 'size', label: 'Size' },
+                              ] as const
+                            ).map((opt) => (
+                              <button
+                                key={`m-sort-${opt.id}`}
+                                type="button"
+                                onClick={() => {
+                                  setSortBy(opt.id);
+                                  setIsSortMenuOpen(false);
+                                }}
+                                className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-xl text-xs font-medium transition-colors ${
+                                  sortBy === opt.id
+                                    ? 'bg-[var(--sel)] text-[var(--tx)]'
+                                    : 'text-[var(--tx)] hover:bg-[var(--hover)]'
+                                }`}
+                              >
+                                <span>{opt.label}</span>
+                                {sortBy === opt.id && <Check size={13} className="text-[#2563EB]" />}
+                              </button>
+                            ))}
+                            <div className="my-1 border-t border-[var(--bd)]" />
+                            <div className="px-2.5 py-1 text-[11px] font-medium text-[var(--sub)]">Direction</div>
+                            {(
+                              [
+                                { id: 'asc', label: 'Ascending', icon: <ArrowUp size={12} /> },
+                                { id: 'desc', label: 'Descending', icon: <ArrowDown size={12} /> },
+                              ] as const
+                            ).map((dir) => (
+                              <button
+                                key={`m-dir-${dir.id}`}
+                                type="button"
+                                onClick={() => {
+                                  setSortOrder(dir.id);
+                                  setIsSortMenuOpen(false);
+                                }}
+                                className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-xl text-xs font-medium transition-colors ${
+                                  sortOrder === dir.id
+                                    ? 'bg-[var(--sel)] text-[var(--tx)]'
+                                    : 'text-[var(--tx)] hover:bg-[var(--hover)]'
+                                }`}
+                              >
+                                <span className="flex items-center gap-1.5">
+                                  {dir.icon}
+                                  <span>{dir.label}</span>
+                                </span>
+                                {sortOrder === dir.id && <Check size={13} className="text-[#2563EB]" />}
+                              </button>
+                            ))}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  </>
+                )}
+              </div>
+
+              {/* Desktop Breadcrumbs & Toolbar */}
+              <div className="hidden md:flex flex-wrap items-center gap-2">
+                <div className="flex items-center gap-1 min-w-0 py-1">
+                  {isTrashView ? (
                     <>
+                      <button
+                        type="button"
+                        onClick={() => navigateUp(0)}
+                        className="flex items-center gap-2 py-1 px-1.5 rounded-lg text-[15px] font-medium text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--hover)] whitespace-nowrap shrink-0 transition-colors"
+                      >
+                        <Folder size={18} className="text-[var(--sub)] shrink-0" />
+                        <span>Files</span>
+                      </button>
                       <ChevronRight size={15} className="text-[var(--sub)] shrink-0" />
                       <span className="flex items-center gap-1.5 py-1 px-1.5 text-[15px] font-semibold text-rose-500 whitespace-nowrap shrink-0">
                         <Trash2 size={15} />
                         <span>Trash</span>
                       </span>
+                    </>
+                  ) : path.length <= 1 ? (
+                    <button
+                      type="button"
+                      onClick={() => navigateUp(0)}
+                      className="flex items-center gap-2 py-1 px-1.5 rounded-lg text-[15px] font-semibold text-[var(--tx)] whitespace-nowrap shrink-0 transition-colors"
+                    >
+                      <Folder size={18} className="text-[#2563EB] shrink-0" fill="currentColor" />
+                      <span>Files</span>
+                    </button>
+                  ) : (
+                    <>
+                      <div className="relative shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => setIsBreadcrumbMenuOpen(prev => !prev)}
+                          title="Parent folders"
+                          aria-label="Show parent folders"
+                          aria-expanded={isBreadcrumbMenuOpen}
+                          className={`w-8 h-8 rounded-xl flex items-center justify-center transition-colors ${
+                            isBreadcrumbMenuOpen
+                              ? 'bg-[var(--pi)] text-[var(--pit)]'
+                              : 'text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--sf)]'
+                          }`}
+                        >
+                          <MoreHorizontal size={17} />
+                        </button>
+                        {isBreadcrumbMenuOpen && (
+                          <>
+                            <div className="fixed inset-0 z-40" onClick={() => setIsBreadcrumbMenuOpen(false)} />
+                            <div className="absolute left-0 mt-1.5 w-60 max-w-[80vw] rounded-2xl bg-[var(--sf)] border border-[var(--bd)] shadow-2xl z-50 p-1.5 space-y-0.5 max-h-72 overflow-y-auto">
+                              <div className="px-2.5 py-1 text-[10px] font-black uppercase tracking-wider text-[var(--sub)]">
+                                Folder path
+                              </div>
+                              {path.slice(0, -1).map((ancestor, idx) => (
+                                <button
+                                  key={`${ancestor.id ?? 'root'}-${idx}`}
+                                  type="button"
+                                  onClick={() => {
+                                    setIsBreadcrumbMenuOpen(false);
+                                    navigateUp(idx);
+                                  }}
+                                  className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-xl text-xs font-semibold text-[var(--tx)] hover:bg-[var(--hover)] transition-colors text-left"
+                                >
+                                  <Folder
+                                    size={15}
+                                    className={idx === 0 ? 'text-[#2563EB] shrink-0' : 'text-[#F59E0B] shrink-0'}
+                                    fill={idx === 0 ? 'none' : 'currentColor'}
+                                  />
+                                  <span className="truncate">{idx === 0 ? 'Files' : ancestor.name}</span>
+                                </button>
+                              ))}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                      <ChevronRight size={15} className="text-[var(--sub)] shrink-0" />
+                      <div
+                        className="flex items-center gap-2 py-1 px-1.5 rounded-lg text-[15px] font-semibold text-[var(--tx)] min-w-0"
+                        title={path[path.length - 1]?.name}
+                      >
+                        <Folder size={17} className="text-[#2563EB] shrink-0" fill="currentColor" />
+                        <span className="truncate max-w-[180px] sm:max-w-[320px] md:max-w-[420px]">
+                          {path[path.length - 1]?.name}
+                        </span>
+                      </div>
                     </>
                   )}
                 </div>
@@ -4082,7 +4436,7 @@ export default function App() {
                       aria-expanded={isSortMenuOpen}
                     >
                       {sortOrder === 'asc' ? <ArrowUp size={14} /> : <ArrowDown size={14} />}
-                      <span className="hidden sm:inline capitalize">{sortBy}</span>
+                      <span className="capitalize">{sortBy}</span>
                       <ChevronDown size={13} className="opacity-70" />
                     </button>
                     {isSortMenuOpen && (
@@ -4158,36 +4512,6 @@ export default function App() {
                     {viewMode === 'list' ? <LayoutGrid size={18} /> : <ListIcon size={18} />}
                   </button>
 
-                  {/* Details Inspector Toggle */}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (selectedFile) {
-                        openFileInspector(null);
-                        return;
-                      }
-                      const candidate =
-                        displayedFiles.find(f => f.id === focusedFileId) ||
-                        displayedFiles.find(f => selectedFileIds.has(f.id)) ||
-                        null;
-                      if (candidate) {
-                        openFileInspector(candidate);
-                      } else {
-                        showToast('Select a file to view its details');
-                      }
-                    }}
-                    className={`w-9 h-9 rounded-xl flex items-center justify-center transition-colors ${
-                      selectedFile
-                        ? 'bg-[var(--pi)] text-[var(--pit)]'
-                        : 'text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--sf)]'
-                    }`}
-                    title={selectedFile ? 'Hide details' : 'View details'}
-                    aria-label={selectedFile ? 'Hide details' : 'View details'}
-                    aria-pressed={Boolean(selectedFile)}
-                  >
-                    <Info size={17} />
-                  </button>
-
                   <button
                     type="button"
                     onClick={() => selectedAccountId && fetchFiles(selectedAccountId, currentFolderId, searchQuery, isTrashView)}
@@ -4206,7 +4530,7 @@ export default function App() {
                         className="h-9 px-3.5 rounded-xl bg-[var(--tonal)] text-[var(--tonalt)] text-xs font-semibold flex items-center gap-1.5 hover:opacity-90 transition-opacity whitespace-nowrap shrink-0"
                       >
                         <ArrowLeft size={15} />
-                        <span className="hidden sm:inline">Back to Drive</span>
+                        <span>Back to Drive</span>
                       </button>
                       {files.length > 0 && (
                         <button
@@ -4220,14 +4544,70 @@ export default function App() {
                       )}
                     </div>
                   ) : (
-                    <button
-                      type="button"
-                      onClick={handleCreateFolder}
-                      className="h-9 px-3.5 md:px-4 rounded-xl bg-[var(--tonal)] text-[var(--tonalt)] text-xs font-semibold flex items-center gap-1.5 ml-1 hover:opacity-90 transition-opacity whitespace-nowrap shrink-0"
-                    >
-                      <FolderPlus size={16} />
-                      <span className="hidden sm:inline">New folder</span>
-                    </button>
+                    <div className="flex items-center gap-1.5 ml-1">
+                      <button
+                        type="button"
+                        onClick={handleCreateFolder}
+                        className="h-9 px-3.5 md:px-4 rounded-xl bg-[var(--tonal)] text-[var(--tonalt)] text-xs font-semibold flex items-center gap-1.5 hover:opacity-90 transition-opacity whitespace-nowrap shrink-0"
+                        title="New folder"
+                      >
+                        <FolderPlus size={16} />
+                        <span>New folder</span>
+                      </button>
+
+                      <div className="relative">
+                        <button
+                          type="button"
+                          disabled={accounts.length === 0}
+                          onClick={() => setUploadMenuAnchor(prev => (prev === 'toolbar' ? null : 'toolbar'))}
+                          title="Upload files or folder"
+                          aria-label="Upload"
+                          className={`h-9 px-3.5 md:px-4 rounded-xl bg-[var(--pi)] text-[var(--pit)] text-xs font-semibold flex items-center gap-1.5 hover:opacity-90 active:scale-[0.98] transition-all whitespace-nowrap shrink-0 ${
+                            accounts.length === 0 ? 'opacity-40 pointer-events-none' : ''
+                          }`}
+                        >
+                          <Upload size={15} />
+                          <span>Upload</span>
+                        </button>
+
+                        {uploadMenuAnchor === 'toolbar' && (
+                          <>
+                            <div className="fixed inset-0 z-40" onClick={() => setUploadMenuAnchor(null)} />
+                            <div className="absolute right-0 mt-1.5 w-60 rounded-[22px] bg-[var(--sf)] border border-[var(--bd)] shadow-2xl z-50 p-2 space-y-1">
+                              <div className="px-3 py-2 border-b border-[var(--bd)]">
+                                <p className="text-[10px] font-black uppercase tracking-wider text-[var(--sub)]">Upload to</p>
+                                <p className="text-xs font-extrabold text-[var(--tx)] truncate mt-0.5">
+                                  {(selectedAccount?.name || (isTgDrive ? 'TG Drive' : selectedAccount?.email || 'Drive'))}
+                                  {path.length > 1 ? ` › ${path.slice(1).map(p => p.name).join(' › ')}` : ' › Files'}
+                                </p>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setUploadMenuAnchor(null);
+                                  fileUploadInputRef.current?.click();
+                                }}
+                                className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"
+                              >
+                                <UploadCloud size={16} className="text-[#2563EB]" />
+                                <span>Upload files</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setUploadMenuAnchor(null);
+                                  folderUploadInputRef.current?.click();
+                                }}
+                                className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"
+                              >
+                                <FolderOpen size={16} className="text-[#F59E0B]" />
+                                <span>Upload folder</span>
+                              </button>
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    </div>
                   )}
                 </div>
               </div>
@@ -4899,64 +5279,85 @@ export default function App() {
           </AnimatePresence>
         </div>
 
-        {/* Mobile Floating Upload Button + Contextual Destination Menu */}
+        {/* Mobile Floating + Speed-Dial Button (Upload & New Folder sub-buttons) */}
         {!isTrashView && !isSettingsOpen && !isJobsDrawerOpen && !isAdminPanelOpen && accounts.length > 0 && (
-          <div className="md:hidden fixed right-4 bottom-24 z-40">
-            {uploadMenuAnchor === 'mobile' && (
-              <>
-                <div className="fixed inset-0 z-30" onClick={() => setUploadMenuAnchor(null)} />
-                <div className="absolute right-0 bottom-16 w-60 rounded-[22px] bg-[var(--sf)] border border-[var(--bd)] shadow-2xl z-40 p-2 space-y-1">
-                  <div className="px-3 py-2 border-b border-[var(--bd)]">
-                    <p className="text-[10px] font-black uppercase tracking-wider text-[var(--sub)]">Upload to</p>
-                    <p className="text-xs font-extrabold text-[var(--tx)] truncate mt-0.5">
-                      {(selectedAccount?.name || (isTgDrive ? 'TG Drive' : selectedAccount?.email || 'Drive'))}
-                      {path.length > 1 ? ` › ${path.slice(1).map(p => p.name).join(' › ')}` : ' › Files'}
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setUploadMenuAnchor(null);
-                      fileUploadInputRef.current?.click();
-                    }}
-                    className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)]"
+          <div className="md:hidden fixed right-4 bottom-24 z-40 flex flex-col items-end">
+            <AnimatePresence>
+              {uploadMenuAnchor === 'mobile' && (
+                <>
+                  <motion.div
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    transition={{ duration: 0.15 }}
+                    className="fixed inset-0 bg-black/25 backdrop-blur-[1px] z-30"
+                    onClick={() => setUploadMenuAnchor(null)}
+                  />
+                  <motion.div
+                    initial={{ opacity: 0, y: 12, scale: 0.94 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, y: 10, scale: 0.94 }}
+                    transition={{ duration: 0.16, ease: 'easeOut' }}
+                    className="relative z-40 mb-3 flex flex-col items-end gap-2.5"
                   >
-                    <UploadCloud size={16} className="text-[#2563EB]" />
-                    <span>Upload files</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setUploadMenuAnchor(null);
-                      folderUploadInputRef.current?.click();
-                    }}
-                    className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)]"
-                  >
-                    <FolderOpen size={16} className="text-[#F59E0B]" />
-                    <span>Upload folder</span>
-                  </button>
-                  <div className="my-1 border-t border-[var(--bd)]" />
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setUploadMenuAnchor(null);
-                      handleCreateFolder();
-                    }}
-                    className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)]"
-                  >
-                    <FolderPlus size={16} className="text-[var(--sub)]" />
-                    <span>New folder</span>
-                  </button>
-                </div>
-              </>
-            )}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setUploadMenuAnchor(null);
+                        handleCreateFolder();
+                      }}
+                      className="flex items-center gap-2.5 pl-4 pr-3.5 h-11 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] shadow-xl text-[13px] font-semibold text-[var(--tx)] active:scale-95 transition-transform whitespace-nowrap"
+                    >
+                      <span>New folder</span>
+                      <span className="w-7 h-7 rounded-xl bg-[var(--tonal)] text-[var(--tonalt)] flex items-center justify-center shrink-0">
+                        <FolderPlus size={16} />
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setUploadMenuAnchor(null);
+                        folderUploadInputRef.current?.click();
+                      }}
+                      className="flex items-center gap-2.5 pl-4 pr-3.5 h-11 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] shadow-xl text-[13px] font-semibold text-[var(--tx)] active:scale-95 transition-transform whitespace-nowrap"
+                    >
+                      <span>Upload folder</span>
+                      <span className="w-7 h-7 rounded-xl bg-amber-500/15 text-[#F59E0B] flex items-center justify-center shrink-0">
+                        <FolderOpen size={16} />
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setUploadMenuAnchor(null);
+                        fileUploadInputRef.current?.click();
+                      }}
+                      className="flex items-center gap-2.5 pl-4 pr-3.5 h-11 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] shadow-xl text-[13px] font-semibold text-[var(--tx)] active:scale-95 transition-transform whitespace-nowrap"
+                    >
+                      <span>Upload files</span>
+                      <span className="w-7 h-7 rounded-xl bg-[#2563EB]/15 text-[#2563EB] flex items-center justify-center shrink-0">
+                        <UploadCloud size={16} />
+                      </span>
+                    </button>
+                  </motion.div>
+                </>
+              )}
+            </AnimatePresence>
+
             <button
               type="button"
               onClick={() => setUploadMenuAnchor(prev => (prev === 'mobile' ? null : 'mobile'))}
-              className="relative z-40 h-14 px-5 rounded-2xl bg-[#2563EB] text-white font-bold text-[15px] flex items-center gap-2.5 shadow-[0_8px_20px_rgba(37,99,235,0.4)] active:scale-95 transition-transform"
+              aria-label={uploadMenuAnchor === 'mobile' ? 'Close create menu' : 'Create or upload'}
+              aria-expanded={uploadMenuAnchor === 'mobile'}
+              className="relative z-40 w-14 h-14 rounded-2xl bg-[#2563EB] text-white flex items-center justify-center shadow-[0_8px_22px_rgba(37,99,235,0.42)] active:scale-95 transition-all"
             >
-              <Upload size={20} />
-              <span>Upload</span>
+              <Plus
+                size={26}
+                strokeWidth={2.4}
+                className={`transition-transform duration-200 ${uploadMenuAnchor === 'mobile' ? 'rotate-45' : ''}`}
+              />
             </button>
           </div>
         )}
@@ -5499,6 +5900,195 @@ export default function App() {
                         <><RefreshCw size={16} className="animate-spin" /><span>Importing...</span></>
                       ) : (
                         <><Upload size={16} /><span>Import Now</span></>
+                      )}
+                    </button>
+                  </div>
+                </motion.div>
+              </div>
+            );
+          })()}
+        </AnimatePresence>
+
+        {/* Server-Side Whole-Drive Copy / Move Modal */}
+        <AnimatePresence>
+          {driveTransferModal && (() => {
+            const src = driveTransferModal.sourceAccount;
+            const isMoveAction = driveTransferModal.isMove;
+            const srcLabel = src.name || (src.accountType === 'tgdrive' ? 'TG Drive' : src.email || 'Source Drive');
+            const destinationOptions = accounts.filter((a) => a.id !== src.id);
+            const selectedDest = accounts.find((a) => a.id === driveTransferTargetId);
+            const isFastTgCopy = src.accountType === 'tgdrive' && selectedDest?.accountType === 'tgdrive';
+            return (
+              <div className="fixed inset-0 z-[130] flex items-center justify-center p-4">
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  onClick={() => { if (!driveTransferSubmitting) setDriveTransferModal(null); }}
+                  className="fixed inset-0 bg-black/60 backdrop-blur-md"
+                />
+                <motion.div
+                  initial={{ opacity: 0, scale: 0.96, y: 12 }}
+                  animate={{ opacity: 1, scale: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 0.96, y: 12 }}
+                  className="relative w-full max-w-lg bg-[var(--sf)] rounded-[28px] border border-[var(--bd)] shadow-2xl p-6 space-y-5 z-10 max-h-[90vh] overflow-y-auto"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className={`w-11 h-11 rounded-2xl flex items-center justify-center shrink-0 ${isMoveAction ? 'bg-amber-500/15 text-amber-500' : 'bg-[#2563EB]/15 text-[#2563EB]'}`}>
+                        {isMoveAction ? <ArrowLeftRight size={20} /> : <Copy size={20} />}
+                      </div>
+                      <div className="min-w-0">
+                        <h3 className="text-base font-extrabold text-[var(--tx)] truncate">
+                          {isMoveAction ? 'Move Whole Drive' : 'Copy Whole Drive'}
+                        </h3>
+                        <p className="text-xs text-[var(--sub)] truncate mt-0.5">
+                          Server-side background transfer preserving all folders
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={driveTransferSubmitting}
+                      onClick={() => setDriveTransferModal(null)}
+                      className="w-9 h-9 rounded-full hover:bg-[var(--bg)] flex items-center justify-center text-[var(--sub)] transition-colors shrink-0"
+                    >
+                      <X size={18} />
+                    </button>
+                  </div>
+
+                  {/* Source Drive */}
+                  <div className="space-y-1.5">
+                    <span className="text-xs font-semibold text-[var(--sub)] px-0.5">Source Drive</span>
+                    <div className="flex items-center gap-3 p-3.5 rounded-2xl bg-[var(--bg)] border border-[var(--bd)]">
+                      {renderProviderBadge(src.accountType, 'sm')}
+                      <div className="min-w-0">
+                        <p className="text-sm font-bold text-[var(--tx)] truncate">{srcLabel}</p>
+                        <p className="text-xs text-[var(--sub)] truncate">{src.email}</p>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Destination Drive */}
+                  <div className="space-y-1.5">
+                    <span className="text-xs font-semibold text-[var(--sub)] px-0.5">Destination Drive</span>
+                    {destinationOptions.length === 0 ? (
+                      <div className="p-4 rounded-2xl bg-[var(--bg)] border border-[var(--bd)] text-xs text-[var(--sub)]">
+                        Link at least one more cloud drive first to {isMoveAction ? 'move' : 'copy'} this entire drive.
+                      </div>
+                    ) : (
+                      <div className="space-y-1.5 max-h-48 overflow-y-auto pr-0.5">
+                        {destinationOptions.map((dest) => {
+                          const selected = driveTransferTargetId === dest.id;
+                          const label = dest.name || (dest.accountType === 'tgdrive' ? 'TG Drive' : dest.email);
+                          return (
+                            <button
+                              key={dest.id}
+                              type="button"
+                              onClick={() => setDriveTransferTargetId(dest.id)}
+                              className={`w-full flex items-center justify-between gap-3 p-3 rounded-2xl border text-left transition-colors ${
+                                selected
+                                  ? 'bg-[var(--sel)] border-[#2563EB]'
+                                  : 'bg-[var(--bg)] border-[var(--bd)] hover:border-[var(--sub)]/50'
+                              }`}
+                            >
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                {renderProviderBadge(dest.accountType, 'sm')}
+                                <div className="min-w-0">
+                                  <p className="text-xs font-bold text-[var(--tx)] truncate">{label}</p>
+                                  <p className="text-[11px] text-[var(--sub)] truncate">{dest.email}</p>
+                                </div>
+                              </div>
+                              {selected && <Check size={16} className="text-[#2563EB] shrink-0" />}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Optional Target Subfolder */}
+                  {destinationOptions.length > 0 && (
+                    <>
+                      <div className="space-y-1.5">
+                        <label className="block text-xs font-semibold text-[var(--sub)] px-0.5">
+                          Destination subfolder (optional)
+                        </label>
+                        <input
+                          type="text"
+                          value={driveTransferTargetFolder}
+                          onChange={(e) => setDriveTransferTargetFolder(e.target.value)}
+                          placeholder="Leave empty for drive root (e.g. Backups/OldDrive)"
+                          className="w-full h-11 px-3.5 rounded-2xl bg-[var(--bg)] border border-[var(--bd)] focus:border-[#2563EB] text-xs font-medium text-[var(--tx)] outline-none"
+                        />
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <span className="block text-xs font-semibold text-[var(--sub)] px-0.5">If a file already exists</span>
+                        <div className="grid grid-cols-3 gap-2">
+                          {[
+                            { id: 'skip', label: 'Skip existing' },
+                            { id: 'rename', label: 'Keep both' },
+                            { id: 'overwrite', label: 'Overwrite' },
+                          ].map((opt) => (
+                            <button
+                              key={opt.id}
+                              type="button"
+                              onClick={() => setDriveTransferConflict(opt.id as 'skip' | 'rename' | 'overwrite')}
+                              className={`h-9 px-2.5 rounded-xl text-xs font-bold border transition-colors ${
+                                driveTransferConflict === opt.id
+                                  ? 'bg-[var(--pi)] text-[var(--pit)] border-transparent'
+                                  : 'bg-[var(--bg)] text-[var(--sub)] border-[var(--bd)] hover:text-[var(--tx)]'
+                              }`}
+                            >
+                              {opt.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    </>
+                  )}
+
+                  {isFastTgCopy && (
+                    <div className="p-3 rounded-2xl bg-sky-500/10 border border-sky-500/20 text-xs text-sky-600 dark:text-sky-400 font-medium">
+                      TG Drive → TG Drive fast-copy enabled: files &amp; notes transfer directly inside Telegram with near-zero server bandwidth.
+                    </div>
+                  )}
+
+                  {isMoveAction && (
+                    <div className="p-3 rounded-2xl bg-amber-500/10 border border-amber-500/25 text-xs text-amber-700 dark:text-amber-300 font-medium flex items-start gap-2">
+                      <AlertTriangle size={15} className="shrink-0 mt-0.5" />
+                      <span>
+                        Move mode removes each source file only after it is safely confirmed in the destination drive. Skipped or failed files remain untouched.
+                      </span>
+                    </div>
+                  )}
+
+                  <div className="flex items-center gap-3 pt-1">
+                    <button
+                      type="button"
+                      disabled={driveTransferSubmitting}
+                      onClick={() => setDriveTransferModal(null)}
+                      className="flex-1 h-11 rounded-[18px] bg-[var(--bg)] border border-[var(--bd)] text-sm font-bold text-[var(--tx)] hover:bg-[var(--hover)] transition-colors disabled:opacity-50"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      disabled={driveTransferSubmitting || !driveTransferTargetId || destinationOptions.length === 0}
+                      onClick={handleStartDriveTransfer}
+                      className={`flex-1 h-11 rounded-[18px] text-sm font-bold text-white shadow-lg transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed ${
+                        isMoveAction
+                          ? 'bg-amber-600 hover:bg-amber-700 shadow-amber-600/20'
+                          : 'bg-[#2563EB] hover:bg-blue-700 shadow-blue-600/20'
+                      }`}
+                    >
+                      {driveTransferSubmitting ? (
+                        <><RefreshCw size={15} className="animate-spin" /><span>Starting...</span></>
+                      ) : isMoveAction ? (
+                        <><ArrowLeftRight size={15} /><span>Start Drive Move</span></>
+                      ) : (
+                        <><Copy size={15} /><span>Start Drive Copy</span></>
                       )}
                     </button>
                   </div>

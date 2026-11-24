@@ -212,50 +212,356 @@ const resolvePeer = async (telegram: TelegramClient, id: string): Promise<any> =
 };
 
 
-// ─── GramJS singleton (bot-auth) ─────────────────────────────────────────────
+// ─── GramJS Multi-Bot Worker Pool (1 Main Bot + N Silent Worker Bots) ────────
+interface TgBotPoolEntry {
+  id: string;
+  role: 'main' | 'worker';
+  token: string;
+  client: any | null;
+  connecting: Promise<any> | null;
+  activeOps: number;
+  totalOps: number;
+  floodWaitUntil: number;
+  ineligibleChannels: Map<string, number>;
+  lastError?: string;
+}
+
 let tgClient: TelegramClient | null = null;
 let testTgClientFactory: (() => Promise<any>) | null = null;
+let testTgWorkerPool: TgBotPoolEntry[] | null = null;
+const tgBotPoolByToken = new Map<string, TgBotPoolEntry>();
+const TG_BOT_CHANNEL_INELIGIBLE_TTL_MS = 10 * 60 * 1000;
+
+function extractFloodWaitSeconds(err: any): number {
+  const direct = Number(err?.seconds);
+  if (Number.isFinite(direct) && direct > 0) return Math.ceil(direct);
+  const raw = String(err?.errorMessage || err?.message || '');
+  const match = raw.match(/FLOOD_WAIT_(\d+)/i) || raw.match(/wait of (\d+) seconds/i);
+  if (match) {
+    const secs = Number(match[1]);
+    if (Number.isFinite(secs) && secs > 0) return Math.ceil(secs);
+  }
+  return 0;
+}
+
+function parseConfiguredTgBotTokens(): { mainToken: string | null; workerTokens: string[] } {
+  const mainRaw = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
+  const mainToken = mainRaw && mainRaw !== 'YOUR_BOT_TOKEN' ? mainRaw : null;
+  const workerRaw = String(process.env.TELEGRAM_WORKER_BOT_TOKENS || process.env.TELEGRAM_WORKER_TOKENS || '');
+  const seen = new Set<string>(mainToken ? [mainToken] : []);
+  const workerTokens: string[] = [];
+  for (const part of workerRaw.split(/[\s,;]+/)) {
+    const t = part.trim();
+    if (!t || t === 'YOUR_BOT_TOKEN' || seen.has(t)) continue;
+    seen.add(t);
+    workerTokens.push(t);
+  }
+  return { mainToken, workerTokens };
+}
+
+function syncTgBotPoolFromEnv(): TgBotPoolEntry[] {
+  if (testTgWorkerPool) return testTgWorkerPool;
+  const { mainToken, workerTokens } = parseConfiguredTgBotTokens();
+  const entries: TgBotPoolEntry[] = [];
+
+  if (mainToken) {
+    let mainEntry = tgBotPoolByToken.get(mainToken);
+    if (!mainEntry) {
+      mainEntry = {
+        id: 'main',
+        role: 'main',
+        token: mainToken,
+        client: tgClient && tgClient.connected ? tgClient : null,
+        connecting: null,
+        activeOps: 0,
+        totalOps: 0,
+        floodWaitUntil: 0,
+        ineligibleChannels: new Map(),
+      };
+      tgBotPoolByToken.set(mainToken, mainEntry);
+    } else {
+      mainEntry.id = 'main';
+      mainEntry.role = 'main';
+      if (!mainEntry.client && tgClient && tgClient.connected) mainEntry.client = tgClient;
+    }
+    entries.push(mainEntry);
+  }
+
+  workerTokens.forEach((token, idx) => {
+    const slotId = `worker-${idx + 1}`;
+    let entry = tgBotPoolByToken.get(token);
+    if (!entry) {
+      entry = {
+        id: slotId,
+        role: 'worker',
+        token,
+        client: null,
+        connecting: null,
+        activeOps: 0,
+        totalOps: 0,
+        floodWaitUntil: 0,
+        ineligibleChannels: new Map(),
+      };
+      tgBotPoolByToken.set(token, entry);
+    } else {
+      entry.id = slotId;
+      entry.role = 'worker';
+    }
+    entries.push(entry);
+  });
+
+  return entries;
+}
+
+async function connectBotPoolEntry(entry: TgBotPoolEntry): Promise<any> {
+  if (testTgWorkerPool) return entry.client;
+  if (entry.client && entry.client.connected) return entry.client;
+  if (entry.connecting) return entry.connecting;
+
+  if (!entry.token || entry.token === 'YOUR_BOT_TOKEN') throw new Error('TELEGRAM_BOT_TOKEN missing');
+  if (!API_ID || !API_HASH) throw new Error('TELEGRAM_API_ID / TELEGRAM_API_HASH missing');
+
+  const connectPromise = (async () => {
+    let sessionString = '';
+    const sessionKey = entry.role === 'main'
+      ? `tg_session_${Buffer.from(entry.token).toString('base64').slice(0, 16)}`
+      : `tg_worker_session_${crypto.createHash('sha256').update(entry.token).digest('hex').slice(0, 16)}`;
+
+    try {
+      const database = db || await connectToMongo();
+      const saved = await database.collection('config').findOne({ key: sessionKey });
+      if (saved?.value) sessionString = saved.value;
+    } catch { /* ignore */ }
+
+    const startInstance = async (session: string) => {
+      const c = new TelegramClient(new StringSession(session), API_ID, API_HASH, { connectionRetries: 5 });
+      await c.start({ botToken: entry.token, botAuthToken: entry.token } as any);
+      return c;
+    };
+
+    let connectedClient: TelegramClient;
+    try {
+      connectedClient = await startInstance(sessionString);
+    } catch (err: any) {
+      if (err.message.includes('AUTH_KEY_UNREGISTERED') || err.message.includes('BotToken') || sessionString) {
+        try {
+          const d = db || await connectToMongo();
+          await d.collection('config').deleteOne({ key: sessionKey });
+        } catch { /* ignore */ }
+        connectedClient = await startInstance('');
+      } else {
+        throw err;
+      }
+    }
+
+    if (connectedClient?.session) {
+      try {
+        const ns = connectedClient.session.save() as unknown as string;
+        if (ns && ns !== sessionString) {
+          const d = db || await connectToMongo();
+          await d.collection('config').updateOne(
+            { key: sessionKey },
+            { $set: { value: ns, updatedAt: new Date() } },
+            { upsert: true }
+          );
+        }
+      } catch { /* ignore */ }
+    }
+
+    entry.client = connectedClient;
+    if (entry.role === 'main') tgClient = connectedClient;
+    return connectedClient;
+  })();
+
+  entry.connecting = connectPromise;
+  try {
+    return await connectPromise;
+  } finally {
+    entry.connecting = null;
+  }
+}
+
 async function getTgClient() {
   if (testTgClientFactory) return testTgClientFactory();
   if (tgClient && tgClient.connected) return tgClient;
+  const entries = syncTgBotPoolFromEnv();
+  const mainEntry = entries.find((e) => e.role === 'main') || entries[0];
+  if (!mainEntry) throw new Error('TELEGRAM_BOT_TOKEN missing');
+  return connectBotPoolEntry(mainEntry);
+}
 
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  if (!token || token === 'YOUR_BOT_TOKEN') throw new Error('TELEGRAM_BOT_TOKEN missing');
-  if (!API_ID || !API_HASH) throw new Error('TELEGRAM_API_ID / TELEGRAM_API_HASH missing');
-
-  let sessionString = '';
-  const sessionKey = `tg_session_${Buffer.from(token).toString('base64').slice(0, 16)}`;
-  try {
-    const database = db || await connectToMongo();
-    const saved = await database.collection('config').findOne({ key: sessionKey });
-    if (saved?.value) sessionString = saved.value;
-  } catch { /* ignore */ }
-
-  const startInstance = async (session: string) => {
-    const c = new TelegramClient(new StringSession(session), API_ID, API_HASH, { connectionRetries: 5 });
-    await c.start({ botToken: token, botAuthToken: token } as any);
-    return c;
-  };
-
-  try {
-    tgClient = await startInstance(sessionString);
-  } catch (err: any) {
-    if (err.message.includes('AUTH_KEY_UNREGISTERED') || err.message.includes('BotToken') || sessionString) {
-      try { const d = db || await connectToMongo(); await d.collection('config').deleteOne({ key: sessionKey }); } catch { /* ignore */ }
-      tgClient = await startInstance('');
-    } else { throw err; }
+/**
+ * Runs a GramJS operation against the smartest available bot in the pool:
+ * - Balances load by lowest activeOps (preferring silent workers for background/heavy traffic)
+ * - Trips a per-bot cooldown on FLOOD_WAIT and immediately fails over to the next healthy bot
+ * - Remembers per-channel ineligibility (e.g. worker bot not added to a specific channel) and
+ *   automatically routes to eligible bots / main bot without failing the user request
+ */
+async function withTgPoolClient<T>(
+  channelId: string | null,
+  fn: (telegram: any, slotId: string) => Promise<T>,
+  options?: { preferWorker?: boolean }
+): Promise<T> {
+  if (!testTgWorkerPool && testTgClientFactory) {
+    const telegram = await testTgClientFactory();
+    return fn(telegram, 'main');
   }
 
-  if (tgClient?.session) {
-    try {
-      const ns = tgClient.session.save() as unknown as string;
-      if (ns && ns !== sessionString) {
-        const d = db || await connectToMongo();
-        await d.collection('config').updateOne({ key: sessionKey }, { $set: { value: ns, updatedAt: new Date() } }, { upsert: true });
+  const entries = syncTgBotPoolFromEnv();
+  if (entries.length === 0) {
+    const telegram = await getTgClient();
+    return fn(telegram, 'main');
+  }
+
+  const cleanChannel = channelId ? String(channelId).trim() : '';
+  const attempted = new Set<string>();
+  let lastErr: any = null;
+
+  while (attempted.size < entries.length) {
+    const now = Date.now();
+    const eligible = entries.filter((entry) => {
+      if (attempted.has(entry.id)) return false;
+      if (cleanChannel) {
+        const blockedUntil = entry.ineligibleChannels.get(cleanChannel) || 0;
+        if (blockedUntil > now) return false;
       }
-    } catch { /* ignore */ }
+      return true;
+    });
+
+    if (eligible.length === 0) break;
+
+    const ready = eligible.filter((e) => e.floodWaitUntil <= now);
+    const pool = ready.length > 0 ? ready : [...eligible].sort((a, b) => a.floodWaitUntil - b.floodWaitUntil);
+
+    if (ready.length > 0) {
+      pool.sort((a, b) => {
+        if (a.activeOps !== b.activeOps) return a.activeOps - b.activeOps;
+        if (options?.preferWorker && a.role !== b.role) {
+          return a.role === 'worker' ? -1 : 1;
+        }
+        return a.totalOps - b.totalOps;
+      });
+    }
+
+    const chosen = pool[0];
+    attempted.add(chosen.id);
+    chosen.activeOps++;
+    chosen.totalOps++;
+
+    try {
+      const client = await connectBotPoolEntry(chosen);
+      return await fn(client, chosen.id);
+    } catch (err: any) {
+      lastErr = err;
+      const floodSec = extractFloodWaitSeconds(err);
+      if (floodSec > 0) {
+        chosen.floodWaitUntil = Date.now() + floodSec * 1000;
+        chosen.lastError = `FLOOD_WAIT_${floodSec}`;
+        const hasFallback = entries.some((e) =>
+          !attempted.has(e.id) &&
+          e.floodWaitUntil <= Date.now() &&
+          (!cleanChannel || (e.ineligibleChannels.get(cleanChannel) || 0) <= Date.now())
+        );
+        if (hasFallback) continue;
+        throw err;
+      }
+      if (cleanChannel && isTgChannelAccessError(err)) {
+        chosen.ineligibleChannels.set(cleanChannel, Date.now() + TG_BOT_CHANNEL_INELIGIBLE_TTL_MS);
+        chosen.lastError = String(err?.errorMessage || err?.message || 'CHANNEL_ACCESS_ERROR');
+        const hasFallback = entries.some((e) =>
+          !attempted.has(e.id) &&
+          (!cleanChannel || (e.ineligibleChannels.get(cleanChannel) || 0) <= Date.now())
+        );
+        if (hasFallback) continue;
+        throw err;
+      }
+      throw err;
+    } finally {
+      chosen.activeOps = Math.max(0, chosen.activeOps - 1);
+    }
   }
-  return tgClient;
+
+  if (lastErr) throw lastErr;
+  const fallback = await getTgClient();
+  return fn(fallback, 'main');
+}
+
+function getTgBotPoolStatus() {
+  const entries = syncTgBotPoolFromEnv();
+  const now = Date.now();
+  const bots = entries.map((e) => {
+    const cooldownRemainingSec = e.floodWaitUntil > now ? Math.ceil((e.floodWaitUntil - now) / 1000) : 0;
+    let ineligibleChannelCount = 0;
+    for (const until of e.ineligibleChannels.values()) {
+      if (until > now) ineligibleChannelCount++;
+    }
+    return {
+      id: e.id,
+      role: e.role,
+      connected: Boolean(e.client && (e.client.connected !== false)),
+      activeOps: e.activeOps,
+      totalOps: e.totalOps,
+      coolingDown: cooldownRemainingSec > 0,
+      cooldownRemainingSec,
+      ineligibleChannelCount,
+    };
+  });
+  return {
+    mainConfigured: bots.some((b) => b.role === 'main'),
+    workerCount: bots.filter((b) => b.role === 'worker').length,
+    totalBots: bots.length,
+    healthyBots: bots.filter((b) => !b.coolingDown).length,
+    bots,
+  };
+}
+
+/**
+ * Zero-bandwidth server-side copy between two Telegram channels/groups using GramJS ForwardMessages (dropAuthor: true).
+ * Returns the new messageId in targetChannelId, or null if fast-copy is not possible so the caller can fall back to streaming.
+ */
+async function tgFastCopyMessage(
+  sourceChannelId: string,
+  targetChannelId: string,
+  messageId: number,
+  targetThreadId?: number | null
+): Promise<number | null> {
+  if (!sourceChannelId || !targetChannelId || !Number.isInteger(Number(messageId)) || Number(messageId) <= 0) {
+    return null;
+  }
+  try {
+    return await withTgPoolClient(
+      sourceChannelId,
+      async (telegram) => {
+        if (!telegram || typeof telegram.invoke !== 'function') return null;
+        const fromPeer = await resolvePeer(telegram, sourceChannelId);
+        const toPeer = await resolvePeer(telegram, targetChannelId);
+        const randomId = BigInt(`0x${crypto.randomBytes(8).toString('hex')}`);
+        const reqParams: any = {
+          fromPeer,
+          toPeer,
+          id: [Number(messageId)],
+          randomId: [randomId as any],
+          dropAuthor: true,
+        };
+        if (targetThreadId && Number(targetThreadId) > 1) {
+          reqParams.topMsgId = Number(targetThreadId);
+        }
+        const updates: any = await telegram.invoke(new Api.messages.ForwardMessages(reqParams));
+        const list: any[] = Array.isArray(updates?.updates) ? updates.updates : [];
+        for (const u of list) {
+          const directId = Number(u?.id);
+          if (Number.isInteger(directId) && directId > 0) return directId;
+          const msgId = Number(u?.message?.id);
+          if (Number.isInteger(msgId) && msgId > 0) return msgId;
+        }
+        const fallbackId = Number(updates?.id || updates?.message?.id);
+        return Number.isInteger(fallbackId) && fallbackId > 0 ? fallbackId : null;
+      },
+      { preferWorker: true }
+    );
+  } catch {
+    return null;
+  }
 }
 
 // ─── Cloud clients ────────────────────────────────────────────────────────────
@@ -266,6 +572,7 @@ export function setTestDependencies(deps: {
   db?: any;
   tgClient?: any;
   getTgClient?: (() => Promise<any>) | null;
+  tgWorkerPool?: Array<{ id: string; role?: 'main' | 'worker'; client: any }> | null;
   resolvePeer?: ((telegram: any, id: string) => Promise<any>) | null;
   driveClientFactory?: ((tokens: any) => Promise<any>) | null;
   getDriveClient?: ((tokens: any) => Promise<any>) | null;
@@ -274,6 +581,7 @@ export function setTestDependencies(deps: {
 } | null) {
   if (!deps) {
     testTgClientFactory = null;
+    testTgWorkerPool = null;
     testResolvePeer = null;
     testDriveClientFactory = null;
     testOneDriveClientFactory = null;
@@ -284,6 +592,21 @@ export function setTestDependencies(deps: {
   if ('db' in deps) setDb(deps.db);
   if ('tgClient' in deps) tgClient = deps.tgClient;
   if ('getTgClient' in deps) testTgClientFactory = deps.getTgClient ?? null;
+  if ('tgWorkerPool' in deps) {
+    testTgWorkerPool = deps.tgWorkerPool
+      ? deps.tgWorkerPool.map((w, idx) => ({
+          id: w.id || (idx === 0 ? 'main' : `worker-${idx}`),
+          role: w.role || (idx === 0 ? 'main' : 'worker'),
+          token: `test-token-${idx}`,
+          client: w.client,
+          connecting: null,
+          activeOps: 0,
+          totalOps: 0,
+          floodWaitUntil: 0,
+          ineligibleChannels: new Map(),
+        }))
+      : null;
+  }
   if ('resolvePeer' in deps) testResolvePeer = deps.resolvePeer ?? null;
   if ('driveClientFactory' in deps) testDriveClientFactory = deps.driveClientFactory ?? null;
   if ('getDriveClient' in deps) testDriveClientFactory = deps.getDriveClient ?? null;
@@ -451,18 +774,23 @@ async function tgUploadFile(
     }
     let result: any;
     try {
-      const telegram   = await getTgClient();
-      const peerEntity = await resolvePeer(telegram, channelId);
-      const sendOpts: any = {
-        file: filePath,
-        caption: effectiveCaption,
-        forceDocument: true,
-        attributes: [new Api.DocumentAttributeFilename({ fileName: effectiveName })],
-      };
-      if (resolvedThreadId && resolvedThreadId > 1) {
-        sendOpts.replyTo = resolvedThreadId;
-      }
-      result           = await telegram.sendFile(peerEntity, sendOpts) as any;
+      result = await withTgPoolClient(
+        channelId,
+        async (telegram) => {
+          const peerEntity = await resolvePeer(telegram, channelId);
+          const sendOpts: any = {
+            file: filePath,
+            caption: effectiveCaption,
+            forceDocument: true,
+            attributes: [new Api.DocumentAttributeFilename({ fileName: effectiveName })],
+          };
+          if (resolvedThreadId && resolvedThreadId > 1) {
+            sendOpts.replyTo = resolvedThreadId;
+          }
+          return (await telegram.sendFile(peerEntity, sendOpts)) as any;
+        },
+        { preferWorker: true }
+      );
       recordProviderCall('telegram', 'sendFile', Date.now() - startedAt, true, 0);
     } catch (tgErr: any) {
       recordProviderCall('telegram', 'sendFile', Date.now() - startedAt, false, 0, tgErr?.code || 'ERROR');
@@ -649,10 +977,17 @@ async function tgStreamFile(messageId: number, channelId: string, req: any, res:
     let media: any = null;
     let telegram: any = null;
     if (!noteBuffer) {
-      telegram = await getTgClient();
-      const peer     = await resolvePeer(telegram, channelId);
-      const messages = await telegram.getMessages(peer, { ids: [messageId] });
-      const tgMsg: any = messages?.[0];
+      const fetched = await withTgPoolClient(
+        channelId,
+        async (tgc) => {
+          const peer = await resolvePeer(tgc, channelId);
+          const messages = await tgc.getMessages(peer, { ids: [messageId] });
+          return { tgc, tgMsg: messages?.[0] };
+        },
+        { preferWorker: true }
+      );
+      telegram = fetched.tgc;
+      const tgMsg: any = fetched.tgMsg;
       if (!tgMsg) throw new Error('Message not found');
       if (tgMsg.media) {
         media = tgMsg.media;
@@ -905,10 +1240,17 @@ async function generateThumbnail(account: any, fileId: string, s: number, thumbP
         return null;
       }
 
-      const telegram = await getTgClient();
-      const peer = await resolvePeer(telegram, account.channelId);
-      const msgs = await telegram.getMessages(peer, { ids: [meta.messageId] });
-      if (!msgs || !msgs[0] || !msgs[0].media) return null;
+      const { telegram, tgMsg } = await withTgPoolClient(
+        account.channelId,
+        async (tgc) => {
+          const peer = await resolvePeer(tgc, account.channelId);
+          const msgs = await tgc.getMessages(peer, { ids: [meta.messageId] });
+          return { telegram: tgc, tgMsg: msgs?.[0] || null };
+        },
+        { preferWorker: true }
+      );
+      if (!tgMsg || !tgMsg.media) return null;
+      const msgs = [tgMsg];
 
       const media: any = msgs[0].media;
       const rawThumbs: any[] = (media.document && media.document.thumbs) || (media.photo && media.photo.sizes) || [];
@@ -1221,9 +1563,10 @@ async function permanentlyDeleteSingleFile(database: any, account: any, fileId: 
       accountId: meta.accountId,
     });
     if (referenceCount <= 1) {
-      const telegram = await getTgClient();
-      const peer     = await resolvePeer(telegram, account.channelId);
-      try { await telegram.deleteMessages(peer, [meta.messageId], { revoke: true }); } catch { /* message may already be gone */ }
+      await withTgPoolClient(account.channelId, async (telegram) => {
+        const peer = await resolvePeer(telegram, account.channelId);
+        try { await telegram.deleteMessages(peer, [meta.messageId], { revoke: true }); } catch { /* message may already be gone */ }
+      });
     }
     await database.collection('tg_files').deleteOne({ _id: meta._id });
   } else if (account.accountType === 'onedrive') {
@@ -1815,6 +2158,10 @@ export {
   resolvePeer,
   tgClient,
   getTgClient,
+  withTgPoolClient,
+  getTgBotPoolStatus,
+  tgFastCopyMessage,
+  extractFloodWaitSeconds,
   getDriveClient,
   getOneDriveClient,
   resolveAuthorizedAccount,

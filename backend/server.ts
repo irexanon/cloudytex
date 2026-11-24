@@ -127,6 +127,7 @@ import {
   resolvePeer,
   tgClient,
   getTgClient,
+  getTgBotPoolStatus,
   setTestDependencies,
   getDriveClient,
   getOneDriveClient,
@@ -164,6 +165,7 @@ import {
   checkDestinationFileExists,
   crossAccountTransfer,
   verifySingleBackupItem,
+  collectAccountManifest,
   enqueueTransferJob,
   publicJob,
   MAX_CONCURRENT_JOBS,
@@ -567,6 +569,7 @@ app.get('/api/admin/metrics', requireAuth, async (req: any, res: any) => {
       authCacheMisses: authStats.misses,
     },
     oauthRefreshFailures: systemMetrics.oauthRefreshFailures,
+    telegramBotPool: getTgBotPoolStatus(),
     metrics: systemMetrics,
     alerts,
   });
@@ -4386,6 +4389,124 @@ app.post('/api/backups/:jobId/restore', requireAuth, async (req: any, res: any) 
     });
   } catch (err: any) {
     return apiError(res, err.status || 500, err.code || STANDARD_ERROR_CODES.INTERNAL_ERROR, err.message || 'Failed to enqueue restore job', req.requestId);
+  }
+});
+
+// ─── Whole-Drive / Subfolder Recursive Manifest (for native Android downloads) ─
+app.get('/api/accounts/:accountId/manifest', requireAuth, async (req: any, res: any) => {
+  const database = req.db || db || await connectToMongo();
+  const accountId = String(req.params.accountId || '').trim();
+  const { account, accessDenied } = await resolveAuthorizedAccount(database, accountId, req.userId, !!req.isAdmin);
+  if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
+  if (!account) return apiError(res, 404, STANDARD_ERROR_CODES.NOT_FOUND, 'Account not found', req.requestId);
+
+  const rawFolderId = typeof req.query.folderId === 'string' ? req.query.folderId.trim() : '';
+  let cleanFolderId = '';
+  if (rawFolderId && rawFolderId !== 'root') {
+    const folderCheck = validateSafeFolderId(rawFolderId);
+    if (!folderCheck.ok) {
+      return apiError(res, folderCheck.error.status, folderCheck.error.code, folderCheck.error.message, req.requestId);
+    }
+    cleanFolderId = folderCheck.folderId === 'root' ? '' : folderCheck.folderId;
+  }
+
+  const parsedLimit = parseInt(String(req.query.maxFiles || '25000'), 10);
+  const maxFiles = Number.isFinite(parsedLimit) ? Math.min(25000, Math.max(1, parsedLimit)) : 25000;
+
+  try {
+    const manifest = await collectAccountManifest(database, account, cleanFolderId, maxFiles, false);
+    res.setHeader('Cache-Control', 'no-store');
+    return res.json(manifest);
+  } catch (err: any) {
+    return apiError(res, err?.status || 500, err?.code || STANDARD_ERROR_CODES.INTERNAL_ERROR, err?.message || 'Failed to build drive manifest', req.requestId);
+  }
+});
+
+// ─── Server-Side Whole-Drive / Subfolder Copy & Move ──────────────────────────
+app.post('/api/transfers/drive', requireAuth, async (req: any, res: any) => {
+  const database = req.db || db || await connectToMongo();
+  const {
+    sourceAccountId,
+    targetAccountId,
+    sourceFolderId,
+    targetFolderId,
+    isMove,
+    conflictStrategy: rawConflict,
+  } = req.body || {};
+
+  if (typeof sourceAccountId !== 'string' || !sourceAccountId.trim() || typeof targetAccountId !== 'string' || !targetAccountId.trim()) {
+    return apiError(res, 400, STANDARD_ERROR_CODES.BAD_REQUEST, 'sourceAccountId and targetAccountId are required', req.requestId);
+  }
+
+  const cleanSourceId = sourceAccountId.trim();
+  const cleanTargetId = targetAccountId.trim();
+
+  const srcFolderCheck = validateSafeFolderId(sourceFolderId);
+  if (!srcFolderCheck.ok) {
+    return apiError(res, srcFolderCheck.error.status, srcFolderCheck.error.code, srcFolderCheck.error.message, req.requestId);
+  }
+  const dstFolderCheck = validateSafeFolderId(targetFolderId);
+  if (!dstFolderCheck.ok) {
+    return apiError(res, dstFolderCheck.error.status, dstFolderCheck.error.code, dstFolderCheck.error.message, req.requestId);
+  }
+
+  if (cleanSourceId === cleanTargetId && srcFolderCheck.folderId === dstFolderCheck.folderId) {
+    return apiError(res, 400, STANDARD_ERROR_CODES.BAD_REQUEST, 'Source and destination locations cannot be identical', req.requestId);
+  }
+
+  const { account: sourceAccount, accessDenied: sourceDenied } = await resolveAuthorizedAccount(database, cleanSourceId, req.userId, !!req.isAdmin);
+  if (sourceDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to source account', req.requestId);
+  if (!sourceAccount) return apiError(res, 404, STANDARD_ERROR_CODES.NOT_FOUND, 'Source account not found', req.requestId);
+
+  const { account: targetAccount, accessDenied: targetDenied } = await resolveAuthorizedAccount(database, cleanTargetId, req.userId, !!req.isAdmin);
+  if (targetDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to target account', req.requestId);
+  if (!targetAccount) return apiError(res, 404, STANDARD_ERROR_CODES.NOT_FOUND, 'Target account not found', req.requestId);
+
+  const conflictStrategy: ConflictStrategy =
+    rawConflict === 'skip' || rawConflict === 'rename' || rawConflict === 'overwrite'
+      ? rawConflict
+      : 'skip';
+  const moveFlag = Boolean(isMove);
+
+  const sourceName = sourceAccount.name || sourceAccount.email || (sourceAccount.accountType === 'tgdrive' ? 'TG Drive' : 'Source Drive');
+  const targetName = targetAccount.name || targetAccount.email || (targetAccount.accountType === 'tgdrive' ? 'TG Drive' : 'Target Drive');
+  const displayName = `${sourceName} → ${targetName}`;
+
+  try {
+    const job = await enqueueTransferJob(
+      database,
+      {
+        sourceAccountId: cleanSourceId,
+        targetAccountId: cleanTargetId,
+        sourceFolderId: srcFolderCheck.folderId,
+        targetFolderId: dstFolderCheck.folderId,
+        sourceAccountName: sourceName,
+        targetAccountName: targetName,
+        displayName,
+        isMove: moveFlag,
+        conflictStrategy,
+        userId: req.userId ? String(req.userId) : null,
+        isAdmin: !!req.isAdmin,
+      },
+      'drive_transfer'
+    );
+    recordAuditEvent(moveFlag ? 'drive_move_enqueued' : 'drive_copy_enqueued', {
+      jobId: String(job._id),
+      userId: req.userId ? String(req.userId) : null,
+      sourceAccountId: cleanSourceId,
+      targetAccountId: cleanTargetId,
+      conflictStrategy,
+    });
+    runJobWorker().catch(() => {});
+    return res.status(202).json({
+      success: true,
+      async: true,
+      jobId: String(job._id),
+      status: job.status,
+      job: publicJob(job),
+    });
+  } catch (err: any) {
+    return apiError(res, err?.status || 500, err?.code || STANDARD_ERROR_CODES.INTERNAL_ERROR, err?.message || 'Failed to enqueue drive transfer', req.requestId);
   }
 });
 
