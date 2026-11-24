@@ -119,6 +119,11 @@ import {
 } from './core.ts';
 
 import {
+  checkTgChannelAccess,
+  clearTgChannelAccessCache,
+  isTgChannelAccessError,
+  formatTgChannelError,
+  markTgChannelInaccessible,
   resolvePeer,
   tgClient,
   getTgClient,
@@ -196,6 +201,7 @@ app.use(compression({
     return compression.filter(req, res);
   },
 }));
+app.use('/api/tgdrive/:accountId/import', express.json({ limit: '15mb' }));
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '1mb' }));
 app.use(originGuardMiddleware);
 // Correlate client-visible failures with server logs without logging credentials.
@@ -914,21 +920,30 @@ app.post('/api/tgdrive/register', requireAuth, async (req: any, res: any) => {
   const database = req.db;
   const name     = (typeof driveName === 'string' ? driveName.trim() : '') || 'TG Drive';
 
+  let isForum = false;
+  let chatType = 'channel';
   try {
-    const admins = await bot!.telegram.getChatAdministrators(cleanChannelId);
-    const botInfo = await bot!.telegram.getMe();
+    const [admins, botInfo, chatInfo] = await Promise.all([
+      bot!.telegram.getChatAdministrators(cleanChannelId),
+      bot!.telegram.getMe(),
+      bot!.telegram.getChat(cleanChannelId).catch(() => null),
+    ]);
     const isBotAdmin = admins.some((a: any) => a.user.id === botInfo.id);
-    if (!isBotAdmin) return res.status(400).json({ error: 'Bot is not an admin in this channel' });
+    if (!isBotAdmin) return res.status(400).json({ error: 'Bot is not an admin in this channel or group' });
+    if (chatInfo) {
+      isForum = Boolean((chatInfo as any).is_forum);
+      chatType = String((chatInfo as any).type || 'channel');
+    }
   } catch (e: any) {
-    return res.status(400).json({ error: `Cannot access channel: ${e.message}. Make sure the bot is an admin in the channel.` });
+    return res.status(400).json({ error: `Cannot access channel/group: ${e.message}. Make sure the bot is an admin.` });
   }
 
   const existingAccount = await database.collection('accounts').findOne({ channelId: cleanChannelId, userId: { $ne: userId } });
-  if (existingAccount) return res.status(400).json({ error: 'This channel is already linked to another Cloudyte account.' });
+  if (existingAccount) return res.status(400).json({ error: 'This channel or group is already linked to another Cloudyte account.' });
 
   await database.collection('accounts').updateOne(
     { userId, channelId: cleanChannelId, accountType: 'tgdrive' },
-    { $set: { userId, channelId: cleanChannelId, accountType: 'tgdrive', name, linkedAt: new Date().toISOString() } },
+    { $set: { userId, channelId: cleanChannelId, accountType: 'tgdrive', name, isForum, chatType, linkedAt: new Date().toISOString() } },
     { upsert: true }
   );
 
@@ -946,7 +961,319 @@ app.post('/api/tgdrive/register', requireAuth, async (req: any, res: any) => {
     { $set: { accountId: newAccountId } }
   );
 
-  res.json({ success: true, id: newAccountId.toString(), channelId: cleanChannelId, name });
+  clearTgChannelAccessCache(cleanChannelId);
+  res.json({ success: true, id: newAccountId.toString(), channelId: cleanChannelId, name, isForum, chatType });
+});
+
+// ─── TG Drive JSON Bulk Import (Forum Topics as Folders + Old Media Messages) ─
+function inferMimeTypeFromName(name: string): string {
+  const ext = String(name || '').split('.').pop()?.toLowerCase() || '';
+  const map: Record<string, string> = {
+    mp4: 'video/mp4', mkv: 'video/x-matroska', mov: 'video/quicktime', webm: 'video/webm', avi: 'video/x-msvideo',
+    jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif', heic: 'image/heic',
+    mp3: 'audio/mpeg', m4a: 'audio/mp4', ogg: 'audio/ogg', wav: 'audio/wav', flac: 'audio/flac',
+    pdf: 'application/pdf', zip: 'application/zip', rar: 'application/vnd.rar', '7z': 'application/x-7z-compressed',
+    txt: 'text/plain', json: 'application/json', csv: 'text/csv',
+    doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    xls: 'application/vnd.ms-excel', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    ppt: 'application/vnd.ms-powerpoint', pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  };
+  return map[ext] || 'application/octet-stream';
+}
+
+function sanitizeImportedSegment(raw: unknown, fallback: string): string {
+  const cleaned = String(raw ?? '')
+    .replace(/[\x00-\x1f\x7f]/g, '')
+    .replace(/[\\/]+/g, ' - ')
+    .replace(/\.\./g, '.')
+    .trim()
+    .slice(0, 180);
+  return cleaned && cleaned !== '.' ? cleaned : fallback;
+}
+
+function parseImportUnixSeconds(raw: unknown): number {
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
+    return raw > 1e12 ? Math.floor(raw / 1000) : Math.floor(raw);
+  }
+  if (typeof raw === 'string' && raw.trim()) {
+    const asNum = Number(raw.trim());
+    if (Number.isFinite(asNum) && asNum > 0) {
+      return asNum > 1e12 ? Math.floor(asNum / 1000) : Math.floor(asNum);
+    }
+    const ms = Date.parse(raw.trim());
+    if (Number.isFinite(ms) && ms > 0) return Math.floor(ms / 1000);
+  }
+  return Math.floor(Date.now() / 1000);
+}
+
+app.post('/api/tgdrive/:accountId/import', requireAuth, async (req: any, res: any) => {
+  const { accountId } = req.params;
+  const userId = req.userId;
+  const database = req.db;
+
+  const { account, accessDenied } = await resolveAuthorizedAccount(database, accountId, userId, req.isAdmin);
+  if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
+  if (!account) return apiError(res, 404, STANDARD_ERROR_CODES.NOT_FOUND, 'Account not found', req.requestId);
+  if (account.accountType !== 'tgdrive') {
+    return apiError(res, 400, STANDARD_ERROR_CODES.BAD_REQUEST, 'JSON import is only supported for Telegram Drive accounts', req.requestId);
+  }
+
+  const body = req.body;
+  const rawTopics: any[] = Array.isArray(body?.topics)
+    ? body.topics
+    : (Array.isArray(body?.threads) ? body.threads : (Array.isArray(body?.folders) ? body.folders : []));
+  const rawFiles: any[] = Array.isArray(body)
+    ? body
+    : (Array.isArray(body?.files)
+        ? body.files
+        : (Array.isArray(body?.messages) ? body.messages : (Array.isArray(body?.media) ? body.media : [])));
+
+  if (rawTopics.length === 0 && rawFiles.length === 0) {
+    return apiError(res, 400, STANDARD_ERROR_CODES.BAD_REQUEST, 'Import payload must include a non-empty "topics" or "files" array', req.requestId);
+  }
+  if (rawTopics.length > 2000) {
+    return apiError(res, 400, STANDARD_ERROR_CODES.BAD_REQUEST, 'Too many topics in one batch (maximum 2,000 per import)', req.requestId);
+  }
+  if (rawFiles.length > 25000) {
+    return apiError(res, 400, STANDARD_ERROR_CODES.BAD_REQUEST, 'Too many files in one batch (maximum 25,000 per import — split into batches)', req.requestId);
+  }
+
+  try {
+    const ownerUserId = String(account.userId || userId || '');
+    const existingFolders = await database.collection('tg_folders').find({ accountId: account._id }).toArray();
+    const threadIdToPath = new Map<number, string>();
+    const existingPaths = new Set<string>();
+    for (const f of existingFolders) {
+      if (f.path) existingPaths.add(String(f.path));
+      if (Number.isInteger(Number(f.threadId)) && Number(f.threadId) > 0 && f.path) {
+        threadIdToPath.set(Number(f.threadId), String(f.path));
+      }
+    }
+
+    let importedTopics = 0;
+    let updatedTopics = 0;
+    let hasForumTopics = Boolean(body?.isForum);
+
+    // 1. Import Forum Topics -> tg_folders
+    for (const rawTopic of rawTopics) {
+      if (!rawTopic || typeof rawTopic !== 'object') continue;
+      const rawTid = rawTopic.threadId ?? rawTopic.topicId ?? rawTopic.topic_id ?? rawTopic.message_thread_id ?? rawTopic.id;
+      const tid = Number(rawTid);
+      const validTid = Number.isSafeInteger(tid) && tid > 1 ? tid : null;
+      const rawName = rawTopic.name ?? rawTopic.title ?? (validTid ? `Topic ${validTid}` : '');
+      const cleanName = sanitizeImportedSegment(rawName, validTid ? `Topic ${validTid}` : 'Untitled Folder');
+
+      // General topic (threadId === 1) maps to Root (''), no subfolder needed unless explicitly named otherwise
+      if (tid === 1) {
+        hasForumTopics = true;
+        continue;
+      }
+      if (validTid) hasForumTopics = true;
+
+      let targetPath = cleanName;
+      if (validTid && threadIdToPath.has(validTid)) {
+        targetPath = threadIdToPath.get(validTid)!;
+        await database.collection('tg_folders').updateOne(
+          { accountId: account._id, threadId: validTid },
+          { $set: { name: cleanName, updatedAt: Math.floor(Date.now() / 1000) } }
+        );
+        updatedTopics++;
+      } else {
+        // Avoid colliding with a different topic that shares the exact same title
+        if (validTid && existingPaths.has(targetPath)) {
+          targetPath = `${cleanName} (${validTid})`;
+        }
+        await database.collection('tg_folders').updateOne(
+          { accountId: account._id, path: targetPath },
+          {
+            $set: {
+              accountId: account._id,
+              userId: ownerUserId,
+              name: cleanName,
+              path: targetPath,
+              ...(validTid ? { threadId: validTid } : {}),
+              createdAt: parseImportUnixSeconds(rawTopic.date ?? rawTopic.createdAt),
+            },
+          },
+          { upsert: true }
+        );
+        existingPaths.add(targetPath);
+        if (validTid) threadIdToPath.set(validTid, targetPath);
+        importedTopics++;
+      }
+    }
+
+    // 2. Load existing messageIds for fast idempotent deduplication
+    const existingFiles = await database.collection('tg_files')
+      .find({ accountId: account._id }, { projection: { messageId: 1 } })
+      .toArray();
+    const existingMessageIds = new Set<number>(
+      existingFiles
+        .map((f: any) => Number(f.messageId))
+        .filter((n: number) => Number.isSafeInteger(n) && n > 0)
+    );
+
+    let importedFiles = 0;
+    let skippedDuplicates = 0;
+    let invalidCount = 0;
+
+    for (const rawFile of rawFiles) {
+      if (!rawFile || typeof rawFile !== 'object') {
+        invalidCount++;
+        continue;
+      }
+      const msgId = Number(rawFile.messageId ?? rawFile.message_id ?? rawFile.id);
+      if (!Number.isSafeInteger(msgId) || msgId <= 0) {
+        invalidCount++;
+        continue;
+      }
+      if (existingMessageIds.has(msgId)) {
+        skippedDuplicates++;
+        continue;
+      }
+
+      const rawTid = rawFile.threadId ?? rawFile.topicId ?? rawFile.topic_id ?? rawFile.message_thread_id;
+      const parsedTid = Number(rawTid);
+      const validTid = Number.isSafeInteger(parsedTid) && parsedTid > 1 ? parsedTid : null;
+      if (validTid) hasForumTopics = true;
+
+      let folderPath = '';
+      if (validTid) {
+        if (!threadIdToPath.has(validTid)) {
+          // Auto-create folder if file references a threadId not listed in topics[]
+          const fallbackName = sanitizeImportedSegment(rawFile.topicName ?? rawFile.topic_name ?? rawFile.folder, `Topic ${validTid}`);
+          const autoPath = existingPaths.has(fallbackName) ? `${fallbackName} (${validTid})` : fallbackName;
+          await database.collection('tg_folders').updateOne(
+            { accountId: account._id, path: autoPath },
+            {
+              $set: {
+                accountId: account._id,
+                userId: ownerUserId,
+                name: fallbackName,
+                path: autoPath,
+                threadId: validTid,
+                createdAt: Math.floor(Date.now() / 1000),
+              },
+            },
+            { upsert: true }
+          );
+          existingPaths.add(autoPath);
+          threadIdToPath.set(validTid, autoPath);
+          importedTopics++;
+        }
+        folderPath = threadIdToPath.get(validTid)!;
+      } else if (typeof (rawFile.folder ?? rawFile.path) === 'string' && String(rawFile.folder ?? rawFile.path).trim()) {
+        const segments = String(rawFile.folder ?? rawFile.path)
+          .split('/')
+          .map((s) => sanitizeImportedSegment(s, ''))
+          .filter(Boolean);
+        folderPath = segments.join('/');
+        if (folderPath && !existingPaths.has(folderPath)) {
+          await database.collection('tg_folders').updateOne(
+            { accountId: account._id, path: folderPath },
+            {
+              $set: {
+                accountId: account._id,
+                userId: ownerUserId,
+                name: segments[segments.length - 1],
+                path: folderPath,
+                createdAt: Math.floor(Date.now() / 1000),
+              },
+            },
+            { upsert: true }
+          );
+          existingPaths.add(folderPath);
+          importedTopics++;
+        }
+      }
+
+      const rawNoteText = rawFile.text ?? rawFile.message ?? rawFile.content ?? rawFile.body;
+      const hasNoteText = typeof rawNoteText === 'string';
+      const noteText = hasNoteText ? rawNoteText.slice(0, 512 * 1024) : '';
+      const isNote = Boolean(
+        rawFile.isNote === true ||
+        rawFile.type === 'note' ||
+        rawFile.kind === 'note' ||
+        (hasNoteText && !(rawFile.mimeType ?? rawFile.mime_type ?? rawFile.mime))
+      );
+
+      let explicitName = rawFile.name ?? rawFile.fileName ?? rawFile.file_name ?? rawFile.title;
+      if ((!explicitName || !String(explicitName).trim()) && isNote && noteText.trim()) {
+        const firstLine = noteText.split(/\r?\n/).map((l: string) => l.trim()).find(Boolean) || '';
+        const baseTitle = sanitizeImportedSegment(firstLine.slice(0, 60), `note_${msgId}`);
+        explicitName = /\.[a-z0-9]{1,8}$/i.test(baseTitle) ? baseTitle : `${baseTitle}.txt`;
+      }
+      let fileName = sanitizeImportedSegment(explicitName, isNote ? `note_${msgId}.txt` : `file_${msgId}`);
+      if (isNote && !/\.[a-z0-9]{1,8}$/i.test(fileName)) {
+        fileName = `${fileName.slice(0, 175)}.txt`;
+      }
+
+      const rawSizeNum = Number(rawFile.size ?? rawFile.fileSize ?? rawFile.file_size ?? rawFile.sizeBytes ?? 0) || 0;
+      const sizeNum = rawSizeNum > 0
+        ? Math.floor(rawSizeNum)
+        : (hasNoteText ? Buffer.byteLength(noteText, 'utf8') : 0);
+      const rawMime = typeof (rawFile.mimeType ?? rawFile.mime_type ?? rawFile.mime) === 'string'
+        ? String(rawFile.mimeType ?? rawFile.mime_type ?? rawFile.mime).trim()
+        : '';
+      const mimeType = isNote
+        ? (rawMime && rawMime !== 'application/octet-stream' ? rawMime : 'text/plain')
+        : (rawMime && rawMime !== 'application/octet-stream' ? rawMime : inferMimeTypeFromName(fileName));
+      const dateSec = parseImportUnixSeconds(rawFile.date ?? rawFile.timestamp);
+      const caption = typeof rawFile.caption === 'string' ? rawFile.caption.slice(0, 1024) : '';
+
+      await database.collection('tg_files').insertOne({
+        accountId: account._id,
+        userId: ownerUserId,
+        messageId: msgId,
+        ...(validTid ? { threadId: validTid } : {}),
+        shareId: nanoid(6),
+        name: fileName,
+        size: sizeNum,
+        mimeType,
+        folder: folderPath,
+        caption,
+        ...(isNote ? { isNote: true } : {}),
+        ...(hasNoteText ? { textContent: noteText } : {}),
+        isEncrypted: false,
+        date: dateSec,
+        updatedAt: dateSec * 1000,
+      });
+      existingMessageIds.add(msgId);
+      importedFiles++;
+    }
+
+    if (hasForumTopics && !account.isForum) {
+      await database.collection('accounts').updateOne(
+        { _id: account._id },
+        { $set: { isForum: true, chatType: account.chatType || 'supergroup' } }
+      );
+    }
+
+    invalidateDriveCache(String(account._id));
+    recordAuditEvent('tgdrive_json_imported', {
+      userId: ownerUserId,
+      accountId: String(account._id),
+      importedTopics,
+      updatedTopics,
+      importedFiles,
+      skippedDuplicates,
+      invalidCount,
+    });
+
+    res.json({
+      success: true,
+      isForum: hasForumTopics || Boolean(account.isForum),
+      importedTopics,
+      updatedTopics,
+      importedFiles,
+      skippedDuplicates,
+      invalidCount,
+      totalFiles: existingMessageIds.size,
+    });
+  } catch (err: any) {
+    console.error('TG Drive JSON import error:', err);
+    return apiError(res, 500, STANDARD_ERROR_CODES.INTERNAL_ERROR, err.message || 'Import failed', req.requestId);
+  }
 });
 
 // ─── User settings ────────────────────────────────────────────────────────────
@@ -1038,8 +1365,10 @@ app.get('/api/accounts', requireAuth, async (req: any, res: any) => {
     return true;
   });
 
+  const forceRefreshAccess = req.query.refresh === '1' || req.query.refresh === 'true';
   const enriched = await Promise.all(unique.map(async (acc: any) => {
     if (acc.accountType === 'tgdrive') {
+      const channelAccess = await checkTgChannelAccess(acc.channelId, bot, forceRefreshAccess);
       try {
         const summary = await computeSingleAccountStorageSummary(acc, database);
         const usedBytes = summary.usedBytes || 0;
@@ -1047,17 +1376,36 @@ app.get('/api/accounts', requireAuth, async (req: any, res: any) => {
         return {
           id:          acc._id.toString(),
           name:        acc.name || 'TG Drive',
-          email:       `Channel: ${acc.channelId}`,
+          email:       `${acc.isForum ? 'Forum Group' : (acc.chatType === 'supergroup' || acc.chatType === 'group' ? 'Group' : 'Channel')}: ${acc.channelId}`,
           channelId:   acc.channelId,
+          isForum:     Boolean(acc.isForum),
+          chatType:    acc.chatType || 'channel',
           accountType: 'tgdrive',
           usage:       (usedBytes / (1024 ** 3)).toFixed(2) + ' GB',
           total:       '∞',
           percentage:  0,
           fileCount,
+          error:       !channelAccess.ok,
+          ...(channelAccess.ok ? {} : { errorCode: channelAccess.code || 'TG_CHANNEL_ACCESS_DENIED', errorMessage: channelAccess.message }),
           isDefault:   acc.isDefault || false,
         };
       } catch {
-        return { id: acc._id.toString(), name: acc.name || 'TG Drive', email: `Channel: ${acc.channelId}`, channelId: acc.channelId, accountType: 'tgdrive', usage: '0 GB', total: '∞', percentage: 0, fileCount: 0, error: false, isDefault: acc.isDefault || false };
+        return {
+          id: acc._id.toString(),
+          name: acc.name || 'TG Drive',
+          email: `${acc.isForum ? 'Forum Group' : (acc.chatType === 'supergroup' || acc.chatType === 'group' ? 'Group' : 'Channel')}: ${acc.channelId}`,
+          channelId: acc.channelId,
+          isForum: Boolean(acc.isForum),
+          chatType: acc.chatType || 'channel',
+          accountType: 'tgdrive',
+          usage: '0 GB',
+          total: '∞',
+          percentage: 0,
+          fileCount: 0,
+          error: !channelAccess.ok,
+          ...(channelAccess.ok ? {} : { errorCode: channelAccess.code || 'TG_CHANNEL_ACCESS_DENIED', errorMessage: channelAccess.message }),
+          isDefault: acc.isDefault || false,
+        };
       }
     }
 
@@ -1079,7 +1427,16 @@ app.get('/api/accounts', requireAuth, async (req: any, res: any) => {
         isDefault: acc.isDefault || false,
       };
     } catch {
-      return { id: acc._id.toString(), name: acc.name || 'Disconnected', email: acc.email || acc.channelId, error: true, percentage: 0, accountType: acc.accountType || 'google', isDefault: acc.isDefault || false };
+      return {
+        id: acc._id.toString(),
+        name: acc.name || 'Disconnected',
+        email: acc.email || acc.channelId,
+        error: true,
+        errorMessage: 'Drive connection expired or revoked. Please reconnect this account.',
+        percentage: 0,
+        accountType: acc.accountType || 'google',
+        isDefault: acc.isDefault || false,
+      };
     }
   }));
   res.json(enriched);
@@ -1920,9 +2277,29 @@ app.post('/api/folders', requireAuth, async (req: any, res: any) => {
     if (account.accountType === 'tgdrive') {
       const parentPath = folderCheck.folderId === 'root' ? '' : folderCheck.folderId;
       const folderPath = parentPath ? `${parentPath}/${name}` : name;
+      let createdThreadId: number | null = null;
+      if (account.isForum && !parentPath && bot?.telegram) {
+        try {
+          const topic = await (bot.telegram as any).createForumTopic(account.channelId, name);
+          if (topic && Number.isInteger(Number(topic.message_thread_id))) {
+            createdThreadId = Number(topic.message_thread_id);
+          }
+        } catch (topicErr: any) {
+          console.warn(`[TG Drive] Failed to create forum topic "${name}" in ${account.channelId}:`, topicErr?.message);
+        }
+      }
       await database.collection('tg_folders').updateOne(
         { accountId: account._id, path: folderPath },
-        { $set: { accountId: account._id, userId: String(userId || account.userId || ''), name, path: folderPath, createdAt: Math.floor(Date.now() / 1000) } },
+        {
+          $set: {
+            accountId: account._id,
+            userId: String(userId || account.userId || ''),
+            name,
+            path: folderPath,
+            ...(createdThreadId ? { threadId: createdThreadId } : {}),
+            createdAt: Math.floor(Date.now() / 1000),
+          },
+        },
         { upsert: true }
       );
     } else {
@@ -2676,9 +3053,12 @@ async function handleDownloadRequest(req: any, res: any, isHead = false) {
     if (account.accountType === 'tgdrive') {
       if (!meta) return res.status(404).send('File not found');
 
+      const tgSize = (meta.isNote === true && typeof meta.textContent === 'string')
+        ? Buffer.byteLength(meta.textContent, 'utf8')
+        : (meta.isEncrypted ? Number(meta.encryptedSizeBytes ?? meta.size ?? 0) : Number(meta.size || 0));
       const etag = meta.isEncrypted && meta.encryptedChecksum
         ? `"${meta.encryptedChecksum}"`
-        : `"${meta._id}-${meta.size}"`;
+        : `"${meta._id}-${tgSize}"`;
       res.setHeader('ETag', etag);
       if (req.headers['if-none-match'] === etag && !req.headers.range) {
         return res.status(304).end();
@@ -2686,9 +3066,11 @@ async function handleDownloadRequest(req: any, res: any, isHead = false) {
 
       const downloadName = meta.isEncrypted ? (meta.opaqueRemoteName || meta.name) : meta.name;
       res.setHeader('Content-Disposition', buildSafeContentDisposition(dispositionType, downloadName));
-      const tgSize = meta.isEncrypted ? Number(meta.encryptedSizeBytes ?? meta.size ?? 0) : Number(meta.size || 0);
       if (isHead) {
-        res.setHeader('Content-Type', meta.isEncrypted ? 'application/octet-stream' : (meta.mimeType || 'application/octet-stream'));
+        const resolvedHeadMime = meta.isEncrypted
+          ? 'application/octet-stream'
+          : (meta.mimeType === 'text/plain' ? 'text/plain; charset=utf-8' : (meta.mimeType || 'application/octet-stream'));
+        res.setHeader('Content-Type', resolvedHeadMime);
         const effectiveRange = shouldHonorRangeHeader(req.headers, etag) ? req.headers.range : undefined;
         const parsedRange = parseHttpByteRange(effectiveRange, tgSize);
         if (parsedRange.kind === 'invalid') {
@@ -2700,7 +3082,7 @@ async function handleDownloadRequest(req: any, res: any, isHead = false) {
           res.setHeader('Content-Length', String(parsedRange.length));
           return res.status(206).end();
         }
-        if (tgSize > 0) res.setHeader('Content-Length', String(tgSize));
+        if (tgSize >= 0) res.setHeader('Content-Length', String(tgSize));
         return res.status(200).end();
       }
       systemMetrics.downloadBytesTotal += tgSize;
@@ -2859,6 +3241,12 @@ app.post('/api/download-tickets', requireAuth, async (req: any, res: any) => {
   if (fileDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this file', req.requestId);
   if (account.accountType === 'tgdrive' && !meta) {
     return apiError(res, 404, STANDARD_ERROR_CODES.NOT_FOUND, 'File not found', req.requestId);
+  }
+  if (account.accountType === 'tgdrive') {
+    const channelAccess = await checkTgChannelAccess(account.channelId, bot);
+    if (!channelAccess.ok) {
+      return apiError(res, 403, 'TG_CHANNEL_ACCESS_DENIED', channelAccess.message || formatTgChannelError(new Error('CHANNEL_INVALID'), account.channelId), req.requestId);
+    }
   }
 
   const now = new Date();

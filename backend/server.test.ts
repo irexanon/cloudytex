@@ -27,6 +27,7 @@ const {
   runEncryptionMigration,
   TEMP_DIR,
 } = await import('./server.ts');
+const { clearTgChannelAccessCache } = await import('./provider.ts');
 
 // ─── In-memory MongoDB Mock for Integration Tests ───────────────────────────
 function matchesQuery(doc: any, query: any): boolean {
@@ -2284,6 +2285,260 @@ test('Cloudyte E2EE Backend Suite (Tests 1-39)', async (t) => {
     // Verify share downloadCount was only incremented once (HEAD + offset>0 resume chunk did not double-count)
     const shareDoc = await mockDb.collection('shares').findOne({ shareId });
     assert.equal(Number(shareDoc?.downloadCount || 0), 1);
+  });
+
+  await t.test('57. Telegram CHANNEL_INVALID surfaces clear 403 TG_CHANNEL_ACCESS_DENIED on downloads, tickets, and /api/accounts', async () => {
+    const fileDoc = await mockDb.collection('tg_files').findOne({ accountId: tgAccount1Id, name: 'resumable-range-test.txt' });
+    assert.ok(fileDoc);
+    const origGetMessages = mockTgClient.getMessages;
+    try {
+      mockTgClient.getMessages = async () => {
+        const rpcErr: any = new Error('400: CHANNEL_INVALID (caused by channels.GetChannels)');
+        rpcErr.code = 400;
+        rpcErr.errorMessage = 'CHANNEL_INVALID';
+        throw rpcErr;
+      };
+
+      // 1. Direct download returns 403 JSON with actionable message (not generic 500 Streaming error)
+      const dlRes = await apiFetch(`/api/download/${String(tgAccount1Id)}/${String(fileDoc._id)}`);
+      assert.equal(dlRes.status, 403);
+      const dlErr: any = await dlRes.json();
+      assert.equal(dlErr.code, 'TG_CHANNEL_ACCESS_DENIED');
+      assert.ok(String(dlErr.error || '').toLowerCase().includes('admin'));
+
+      // 2. /api/accounts immediately flags this TG Drive account with error: true and errorMessage
+      const accsRes = await apiFetch('/api/accounts');
+      assert.equal(accsRes.status, 200);
+      const accs: any[] = await accsRes.json();
+      const tgAcc = accs.find((a) => a.id === String(tgAccount1Id));
+      assert.ok(tgAcc);
+      assert.equal(tgAcc.error, true);
+      assert.equal(tgAcc.errorCode, 'TG_CHANNEL_ACCESS_DENIED');
+      assert.ok(String(tgAcc.errorMessage || '').toLowerCase().includes('channel'));
+
+      // 3. /api/download-tickets pre-checks channel access and returns 403 TG_CHANNEL_ACCESS_DENIED
+      const ticketRes = await apiFetch('/api/download-tickets', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          accountId: String(tgAccount1Id),
+          fileId: String(fileDoc._id),
+          singleUse: false,
+          ttlSeconds: 3600,
+        }),
+      });
+      assert.equal(ticketRes.status, 403);
+      const ticketErr: any = await ticketRes.json();
+      assert.equal(ticketErr.code, 'TG_CHANNEL_ACCESS_DENIED');
+    } finally {
+      mockTgClient.getMessages = origGetMessages;
+      const tgAccDoc = await mockDb.collection('accounts').findOne({ _id: tgAccount1Id });
+      if (tgAccDoc?.channelId) clearTgChannelAccessCache(tgAccDoc.channelId);
+    }
+  });
+
+  await t.test('58. TG Drive JSON bulk import maps Forum Topics to folders, General topic to root, infers MIME, and skips duplicates', async () => {
+    const forumAccId = new ObjectId();
+    await mockDb.collection('accounts').insertOne({
+      _id: forumAccId,
+      userId: user1Id,
+      accountType: 'tgdrive',
+      channelId: '-100777888999',
+      name: 'Forum Archive Group',
+      email: 'Forum Group: -100777888999',
+      chatType: 'supergroup',
+      isForum: false,
+      createdAt: new Date(),
+    });
+
+    const payload = {
+      isForum: true,
+      topics: [
+        { threadId: 1, name: 'General' },
+        { threadId: 12, name: 'Movies' },
+        { topic_id: 45, title: 'Docs/Work' },
+      ],
+      files: [
+        {
+          messageId: 501,
+          threadId: 1,
+          name: 'readme.pdf',
+          size: 2048,
+          date: 1732000000,
+        },
+        {
+          message_id: 502,
+          topic_id: 12,
+          file_name: 'Interstellar.mkv',
+          file_size: 104857600,
+          date: '2026-01-15T10:00:00Z',
+          caption: '1080p',
+        },
+        {
+          messageId: 503,
+          threadId: 45,
+          name: 'report.zip',
+          size: 4096,
+          mime_type: 'application/zip',
+        },
+        {
+          // References a topic not pre-listed in topics[] -> should auto-create folder
+          messageId: 504,
+          threadId: 99,
+          topicName: 'Music',
+          name: 'track.mp3',
+          size: 512000,
+        },
+      ],
+    };
+
+    const importRes = await apiFetch(`/api/tgdrive/${String(forumAccId)}/import`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    assert.equal(importRes.status, 200);
+    const importData: any = await importRes.json();
+    assert.equal(importData.success, true);
+    assert.equal(importData.isForum, true);
+    assert.equal(importData.importedTopics, 3); // Movies, Docs - Work, Music (General threadId=1 maps to root)
+    assert.equal(importData.importedFiles, 4);
+    assert.equal(importData.skippedDuplicates, 0);
+
+    // Re-importing the exact same JSON must be idempotent and skip all 4 duplicate messageIds
+    const reimportRes = await apiFetch(`/api/tgdrive/${String(forumAccId)}/import`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    assert.equal(reimportRes.status, 200);
+    const reimportData: any = await reimportRes.json();
+    assert.equal(reimportData.importedFiles, 0);
+    assert.equal(reimportData.skippedDuplicates, 4);
+
+    // Verify /api/accounts reflects isForum: true and fileCount: 4
+    const accsRes = await apiFetch('/api/accounts');
+    assert.equal(accsRes.status, 200);
+    const accs: any[] = await accsRes.json();
+    const forumAcc = accs.find((a) => a.id === String(forumAccId));
+    assert.ok(forumAcc);
+    assert.equal(forumAcc.isForum, true);
+    assert.equal(forumAcc.fileCount, 4);
+
+    // Verify root listing contains General-topic file + 3 topic folders
+    const rootRes = await apiFetch(`/api/files?accountId=${String(forumAccId)}`);
+    assert.equal(rootRes.status, 200);
+    const rootItems: any[] = await rootRes.json();
+    const folderNames = rootItems.filter((i) => i.type === 'folder').map((i) => i.name).sort();
+    assert.deepEqual(folderNames, ['Docs - Work', 'Movies', 'Music']);
+    const rootFile = rootItems.find((i) => i.type !== 'folder' && i.name === 'readme.pdf');
+    assert.ok(rootFile);
+    assert.equal(rootFile.type, 'pdf');
+    assert.equal(rootFile.mimeType, 'application/pdf');
+
+    // Verify Movies topic folder listing returns Interstellar.mkv with inferred video/x-matroska MIME
+    const moviesRes = await apiFetch(`/api/files?accountId=${String(forumAccId)}&folderId=Movies`);
+    assert.equal(moviesRes.status, 200);
+    const moviesItems: any[] = await moviesRes.json();
+    assert.equal(moviesItems.length, 1);
+    assert.equal(moviesItems[0].name, 'Interstellar.mkv');
+    assert.equal(moviesItems[0].type, 'video');
+    assert.equal(moviesItems[0].mimeType, 'video/x-matroska');
+    assert.equal(moviesItems[0].sizeBytes, 104857600);
+  });
+
+  await t.test('59. TG Drive JSON bulk import converts text messages into .txt notes with full download, HEAD, and byte-range support', async () => {
+    const notesAccId = new ObjectId();
+    await mockDb.collection('accounts').insertOne({
+      _id: notesAccId,
+      userId: user1Id,
+      accountType: 'tgdrive',
+      channelId: '-100555666777',
+      name: 'Notes Forum Group',
+      email: 'Forum Group: -100555666777',
+      chatType: 'supergroup',
+      isForum: true,
+      createdAt: new Date(),
+    });
+
+    const sampleText = 'Deployment Checklist\n1. Add bot as admin\n2. Import JSON archive\n';
+    const expectedBytes = Buffer.byteLength(sampleText, 'utf8');
+
+    const importRes = await apiFetch(`/api/tgdrive/${String(notesAccId)}/import`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        isForum: true,
+        topics: [{ threadId: 77, name: 'Guides' }],
+        files: [
+          {
+            messageId: 801,
+            threadId: 77,
+            text: sampleText,
+            date: 1732100000,
+          },
+          {
+            // Explicit note without inline text -> falls back to Telegram message.message on download
+            messageId: 802,
+            threadId: 77,
+            type: 'note',
+            name: 'Live Fetched Note',
+          },
+        ],
+      }),
+    });
+    assert.equal(importRes.status, 200);
+    const importBody: any = await importRes.json();
+    assert.equal(importBody.importedFiles, 2);
+
+    const listRes = await apiFetch(`/api/files?accountId=${String(notesAccId)}&folderId=Guides`);
+    assert.equal(listRes.status, 200);
+    const items: any[] = await listRes.json();
+    assert.equal(items.length, 2);
+
+    const note1 = items.find((i) => i.messageId === 801);
+    assert.ok(note1);
+    assert.equal(note1.name, 'Deployment Checklist.txt');
+    assert.equal(note1.mimeType, 'text/plain');
+    assert.equal(note1.type, 'doc');
+    assert.equal(note1.isNote, true);
+    assert.equal(note1.sizeBytes, expectedBytes);
+
+    const note2 = items.find((i) => i.messageId === 802);
+    assert.ok(note2);
+    assert.equal(note2.name, 'Live Fetched Note.txt');
+    assert.equal(note2.mimeType, 'text/plain');
+
+    // HEAD probe returns exact UTF-8 byte length and Accept-Ranges: bytes
+    const headRes = await apiFetch(`/api/download/${String(notesAccId)}/${note1.id}`, { method: 'HEAD' });
+    assert.equal(headRes.status, 200);
+    assert.equal(headRes.headers.get('content-length'), String(expectedBytes));
+    assert.equal(headRes.headers.get('accept-ranges'), 'bytes');
+    assert.ok((headRes.headers.get('content-type') || '').includes('text/plain'));
+
+    // Full download returns exact UTF-8 text
+    const fullRes = await apiFetch(`/api/download/${String(notesAccId)}/${note1.id}?preview=1`);
+    assert.equal(fullRes.status, 200);
+    assert.equal(await fullRes.text(), sampleText);
+
+    // Byte-range 206 partial request returns exact slice
+    const rangeRes = await apiFetch(`/api/download/${String(notesAccId)}/${note1.id}`, {
+      headers: { Range: 'bytes=0-9' },
+    });
+    assert.equal(rangeRes.status, 206);
+    assert.equal(rangeRes.headers.get('content-range'), `bytes 0-9/${expectedBytes}`);
+    assert.equal(await rangeRes.text(), sampleText.slice(0, 10));
+
+    // Live Telegram fallback when textContent was omitted in JSON
+    const origGetMessages = mockTgClient.getMessages;
+    try {
+      mockTgClient.getMessages = async () => [{ id: 802, message: 'Fetched straight from Telegram message text' }] as any;
+      const liveRes = await apiFetch(`/api/download/${String(notesAccId)}/${note2.id}?preview=1`);
+      assert.equal(liveRes.status, 200);
+      assert.equal(await liveRes.text(), 'Fetched straight from Telegram message text');
+    } finally {
+      mockTgClient.getMessages = origGetMessages;
+    }
   });
 });
 

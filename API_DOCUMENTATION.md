@@ -409,8 +409,8 @@ Used when initiating linking from Telegram Bot interactions:
 ---
 
 ### 5.4 Register Telegram Storage Drive
-Links a private or public Telegram channel as an unlimited cloud storage drive.
-*(Note: The Cloudyte bot must be added as an Administrator with post/upload permissions in the Telegram channel).*
+Links a private or public Telegram **Channel**, **Group**, or **Forum Group** (with Topics enabled) as an unlimited cloud storage drive.
+*(Note: The Cloudyte bot must be added as an Administrator with post/upload permissions in the Telegram channel or group. In Forum Groups, Telegram Topics automatically map to top-level Cloudyte folders, new group media is auto-indexed in real time, and creating a top-level folder in Cloudyte creates a real Telegram Forum Topic).*
 - **Method & Route:** `POST /api/tgdrive/register`
 - **Auth Required:** Yes
 - **Request Body (JSON):**
@@ -426,20 +426,69 @@ Links a private or public Telegram channel as an unlimited cloud storage drive.
     "success": true,
     "id": "65d8a1f2e4b0111111111111",
     "channelId": "-1001987654321",
-    "name": "My Telegram Cloud"
+    "name": "My Telegram Cloud",
+    "isForum": true,
+    "chatType": "supergroup"
   }
   ```
-- **Errors:** `400 Bad Request` (missing channel ID or bot lacks admin permissions in channel).
+- **Errors:** `400 Bad Request` (missing channel ID or bot lacks admin permissions in channel/group).
+
+### 5.4.1 Bulk Import Telegram History & Forum Topics (JSON)
+Imports pre-scanned historical media messages and Forum Group topics (for example, exported via a user-account Telegram scanner script) into an existing Telegram Drive account.
+Because Telegram bots cannot iterate historical messages before they joined, importing a JSON index allows the bot (once added as Administrator) to fetch, stream, preview, and download all historical files by `messageId`.
+- **Method & Route:** `POST /api/tgdrive/:accountId/import`
+- **Auth Required:** Yes (`write` scope; owner of `:accountId`)
+- **Payload Limit:** Up to `15 MB` JSON body (max `2,000` topics and `25,000` files per batch; re-imports safely skip duplicate `messageId`s).
+- **Request Body (JSON):**
+  ```json
+  {
+    "isForum": true,
+    "topics": [
+      { "threadId": 1, "name": "General" },
+      { "threadId": 12, "name": "Movies" },
+      { "threadId": 45, "name": "Documents" }
+    ],
+    "files": [
+      {
+        "messageId": 101,
+        "threadId": 12,
+        "name": "Interstellar.mkv",
+        "size": 2147483648,
+        "mimeType": "video/x-matroska",
+        "date": 1732000000,
+        "caption": "1080p BluRay"
+      }
+    ]
+  }
+  ```
+  - **Supported Field Aliases:**
+    - Topics array: `topics`, `threads`, or `folders` (each with `threadId` / `topicId` / `topic_id` / `message_thread_id` / `id` and `name` / `title`).
+    - Files array: `files`, `messages`, `media`, or a top-level array (each with `messageId` / `message_id` / `id`, optional `threadId` / `topic_id` / `message_thread_id`, optional `folder` / `topicName`, `name` / `file_name`, `size` / `file_size`, optional `mimeType` / `mime_type`, optional `date` in Unix seconds, ms, or ISO-8601).
+    - **Text Messages as `.txt` Notes:** Include `text` (or `message` / `content` / `body`) and/or `type: "note"` / `isNote: true`. Cloudyte auto-generates a `.txt` filename from the first line if `name` is omitted, sets `mimeType: "text/plain"`, computes UTF-8 byte `size`, and serves full previews + HTTP `Range` downloads seamlessly (or fetches `message.message` live from Telegram if inline `text` is omitted).
+    - `threadId: 1` (Telegram's General topic) automatically maps to the drive root (`""`).
+- **Response (200 OK):**
+  ```json
+  {
+    "success": true,
+    "isForum": true,
+    "importedTopics": 2,
+    "updatedTopics": 0,
+    "importedFiles": 1,
+    "skippedDuplicates": 0,
+    "invalidCount": 0,
+    "totalFiles": 1
+  }
+  ```
 
 ---
 
 ### 5.5 Telegram Drive Database & Virtual Filesystem Architecture
 
-Telegram channels natively store media as flat message streams without directories or folder structures. Cloudyte solves this by maintaining a **hybrid storage engine**:
-1. **Raw File Binaries:** Stored directly in the linked Telegram channel as message attachments (providing virtually unlimited, free cloud storage).
-2. **Virtual Filesystem in MongoDB:** All directories, folder hierarchies, custom file names, MIME types, and share IDs are indexed and managed in MongoDB collections:
-   - **`tg_files` collection:** Stores each file's metadata (`messageId`, `accountId`, `name`, `size`, `mimeType`, `folder`, `shareId`, `date`).
-   - **`tg_folders` collection:** Stores virtual directory paths (`accountId`, `name`, `path`, `createdAt`).
+Telegram channels natively store media as flat message streams without directories or folder structures, while Forum Groups organize messages into Topics (`message_thread_id`). Cloudyte combines both with a **hybrid storage engine**:
+1. **Raw File Binaries:** Stored directly in the linked Telegram channel or group as message attachments (providing virtually unlimited, free cloud storage).
+2. **Virtual Filesystem in MongoDB:** All directories, Forum Topic mappings, custom file names, MIME types, and share IDs are indexed and managed in MongoDB collections:
+   - **`tg_files` collection:** Stores each file's metadata (`messageId`, `threadId`, `accountId`, `name`, `size`, `mimeType`, `folder`, `shareId`, `date`).
+   - **`tg_folders` collection:** Stores virtual directory paths and optional Telegram Forum Topic links (`accountId`, `name`, `path`, `threadId`, `createdAt`).
 
 #### Telegram Drive Database Schema:
 ```typescript
@@ -448,12 +497,13 @@ interface TgFileDoc {
   _id: ObjectId;          // Unique file ID (used in /api/files/:fileId and /api/download/:accId/:fileId)
   userId?: string;        // Owner user ID
   accountId: ObjectId;    // Linked tgdrive account _id
-  messageId: number;      // Telegram message ID in the channel
+  messageId: number;      // Telegram message ID in the channel/group
+  threadId?: number;      // Optional Telegram Forum Topic ID (message_thread_id)
   shareId: string;        // Public share code (for /s/:shareId)
   name: string;           // File display name (e.g. "presentation.pdf")
   size: number;           // File size in bytes
   mimeType: string;       // Detected MIME type
-  folder: string;         // Virtual folder path (e.g. "" for root, "documents/work" for nested)
+  folder: string;         // Virtual folder path (e.g. "" for root, "Movies" for a Forum Topic)
   caption?: string;       // Optional Telegram message caption
   date: number;           // Unix timestamp (seconds)
 }
@@ -463,8 +513,9 @@ interface TgFolderDoc {
   _id: ObjectId;
   userId?: string;
   accountId: ObjectId;    // Linked tgdrive account _id
-  name: string;           // Folder name (e.g. "work")
-  path: string;           // Full folder path (e.g. "documents/work")
+  name: string;           // Folder / Forum Topic name (e.g. "Movies")
+  path: string;           // Full folder path (e.g. "Movies" or "Movies/Sci-Fi")
+  threadId?: number;      // Optional Telegram Forum Topic ID (top-level topic folders)
   createdAt: number;      // Unix timestamp (seconds)
 }
 ```

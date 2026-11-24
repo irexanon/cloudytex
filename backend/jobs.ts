@@ -34,6 +34,9 @@ import {
 } from './core.ts';
 
 import {
+  isTgChannelAccessError,
+  formatTgChannelError,
+  markTgChannelInaccessible,
   resolvePeer,
   getTgClient,
   getDriveClient,
@@ -319,29 +322,64 @@ async function crossAccountTransfer(
         mimeType = meta.isEncrypted ? 'application/octet-stream' : meta.mimeType;
         expectedBytes = Number(meta.encryptedSizeBytes ?? meta.size ?? 0) || 0;
 
-        const telegram = await getTgClient();
-        const peer = await resolvePeer(telegram, sourceAccount.channelId);
-        const messages = await telegram.getMessages(peer, { ids: [meta.messageId] });
-        if (!messages || !messages[0] || !messages[0].media) throw new Error('Message not found');
-
-        let downloaded = 0;
-        for await (const chunk of telegram.iterDownload({ file: messages[0].media, requestSize: 1024 * 1024 })) {
-          await checkCancelled();
-          downloaded += chunk.length;
-          if (!writeStream.write(chunk)) {
-            await new Promise<void>((res, rej) => {
-              const onDrain = () => { cleanup(); res(); };
-              const onErr = (e: any) => { cleanup(); rej(e); };
-              const cleanup = () => { writeStream.off('drain', onDrain); writeStream.off('error', onErr); };
-              writeStream.once('drain', onDrain);
-              writeStream.once('error', onErr);
-            });
+        if (meta.isNote === true && typeof meta.textContent === 'string') {
+          const noteBuf = Buffer.from(meta.textContent, 'utf8');
+          expectedBytes = noteBuf.length;
+          await new Promise<void>((res, rej) => {
+            writeStream.on('finish', () => res());
+            writeStream.on('error', rej);
+            writeStream.end(noteBuf);
+          });
+          await onProgress?.({ stage: 'downloading', bytesProcessed: noteBuf.length, totalBytes: noteBuf.length, progressPct: 50 });
+        } else {
+          const telegram = await getTgClient();
+          let messages: any;
+          try {
+            const peer = await resolvePeer(telegram, sourceAccount.channelId);
+            messages = await telegram.getMessages(peer, { ids: [meta.messageId] });
+          } catch (tgErr: any) {
+            if (isTgChannelAccessError(tgErr)) {
+              markTgChannelInaccessible(sourceAccount.channelId, tgErr);
+              const accessErr: any = new Error(formatTgChannelError(tgErr, sourceAccount.channelId));
+              accessErr.code = 'TG_CHANNEL_ACCESS_DENIED';
+              throw accessErr;
+            }
+            throw tgErr;
           }
-          const pct = expectedBytes > 0 ? Math.min(50, 5 + Math.round((downloaded / expectedBytes) * 45)) : 25;
-          await onProgress?.({ stage: 'downloading', bytesProcessed: downloaded, totalBytes: expectedBytes, progressPct: pct });
+          const tgMsg: any = messages?.[0];
+          if (!tgMsg) throw new Error('Message not found');
+
+          if (!tgMsg.media && typeof tgMsg.message === 'string') {
+            const noteBuf = Buffer.from(tgMsg.message, 'utf8');
+            expectedBytes = noteBuf.length;
+            await new Promise<void>((res, rej) => {
+              writeStream.on('finish', () => res());
+              writeStream.on('error', rej);
+              writeStream.end(noteBuf);
+            });
+            await onProgress?.({ stage: 'downloading', bytesProcessed: noteBuf.length, totalBytes: noteBuf.length, progressPct: 50 });
+          } else {
+            if (!tgMsg.media) throw new Error('Message not found');
+            let downloaded = 0;
+            for await (const chunk of telegram.iterDownload({ file: tgMsg.media, requestSize: 1024 * 1024 })) {
+              await checkCancelled();
+              downloaded += chunk.length;
+              if (!writeStream.write(chunk)) {
+                await new Promise<void>((res, rej) => {
+                  const onDrain = () => { cleanup(); res(); };
+                  const onErr = (e: any) => { cleanup(); rej(e); };
+                  const cleanup = () => { writeStream.off('drain', onDrain); writeStream.off('error', onErr); };
+                  writeStream.once('drain', onDrain);
+                  writeStream.once('error', onErr);
+                });
+              }
+              const pct = expectedBytes > 0 ? Math.min(50, 5 + Math.round((downloaded / expectedBytes) * 45)) : 25;
+              await onProgress?.({ stage: 'downloading', bytesProcessed: downloaded, totalBytes: expectedBytes, progressPct: pct });
+            }
+            writeStream.end();
+            await new Promise<void>((res, rej) => { writeStream.on('finish', () => res()); writeStream.on('error', rej); });
+          }
         }
-        writeStream.end();
-        await new Promise<void>((res, rej) => { writeStream.on('finish', () => res()); writeStream.on('error', rej); });
       } else if (sourceAccount.accountType === 'onedrive') {
         const c = await getOneDriveClient(sourceAccount.tokens || sourceAccount.credentials, sourceAccount._id.toString());
         const item = await c.api(`/me/drive/items/${fileId}`).get();

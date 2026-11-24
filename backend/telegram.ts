@@ -8,6 +8,13 @@ import { Telegraf } from 'telegraf';
 import { ObjectId } from 'mongodb';
 import { Api } from 'telegram/tl/index.js';
 import type { TelegramClient } from 'telegram';
+import {
+  checkTgChannelAccess,
+  clearTgChannelAccessCache,
+  formatTgChannelError,
+  isTgChannelAccessError,
+  markTgChannelInaccessible,
+} from './provider.ts';
 
 const SALT_ROUNDS = 10;
 
@@ -70,6 +77,20 @@ function renderProgressBar(current: number, total: number) {
   return `[\`${bar}\`] **${pct.toFixed(2)}%**`;
 }
 
+  // Safely display error text without fragile Markdown parsing (underscores in CHANNEL_INVALID break Markdown!)
+  async function safeEditError(ctx: any, messageId: number, prefix: string, err: any, channelId?: string) {
+    if (channelId && isTgChannelAccessError(err)) {
+      markTgChannelInaccessible(channelId, err);
+    }
+    const friendly = formatTgChannelError(err, channelId);
+    const msg = `${prefix} ${friendly}`;
+    try {
+      await bot!.telegram.editMessageText(ctx.chat.id, messageId, undefined, msg);
+    } catch {
+      await ctx.reply(msg).catch(() => {});
+    }
+  }
+
 async function renderBrowser(ctx: any, accId: string, folderId: string, pageToken?: string, isEdit = false) {
   try {
     const database = await connectToMongo();
@@ -80,10 +101,15 @@ async function renderBrowser(ctx: any, accId: string, folderId: string, pageToke
     let nextToken: string | null = null;
     let folderName         = 'Root';
     let parentId           = 'root';
+    let channelWarning     = '';
 
     if (account.accountType === 'tgdrive') {
       const channelId = account.channelId;
       if (!channelId) return ctx.reply('❌ No channel configured for this TG Drive account.');
+      const access = await checkTgChannelAccess(channelId, bot);
+      if (!access.ok) {
+        channelWarning = `\n⚠️ ${access.message}`;
+      }
 
       const currentFolder = folderId === 'root' ? '' : folderId;
       const escapedFolder = currentFolder ? currentFolder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '/' : '';
@@ -169,10 +195,11 @@ async function renderBrowser(ctx: any, accId: string, folderId: string, pageToke
     buttons.push(nav);
 
     const label = account.accountType === 'tgdrive' ? `📡 TG Drive: \`${account.channelId}\`` : `📧 *Account:* \`${account.email}\` (${account.accountType || 'google'})`;
-    const text    = `${label}\n📍 *Location:* \`${folderName}\`\n\nSelect a file or folder:`;
+    const safeWarning = channelWarning ? `\n${channelWarning.replace(/[_*`[\]]/g, '')}\n` : '';
+    const text    = `${label}\n📍 *Location:* \`${folderName}\`${safeWarning}\nSelect a file or folder:`;
     const options = { parse_mode: 'Markdown' as const, reply_markup: { inline_keyboard: buttons } };
-    if (isEdit) await ctx.editMessageText(text, options).catch(() => {});
-    else await ctx.reply(text, options);
+    if (isEdit) await ctx.editMessageText(text, options).catch(() => ctx.reply(text.replace(/[*`]/g, ''), { reply_markup: { inline_keyboard: buttons } }).catch(() => {}));
+    else await ctx.reply(text, options).catch(() => ctx.reply(text.replace(/[*`]/g, ''), { reply_markup: { inline_keyboard: buttons } }).catch(() => {}));
   } catch (e: any) {
     console.error('RenderBrowser error:', e);
     ctx.reply('❌ Error loading files: ' + e.message);
@@ -532,8 +559,9 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
     ctx.reply('📂 *Select account:*', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
   });
 
-  // Text handler: handles TG Drive channel registration + rename + mkdir
+  // Text handler: handles TG Drive channel/group registration + rename + mkdir
   bot.on('text', async (ctx, next) => {
+    if (ctx.chat?.type !== 'private') return next();
     const state = botState[ctx.from.id];
     if (!state) return next();
     const database  = await connectToMongo();
@@ -542,31 +570,41 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
     try {
       if (action === 'register_tgdrive_channel') {
         const channelId = ctx.message.text.trim();
+        let isForum = false;
+        let chatType = 'channel';
         // Verify bot is admin first
         try {
-          const admins  = await bot!.telegram.getChatAdministrators(channelId);
-          const botInfo = await bot!.telegram.getMe();
+          const [admins, botInfo, chatInfo] = await Promise.all([
+            bot!.telegram.getChatAdministrators(channelId),
+            bot!.telegram.getMe(),
+            bot!.telegram.getChat(channelId).catch(() => null),
+          ]);
           const isAdmin = admins.some((a: any) => a.user.id === botInfo.id);
-          if (!isAdmin) throw new Error('Bot is not an admin in this channel');
+          if (!isAdmin) throw new Error('Bot is not an admin in this channel or group');
+          if (chatInfo) {
+            isForum = Boolean((chatInfo as any).is_forum);
+            chatType = String((chatInfo as any).type || 'channel');
+          }
         } catch (e: any) {
           delete botState[ctx.from.id];
-          return ctx.reply(`❌ Cannot access channel: ${e.message}\n\nMake sure the bot is an admin in the channel.`);
+          return ctx.reply(`❌ Cannot access channel/group: ${e.message}\n\nMake sure the bot is an admin.`);
         }
-        // Channel OK — ask for drive name
-        botState[ctx.from.id] = { action: 'register_tgdrive_name', data: { channelId } };
-        return ctx.reply(`✅ Channel verified!\n\nStep 2/2: Send a *name* for this TG Drive\n(e.g. \`My Storage\`, \`Videos Channel\`)\n\nThis name will appear in your dashboard.`, { parse_mode: 'Markdown' });
+        // Channel/Group OK — ask for drive name
+        botState[ctx.from.id] = { action: 'register_tgdrive_name', data: { channelId, isForum, chatType } };
+        const kindLabel = isForum ? 'Forum Group (Topics = Folders)' : (chatType === 'supergroup' || chatType === 'group' ? 'Group' : 'Channel');
+        return ctx.reply(`✅ ${kindLabel} verified!\n\nStep 2/2: Send a *name* for this TG Drive\n(e.g. \`My Storage\`, \`Movies Group\`)\n\nThis name will appear in your dashboard.`, { parse_mode: 'Markdown' });
       }
 
       if (action === 'register_tgdrive_name') {
         const driveName = ctx.message.text.trim() || 'TG Drive';
-        const { channelId } = data;
+        const { channelId, isForum = false, chatType = 'channel' } = data;
         delete botState[ctx.from.id];
         const userId = await getUserIdByTg(ctx.from!.id, database);
         if (!userId) return ctx.reply('❌ Session lost. Use /login.');
 
         await database.collection('accounts').updateOne(
           { userId, channelId, accountType: 'tgdrive' },
-          { $set: { userId, channelId, accountType: 'tgdrive', name: driveName, linkedAt: new Date().toISOString() } },
+          { $set: { userId, channelId, accountType: 'tgdrive', name: driveName, isForum: Boolean(isForum), chatType, linkedAt: new Date().toISOString() } },
           { upsert: true }
         );
         const acc = await database.collection('accounts').findOne({ userId, channelId, accountType: 'tgdrive' });
@@ -575,9 +613,11 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
         const existingIds = (await database.collection('accounts').find({}, { projection: { _id: 1 } }).toArray()).map((a: any) => a._id);
         const fr = await database.collection('tg_files').updateMany({ accountId: { $nin: existingIds }, userId }, { $set: { accountId: newAccountId } });
         const dr = await database.collection('tg_folders').updateMany({ accountId: { $nin: existingIds }, userId }, { $set: { accountId: newAccountId } });
+        clearTgChannelAccessCache(channelId);
         const relinked = fr.modifiedCount + dr.modifiedCount;
         const extra = relinked > 0 ? `\n♻️ _${relinked} orphaned file(s) re-linked._` : '';
-        ctx.reply(`✅ *TG Drive registered!*\n\n📛 Name: \`${driveName}\`\n📡 Channel: \`${channelId}\`${extra}\n\nUse /files to browse or /upload to add files.`, { parse_mode: 'Markdown' });
+        const modeNote = isForum ? `\n🧵 Forum Mode: *Topics sync as folders*` : '';
+        ctx.reply(`✅ *TG Drive registered!*\n\n📛 Name: \`${driveName}\`\n📡 Chat: \`${channelId}\`${modeNote}${extra}\n\nUse /files to browse or /upload to add files.`, { parse_mode: 'Markdown' });
         return;
       }
 
@@ -637,9 +677,27 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
         if (account.accountType === 'tgdrive') {
           const parentPath = (!data.folderId || data.folderId === 'root') ? '' : data.folderId;
           const folderPath = parentPath ? `${parentPath}/${folderName}` : folderName;
+          let createdThreadId: number | null = null;
+          if (account.isForum && !parentPath) {
+            try {
+              const topic = await (bot!.telegram as any).createForumTopic(account.channelId, folderName);
+              if (topic && Number.isInteger(Number(topic.message_thread_id))) {
+                createdThreadId = Number(topic.message_thread_id);
+              }
+            } catch { /* fallback to virtual folder if bot lacks Manage Topics permission */ }
+          }
           await database.collection('tg_folders').updateOne(
             { accountId: account._id, path: folderPath },
-            { $set: { accountId: account._id, userId: String(userId), name: folderName, path: folderPath, createdAt: Math.floor(Date.now() / 1000) } },
+            {
+              $set: {
+                accountId: account._id,
+                userId: String(userId),
+                name: folderName,
+                path: folderPath,
+                ...(createdThreadId ? { threadId: createdThreadId } : {}),
+                createdAt: Math.floor(Date.now() / 1000),
+              },
+            },
             { upsert: true }
           );
         } else if (account.accountType === 'onedrive') {
@@ -662,8 +720,148 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
     }
   });
 
-  // File upload handler (Telegram → Cloud)
+  // ── Silent real-time sync for linked Telegram Groups & Forum Topics ────────
+  const sanitizeTopicLabel = (raw: unknown, fallback: string) => {
+    const cleaned = String(raw ?? '')
+      .replace(/[\x00-\x1f\x7f]/g, '')
+      .replace(/[\\/]+/g, ' - ')
+      .replace(/\.\./g, '.')
+      .trim()
+      .slice(0, 180);
+    return cleaned && cleaned !== '.' ? cleaned : fallback;
+  };
+
+  bot.on('message', async (ctx, next) => {
+    const chatType = ctx.chat?.type;
+    if (chatType !== 'supergroup' && chatType !== 'group') {
+      return next();
+    }
+    try {
+      const database = await connectToMongo();
+      const chatIdStr = String(ctx.chat.id);
+      const chatUsername = (ctx.chat as any)?.username ? `@${(ctx.chat as any).username}` : null;
+      const channelCandidates = chatUsername ? [chatIdStr, chatUsername] : [chatIdStr];
+      const linkedAccount = await database.collection('accounts').findOne({
+        accountType: 'tgdrive',
+        channelId: { $in: channelCandidates },
+      });
+      if (!linkedAccount) return;
+
+      const msg = ctx.message as any;
+      const ownerUserId = String(linkedAccount.userId || '');
+      const rawThreadId = Number(msg.message_thread_id);
+      const threadId = Number.isSafeInteger(rawThreadId) && rawThreadId > 1 ? rawThreadId : null;
+
+      // 1. Forum topic created -> upsert folder with threadId
+      if (msg.forum_topic_created && threadId) {
+        const topicName = sanitizeTopicLabel(msg.forum_topic_created.name, `Topic ${threadId}`);
+        const existingByPath = await database.collection('tg_folders').findOne({ accountId: linkedAccount._id, path: topicName });
+        const folderPath = existingByPath && Number(existingByPath.threadId) !== threadId
+          ? `${topicName} (${threadId})`
+          : topicName;
+        await database.collection('tg_folders').updateOne(
+          { accountId: linkedAccount._id, threadId },
+          {
+            $set: {
+              accountId: linkedAccount._id,
+              userId: ownerUserId,
+              name: topicName,
+              path: folderPath,
+              threadId,
+              createdAt: msg.date || Math.floor(Date.now() / 1000),
+            },
+          },
+          { upsert: true }
+        );
+        if (!linkedAccount.isForum) {
+          await database.collection('accounts').updateOne({ _id: linkedAccount._id }, { $set: { isForum: true, chatType } });
+        }
+        invalidateDriveCache(String(linkedAccount._id));
+        return;
+      }
+
+      // 2. Forum topic renamed -> update folder display name
+      if (msg.forum_topic_edited?.name && threadId) {
+        const newName = sanitizeTopicLabel(msg.forum_topic_edited.name, `Topic ${threadId}`);
+        const existingFolder = await database.collection('tg_folders').findOne({ accountId: linkedAccount._id, threadId });
+        if (existingFolder) {
+          await database.collection('tg_folders').updateOne(
+            { _id: existingFolder._id },
+            { $set: { name: newName, updatedAt: Math.floor(Date.now() / 1000) } }
+          );
+          invalidateDriveCache(String(linkedAccount._id));
+        }
+        return;
+      }
+
+      // 3. Media posted directly in the linked group -> silently index into tg_files under the topic folder
+      const tgFile = msg.document || msg.video || msg.audio || msg.voice || msg.video_note || msg.animation || (msg.photo && msg.photo[msg.photo.length - 1]);
+      if (!tgFile) return;
+
+      const existingMsg = await database.collection('tg_files').findOne({ accountId: linkedAccount._id, messageId: msg.message_id });
+      if (existingMsg) return;
+
+      let folderPath = '';
+      if (threadId) {
+        let folderDoc = await database.collection('tg_folders').findOne({ accountId: linkedAccount._id, threadId });
+        if (!folderDoc) {
+          const inferredName = sanitizeTopicLabel(msg.reply_to_message?.forum_topic_created?.name, `Topic ${threadId}`);
+          const collision = await database.collection('tg_folders').findOne({ accountId: linkedAccount._id, path: inferredName });
+          const safePath = collision ? `${inferredName} (${threadId})` : inferredName;
+          await database.collection('tg_folders').updateOne(
+            { accountId: linkedAccount._id, threadId },
+            {
+              $set: {
+                accountId: linkedAccount._id,
+                userId: ownerUserId,
+                name: inferredName,
+                path: safePath,
+                threadId,
+                createdAt: msg.date || Math.floor(Date.now() / 1000),
+              },
+            },
+            { upsert: true }
+          );
+          folderPath = safePath;
+          if (!linkedAccount.isForum) {
+            await database.collection('accounts').updateOne({ _id: linkedAccount._id }, { $set: { isForum: true, chatType } });
+          }
+        } else {
+          folderPath = String(folderDoc.path || '');
+        }
+      }
+
+      const rawName = msg.document?.file_name || msg.audio?.file_name || msg.video?.file_name || msg.animation?.file_name || (msg.photo ? `photo_${msg.message_id}.jpg` : `telegram_file_${msg.message_id}`);
+      const fileName = sanitizeTopicLabel(path.basename(rawName), `file_${msg.message_id}`);
+      const mimeType = tgFile.mime_type || (msg.photo ? 'image/jpeg' : (msg.video ? 'video/mp4' : (msg.audio ? 'audio/mpeg' : 'application/octet-stream')));
+      const fileSize = Number(tgFile.file_size || 0);
+      const dateSec = Number(msg.date || Math.floor(Date.now() / 1000));
+
+      await database.collection('tg_files').insertOne({
+        accountId: linkedAccount._id,
+        userId: ownerUserId,
+        messageId: msg.message_id,
+        ...(threadId ? { threadId } : {}),
+        shareId: nanoid12(),
+        name: fileName,
+        size: fileSize,
+        mimeType,
+        folder: folderPath,
+        caption: typeof msg.caption === 'string' ? msg.caption.slice(0, 1024) : '',
+        isEncrypted: false,
+        date: dateSec,
+        updatedAt: dateSec * 1000,
+      });
+      invalidateDriveCache(String(linkedAccount._id));
+    } catch (syncErr: any) {
+      console.warn('[TG Group Sync] Non-fatal sync error:', syncErr?.message);
+    }
+    return;
+  });
+
+  // File upload handler (Private DM Telegram → Cloud)
   bot.on(['document', 'photo', 'video', 'audio', 'voice', 'video_note'], async (ctx) => {
+    if (ctx.chat?.type !== 'private') return;
     const database = await connectToMongo();
     const state    = botState[ctx.from.id];
     let accId: string | null = null;
@@ -705,12 +903,26 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
       if (account.accountType === 'tgdrive') {
         await bot!.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, `📡 *Syncing to TG Drive...*\n\n📄 \`${fileName}\`\n💾 ${sizeMB} MB`, { parse_mode: 'Markdown' }).catch(() => {});
         const caption = folderId ? `F[${folderId}] | ${fileName}` : fileName;
-        const copied  = await bot!.telegram.copyMessage(account.channelId, ctx.chat.id, ctx.message.message_id, { caption });
+        let targetThreadId: number | null = null;
+        if (folderId) {
+          const topFolder = String(folderId).split('/')[0];
+          const folderDoc = await database.collection('tg_folders').findOne({
+            accountId: account._id,
+            $or: [{ path: folderId }, { path: topFolder }],
+          });
+          if (folderDoc && Number.isInteger(Number(folderDoc.threadId)) && Number(folderDoc.threadId) > 1) {
+            targetThreadId = Number(folderDoc.threadId);
+          }
+        }
+        const copyOpts: any = { caption };
+        if (targetThreadId) copyOpts.message_thread_id = targetThreadId;
+        const copied  = await bot!.telegram.copyMessage(account.channelId, ctx.chat.id, ctx.message.message_id, copyOpts);
         const shareId = nanoid12();
         await database.collection('tg_files').insertOne({
           accountId: account._id,
           userId:    String(userId),
           messageId: copied.message_id,
+          ...(targetThreadId ? { threadId: targetThreadId } : {}),
           shareId,
           name:      fileName,
           size:      fileSize,
@@ -911,7 +1123,7 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
         throw err;
       }
     } catch (err: any) {
-      await bot!.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, `❌ *Upload failed:* ${err.message}`, { parse_mode: 'Markdown' }).catch(() => {});
+      await safeEditError(ctx, statusMsg.message_id, '❌ Upload failed:', err, account?.accountType === 'tgdrive' ? account.channelId : undefined);
     }
   });
 
@@ -1074,7 +1286,7 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
           await tgc.sendFile(String(ctx.chat.id), { file: tmpPath, caption: `✅ *${fileName}*`, forceDocument: true, attributes: [new Api.DocumentAttributeFilename({ fileName })] });
           bot!.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
         } catch (err: any) {
-          bot!.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, `❌ *Failed:* ${err.message}`, { parse_mode: 'Markdown' }).catch(() => {});
+          await safeEditError(ctx, statusMsg.message_id, '❌ Failed:', err, account?.accountType === 'tgdrive' ? account.channelId : undefined);
         } finally {
           if (fs.existsSync(tmpPath)) { try { fs.unlinkSync(tmpPath); } catch { /* ignore */ } }
         }

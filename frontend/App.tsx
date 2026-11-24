@@ -87,6 +87,11 @@ export default function App() {
   const [tgDriveNameInput, setTgDriveNameInput] = useState('');
   const [tgRegisterLoading, setTgRegisterLoading] = useState(false);
   const [tgRegisterError, setTgRegisterError] = useState('');
+  const [tgImportAccount, setTgImportAccount] = useState<any | null>(null);
+  const [tgImportText, setTgImportText] = useState('');
+  const [tgImportFileName, setTgImportFileName] = useState('');
+  const [tgImportLoading, setTgImportLoading] = useState(false);
+  const [tgImportError, setTgImportError] = useState('');
   const [isSettingsOpen, setIsSettingsOpen] = useState(initialRoute.page === 'settings');
   const [uploadProgress, setUploadProgress] = useState<{
     name: string;
@@ -120,6 +125,9 @@ export default function App() {
   const [promptValue, setPromptValue]     = useState('');
   const [contextMenu, setContextMenu]     = useState<{ file: any; x: number; y: number } | null>(null);
   const [previewFile, setPreviewFile]     = useState<any | null>(null);
+  const [previewMediaError, setPreviewMediaError] = useState<string | null>(null);
+  const [previewTextContent, setPreviewTextContent] = useState<string | null>(null);
+  const [previewTextLoading, setPreviewTextLoading] = useState(false);
   const [fullScreenGalleryFile, setFullScreenGalleryFile] = useState<any | null>(null);
   const [isMoveModalOpen, setIsMoveModalOpen] = useState(initialRoute.modal === 'move' || initialRoute.modal === 'copy');
   const [modalAction, setModalAction] = useState<'move' | 'copy'>(initialRoute.modal === 'copy' ? 'copy' : 'move');
@@ -361,13 +369,14 @@ export default function App() {
 
   useEffect(() => { fetchUserProfile(); }, [fetchUserProfile]);
 
-  const fetchAccounts = useCallback(async () => {
+  const fetchAccounts = useCallback(async (forceRefresh = false) => {
     if (!isAuthenticated) return;
     const controller = new AbortController();
     const tId = setTimeout(() => controller.abort(), 15000);
     try {
       setLoading(true);
-      const res = await fetch('/api/accounts', { headers: getAuthHeaders(), signal: controller.signal });
+      const url = forceRefresh ? '/api/accounts?refresh=1' : '/api/accounts';
+      const res = await fetch(url, { headers: getAuthHeaders(), signal: controller.signal });
       clearTimeout(tId);
       if (res.status === 401) { setIsAuthenticated(false); setAuthToken(null); localStorage.removeItem('cloudyte_token'); return; }
       const data = await res.json();
@@ -406,6 +415,11 @@ export default function App() {
         const res = await fetch(`/api/trash?accountId=${encodeURIComponent(accId)}`, { headers: getAuthHeaders() });
         if (res.status === 401) { setIsAuthenticated(false); setAuthToken(null); localStorage.removeItem('cloudyte_token'); return; }
         const data = await res.json();
+        if (!res.ok) {
+          showToast(data?.error || 'Could not load trash items', 'error');
+          setFiles([]);
+          return;
+        }
         const list = Array.isArray(data) ? data : [];
         const q = (search || '').trim().toLowerCase();
         setFiles(q ? list.filter((f: any) => String(f.name || '').toLowerCase().includes(q)) : list);
@@ -418,9 +432,16 @@ export default function App() {
       const res = await fetch(`/api/files?${params.toString()}`, { headers: getAuthHeaders() });
       if (res.status === 401) { setIsAuthenticated(false); setAuthToken(null); localStorage.removeItem('cloudyte_token'); return; }
       const data = await res.json();
+      if (!res.ok) {
+        showToast(data?.error || 'Could not load files from this drive', 'error');
+        setFiles([]);
+        return;
+      }
       setFiles(Array.isArray(data) ? data : []);
-    } catch { /* ignore */ } finally { setLoading(false); }
-  }, [getAuthHeaders, isTrashView]);
+    } catch (err: any) {
+      showToast(err?.message || 'Could not load files', 'error');
+    } finally { setLoading(false); }
+  }, [getAuthHeaders, isTrashView, showToast]);
 
   useEffect(() => { fetchAccounts(); }, [fetchAccounts]);
   useEffect(() => {
@@ -436,6 +457,49 @@ export default function App() {
     return () => clearTimeout(t);
   }, [searchQuery, isAuthenticated, isInitializing, syncUrl]);
   useEffect(() => { if (selectedAccountId) fetchFiles(selectedAccountId, currentFolderId, debouncedSearch, isTrashView); }, [selectedAccountId, currentFolderId, debouncedSearch, isTrashView, fetchFiles]);
+  useEffect(() => {
+    setPreviewMediaError(null);
+    setPreviewTextContent(null);
+    setPreviewTextLoading(false);
+    if (!previewFile || !selectedAccountId || previewFile.isEncrypted) return;
+    const lowerName = String(previewFile.name || '').toLowerCase();
+    const lowerMime = String(previewFile.mimeType || '').toLowerCase();
+    const isTextLike = Boolean(
+      previewFile.isNote ||
+      lowerMime.startsWith('text/') ||
+      /\.(txt|md|log|csv|json)$/i.test(lowerName)
+    );
+    const maxPreviewBytes = 512 * 1024;
+    if (!isTextLike || Number(previewFile.sizeBytes || 0) > maxPreviewBytes) return;
+
+    const controller = new AbortController();
+    setPreviewTextLoading(true);
+    const srcUrl = previewFile.url || `/api/download/${encodeURIComponent(selectedAccountId)}/${encodeURIComponent(previewFile.id)}?preview=1`;
+    fetch(srcUrl, { headers: getAuthHeaders(), signal: controller.signal })
+      .then(async (res) => {
+        if (!res.ok) {
+          let errMsg = 'Unable to load note preview.';
+          try {
+            const j = await res.json();
+            if (j?.error) errMsg = j.error;
+          } catch {}
+          throw new Error(errMsg);
+        }
+        return res.text();
+      })
+      .then((txt) => {
+        if (!controller.signal.aborted) setPreviewTextContent(txt);
+      })
+      .catch((err: any) => {
+        if (err?.name === 'AbortError' || controller.signal.aborted) return;
+        fetchAccounts(true);
+        setPreviewMediaError(err?.message || 'Unable to load this text note.');
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setPreviewTextLoading(false);
+      });
+    return () => controller.abort();
+  }, [previewFile?.id, selectedAccountId]);
 
   // Keep /login and /register URLs in sync when unauthenticated
   useEffect(() => {
@@ -534,6 +598,128 @@ export default function App() {
       fetchAccounts();
     } catch (err: any) { setTgRegisterError(err.message); }
     finally { setTgRegisterLoading(false); }
+  };
+
+  // ── Bulk Import Telegram Channel / Forum Group JSON ───────────────────────
+  const SAMPLE_TG_IMPORT_JSON = JSON.stringify(
+    {
+      isForum: true,
+      topics: [
+        { threadId: 1, name: 'General' },
+        { threadId: 12, name: 'Movies' },
+        { threadId: 45, name: 'Notes' },
+      ],
+      files: [
+        {
+          messageId: 101,
+          threadId: 12,
+          name: 'Interstellar.mkv',
+          size: 2147483648,
+          mimeType: 'video/x-matroska',
+          date: 1732000000,
+          caption: '1080p BluRay',
+        },
+        {
+          messageId: 102,
+          threadId: 45,
+          name: 'Server Credentials.txt',
+          text: 'Host: example.com\nNotes from group thread',
+          date: 1732000500,
+        },
+      ],
+    },
+    null,
+    2
+  );
+
+  const openTgImportModal = (acc: any) => {
+    setTgImportAccount(acc);
+    setTgImportText('');
+    setTgImportFileName('');
+    setTgImportError('');
+  };
+
+  const handleTgImportFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (file.size > 15 * 1024 * 1024) {
+      setTgImportError('JSON file exceeds the 15 MB limit. Please split it into smaller batches.');
+      return;
+    }
+    try {
+      const text = await file.text();
+      setTgImportText(text);
+      setTgImportFileName(file.name);
+      setTgImportError('');
+    } catch {
+      setTgImportError('Could not read the selected JSON file.');
+    }
+  };
+
+  const getTgImportPreview = (raw: string): { valid: boolean; topics: number; files: number; error?: string } => {
+    const trimmed = raw.trim();
+    if (!trimmed) return { valid: false, topics: 0, files: 0 };
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        return { valid: true, topics: 0, files: parsed.length };
+      }
+      if (parsed && typeof parsed === 'object') {
+        const topicsArr = parsed.topics || parsed.threads || parsed.folders || [];
+        const filesArr = parsed.files || parsed.messages || parsed.media || [];
+        if (!Array.isArray(topicsArr) && !Array.isArray(filesArr)) {
+          return { valid: false, topics: 0, files: 0, error: 'JSON must include a "topics" or "files" array.' };
+        }
+        return {
+          valid: true,
+          topics: Array.isArray(topicsArr) ? topicsArr.length : 0,
+          files: Array.isArray(filesArr) ? filesArr.length : 0,
+        };
+      }
+      return { valid: false, topics: 0, files: 0, error: 'JSON root must be an object or array.' };
+    } catch {
+      return { valid: false, topics: 0, files: 0, error: 'Invalid JSON syntax.' };
+    }
+  };
+
+  const handleImportTgJson = async () => {
+    if (!tgImportAccount || !tgImportText.trim()) return;
+    let payload: any;
+    try {
+      payload = JSON.parse(tgImportText);
+    } catch {
+      setTgImportError('Invalid JSON syntax. Please check the file or pasted text.');
+      return;
+    }
+    setTgImportLoading(true);
+    setTgImportError('');
+    try {
+      const res = await fetch(`/api/tgdrive/${encodeURIComponent(tgImportAccount.id)}/import`, {
+        method: 'POST',
+        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Import failed');
+      const targetAccId = tgImportAccount.id;
+      setTgImportAccount(null);
+      setTgImportText('');
+      setTgImportFileName('');
+      const parts: string[] = [];
+      if (data.importedTopics > 0) parts.push(`${data.importedTopics} topic folder${data.importedTopics === 1 ? '' : 's'}`);
+      parts.push(`${data.importedFiles} file${data.importedFiles === 1 ? '' : 's'}`);
+      if (data.skippedDuplicates > 0) parts.push(`${data.skippedDuplicates} duplicate${data.skippedDuplicates === 1 ? '' : 's'} skipped`);
+      showToast(`Imported ${parts.join(', ')}`);
+      fetchAccounts();
+      if (selectedAccountId === targetAccId) {
+        fetchFiles(targetAccId, currentFolderId, debouncedSearch, isTrashView);
+      }
+    } catch (err: any) {
+      setTgImportError(err.message || 'Import failed');
+    } finally {
+      setTgImportLoading(false);
+    }
   };
 
   const handleUnlink = async (accountOrId: any) => {
@@ -712,6 +898,7 @@ export default function App() {
     fileId: string,
     opts: { singleUse?: boolean; ttlSeconds?: number; preview?: boolean } = {}
   ): Promise<string> => {
+    let ticketErr: Error | null = null;
     try {
       const res = await fetch('/api/download-tickets', {
         method: 'POST',
@@ -728,8 +915,14 @@ export default function App() {
         if (data?.downloadUrl) {
           return opts.preview ? `${data.downloadUrl}?preview=1` : data.downloadUrl;
         }
+      } else if (res.status === 403 || res.status === 404) {
+        const errData = await res.json().catch(() => null);
+        if (errData?.code === 'TG_CHANNEL_ACCESS_DENIED' || errData?.error) {
+          ticketErr = new Error(errData.error || 'Access denied to this file');
+        }
       }
     } catch { /* fallback below */ }
+    if (ticketErr) throw ticketErr;
     const token = localStorage.getItem('cloudyte_token') || '';
     const suffix = opts.preview ? `?preview=1&token=${encodeURIComponent(token)}` : `?token=${encodeURIComponent(token)}`;
     return `/api/download/${encodeURIComponent(accId)}/${encodeURIComponent(fileId)}${suffix}`;
@@ -747,7 +940,10 @@ export default function App() {
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
-    } catch (err: any) { showToast('Download failed: ' + err.message, 'error'); }
+    } catch (err: any) {
+      showToast(err.message || 'Download failed', 'error');
+      fetchAccounts();
+    }
   };
 
   // ── Share: opens ShareModal with Expiry, MaxDownloads, and optional PIN ─────
@@ -2069,7 +2265,7 @@ export default function App() {
       }
 
       if (isTyping || !isAuthenticated) return;
-      if (confirmModal?.isOpen || promptModal?.isOpen || isMoveModalOpen || linkProviderModal || tgDriveModal || shareTargetFile) return;
+      if (confirmModal?.isOpen || promptModal?.isOpen || isMoveModalOpen || linkProviderModal || tgDriveModal || tgImportAccount || shareTargetFile) return;
 
       if (e.key === 'Escape') {
         if (contextMenu) { setContextMenu(null); return; }
@@ -2140,6 +2336,7 @@ export default function App() {
     isMoveModalOpen,
     linkProviderModal,
     tgDriveModal,
+    tgImportAccount,
     shareTargetFile,
     contextMenu,
     isSortMenuOpen,
@@ -2442,7 +2639,7 @@ export default function App() {
                         </span>
                       )}
                       {acc.error && (
-                        <span className="w-1.5 h-1.5 rounded-full bg-rose-500 shrink-0" title={acc.error} />
+                        <span className="w-1.5 h-1.5 rounded-full bg-rose-500 shrink-0" title={acc.errorMessage || 'Drive access issue'} />
                       )}
                     </div>
                     {showEmailSub && (
@@ -3554,6 +3751,9 @@ export default function App() {
                                     )}
                                   </div>
                                   <p className="text-xs text-[var(--sub)] truncate mt-0.5">{acc.email}</p>
+                                  {acc.error && acc.errorMessage && (
+                                    <p className="text-xs text-rose-500 font-medium mt-1 break-words">{acc.errorMessage}</p>
+                                  )}
                                 </div>
                               </div>
 
@@ -3598,6 +3798,19 @@ export default function App() {
                                           >
                                             <Check size={14} className="text-[#2563EB]" />
                                             <span>Set as default</span>
+                                          </button>
+                                        )}
+                                        {acc.accountType === 'tgdrive' && (
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              setOpenAccountMenuId(null);
+                                              openTgImportModal(acc);
+                                            }}
+                                            className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"
+                                          >
+                                            <Upload size={14} className="text-sky-500" />
+                                            <span>Import JSON</span>
                                           </button>
                                         )}
                                         <button
@@ -4024,35 +4237,51 @@ export default function App() {
               )}
 
               {/* Inline Non-Blocking Account & Storage Alert Banners */}
-              {!isTrashView && selectedAccount?.error && (
-                <div className="rounded-2xl px-4 py-3 bg-rose-500/10 border border-rose-500/25 text-rose-600 dark:text-rose-400 flex flex-wrap items-center justify-between gap-3">
-                  <div className="flex items-center gap-3 min-w-0">
+              {selectedAccount?.error && (
+                <div className="rounded-2xl px-4 py-3 bg-rose-500/10 border border-rose-500/25 text-rose-600 dark:text-rose-400 flex flex-wrap sm:flex-nowrap items-center justify-between gap-3">
+                  <div className="flex items-center gap-3 min-w-0 flex-1">
                     <span className="w-8 h-8 rounded-xl bg-rose-500/15 flex items-center justify-center shrink-0">
                       <AlertTriangle size={16} />
                     </span>
                     <div className="min-w-0">
-                      <p className="text-xs sm:text-sm font-semibold truncate">
-                        {selectedAccount.name || selectedAccount.email || 'This drive'} needs to reconnect
+                      <p className="text-xs sm:text-sm font-semibold">
+                        {selectedAccount.accountType === 'tgdrive'
+                          ? `${selectedAccount.name || 'TG Drive'} — Telegram channel inaccessible`
+                          : `${selectedAccount.name || selectedAccount.email || 'This drive'} needs to reconnect`}
                       </p>
-                      <p className="text-xs opacity-85 truncate">
-                        Refresh authorization to continue browsing and uploading files.
+                      <p className="text-xs opacity-90 break-words">
+                        {selectedAccount.errorMessage ||
+                          (selectedAccount.accountType === 'tgdrive'
+                            ? 'Telegram bot does not have admin access to this channel. Add the bot back as an Admin to restore downloads and previews.'
+                            : 'Refresh authorization to continue browsing and uploading files.')}
                       </p>
                     </div>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (selectedAccount.accountType === 'tgdrive') {
-                        setTgDriveModal(true);
-                        syncUrl({ modal: 'tg-drive' });
-                      } else {
-                        handleConnect(selectedAccount.accountType === 'onedrive' ? 'onedrive' : 'google');
-                      }
-                    }}
-                    className="h-8 px-3.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold shrink-0 transition-colors"
-                  >
-                    Reconnect
-                  </button>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => fetchAccounts(true)}
+                      className="h-8 px-3 rounded-xl bg-rose-500/15 hover:bg-rose-500/25 text-rose-700 dark:text-rose-300 text-xs font-semibold transition-colors"
+                    >
+                      Re-check
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (selectedAccount.accountType === 'tgdrive') {
+                          setTgChannelInput(selectedAccount.channelId || '');
+                          setTgDriveNameInput(selectedAccount.name || '');
+                          setTgDriveModal(true);
+                          syncUrl({ modal: 'tg-drive' });
+                        } else {
+                          handleConnect(selectedAccount.accountType === 'onedrive' ? 'onedrive' : 'google');
+                        }
+                      }}
+                      className="h-8 px-3.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold transition-colors"
+                    >
+                      Reconnect
+                    </button>
+                  </div>
                 </div>
               )}
 
@@ -5041,14 +5270,14 @@ export default function App() {
                   {renderProviderBadge('tgdrive', 'md')}
                   <div>
                     <h2 className="text-xl font-extrabold text-[var(--tx)] tracking-tight">Register TG Drive</h2>
-                    <p className="text-xs text-[var(--sub)] font-medium mt-0.5">Connect a Telegram channel as storage</p>
+                    <p className="text-xs text-[var(--sub)] font-medium mt-0.5">Connect a Telegram channel or group</p>
                   </div>
                 </div>
                 <div className="bg-sky-500/12 border border-sky-500/30 rounded-[18px] p-3.5 text-xs text-sky-700 dark:text-sky-300 font-medium space-y-1">
                   <p className="font-extrabold">Before registering:</p>
-                  <p>1. Create a Telegram channel</p>
+                  <p>1. Create or open a Telegram Channel or Group (Forum Groups map Topics to Folders automatically)</p>
                   <p>2. Add your bot as an <strong>Administrator</strong></p>
-                  <p>3. Copy the channel ID (e.g. <code className="bg-sky-500/15 px-1 rounded font-mono">-1001234567890</code>)</p>
+                  <p>3. Copy the chat ID (e.g. <code className="bg-sky-500/15 px-1 rounded font-mono">-1001234567890</code>)</p>
                 </div>
                 <div className="space-y-3.5">
                   <div className="space-y-1.5">
@@ -5058,17 +5287,17 @@ export default function App() {
                       value={tgDriveNameInput}
                       onChange={e => setTgDriveNameInput(e.target.value)}
                       onKeyDown={e => { if (e.key === 'Enter') handleRegisterTgDrive(); }}
-                      placeholder="e.g. My Storage, Videos Channel"
+                      placeholder="e.g. My Storage, Media Group"
                       className="w-full px-4 py-3.5 bg-[var(--bg)] border border-[var(--bd)] focus:border-sky-500 rounded-2xl outline-none transition-all font-bold text-sm text-[var(--tx)]"
                     />
                   </div>
                   <div className="space-y-1.5">
-                    <label className="text-[10px] font-black uppercase text-[var(--sub)] px-1 tracking-widest">Channel ID or Username</label>
+                    <label className="text-[10px] font-black uppercase text-[var(--sub)] px-1 tracking-widest">Channel / Group ID or Username</label>
                     <input
                       value={tgChannelInput}
                       onChange={e => setTgChannelInput(e.target.value)}
                       onKeyDown={e => { if (e.key === 'Enter') handleRegisterTgDrive(); }}
-                      placeholder="-1001234567890 or @mychannel"
+                      placeholder="-1001234567890 or @mygroup"
                       className="w-full px-4 py-3.5 bg-[var(--bg)] border border-[var(--bd)] focus:border-sky-500 rounded-2xl outline-none transition-all font-bold text-sm text-[var(--tx)]"
                     />
                   </div>
@@ -5083,6 +5312,132 @@ export default function App() {
               </motion.div>
             </div>
           )}
+        </AnimatePresence>
+
+        {/* TG Drive JSON Import Modal */}
+        <AnimatePresence>
+          {tgImportAccount && (() => {
+            const preview = getTgImportPreview(tgImportText);
+            return (
+              <div className="fixed inset-0 z-[210] flex items-center justify-center p-4 sm:p-6">
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  onClick={() => { if (!tgImportLoading) setTgImportAccount(null); }}
+                  className="absolute inset-0 bg-slate-950/65 backdrop-blur-sm"
+                />
+                <motion.div
+                  initial={{ scale: 0.95, opacity: 0, y: 10 }}
+                  animate={{ scale: 1, opacity: 1, y: 0 }}
+                  exit={{ scale: 0.95, opacity: 0, y: 10 }}
+                  transition={{ duration: 0.15 }}
+                  className="bg-[var(--sf)] text-[var(--tx)] p-6 sm:p-7 rounded-[28px] shadow-2xl relative w-full max-w-lg space-y-4 border border-[var(--bd)] max-h-[90vh] overflow-y-auto"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex items-center gap-3 min-w-0">
+                      {renderProviderBadge('tgdrive', 'md')}
+                      <div className="min-w-0">
+                        <h2 className="text-lg font-extrabold text-[var(--tx)] tracking-tight truncate">
+                          Import JSON into {tgImportAccount.name || 'TG Drive'}
+                        </h2>
+                        <p className="text-xs text-[var(--sub)] font-medium mt-0.5 truncate">
+                          {tgImportAccount.email}
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={tgImportLoading}
+                      onClick={() => setTgImportAccount(null)}
+                      className="w-8 h-8 rounded-xl text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--bg)] flex items-center justify-center transition-colors shrink-0"
+                    >
+                      <X size={16} />
+                    </button>
+                  </div>
+
+                  <div className="bg-sky-500/10 border border-sky-500/25 rounded-[18px] p-3.5 text-xs text-sky-700 dark:text-sky-300 font-medium space-y-1">
+                    <p className="font-extrabold">Import historical topics, media &amp; text notes:</p>
+                    <p>Upload or paste your scanner JSON export. Forum topics become folders, General maps to root, items with <code className="bg-sky-500/15 px-1 rounded font-mono">text</code>/<code className="bg-sky-500/15 px-1 rounded font-mono">message</code> become <code className="bg-sky-500/15 px-1 rounded font-mono">.txt</code> notes, and duplicates are skipped.</p>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <label className="cursor-pointer inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-[var(--bg)] border border-[var(--bd)] hover:border-sky-500/60 text-xs font-bold text-[var(--tx)] transition-colors">
+                      <Upload size={14} className="text-sky-500" />
+                      <span>{tgImportFileName ? tgImportFileName : 'Choose .json file'}</span>
+                      <input
+                        type="file"
+                        accept=".json,application/json"
+                        onChange={handleTgImportFileChange}
+                        className="hidden"
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        navigator.clipboard?.writeText(SAMPLE_TG_IMPORT_JSON).then(
+                          () => showToast('Sample JSON copied to clipboard'),
+                          () => showToast('Could not copy sample JSON', 'error')
+                        );
+                      }}
+                      className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--bg)] border border-[var(--bd)] transition-colors"
+                    >
+                      <Copy size={13} />
+                      <span>Copy sample format</span>
+                    </button>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between px-1">
+                      <label className="text-[10px] font-black uppercase text-[var(--sub)] tracking-widest">JSON Payload</label>
+                      {tgImportText.trim() && preview.valid && (
+                        <span className="text-[11px] font-bold text-emerald-500">
+                          Ready: {preview.topics} topic{preview.topics === 1 ? '' : 's'}, {preview.files} file{preview.files === 1 ? '' : 's'}
+                        </span>
+                      )}
+                      {tgImportText.trim() && !preview.valid && preview.error && (
+                        <span className="text-[11px] font-bold text-rose-500">{preview.error}</span>
+                      )}
+                    </div>
+                    <textarea
+                      rows={8}
+                      value={tgImportText}
+                      onChange={e => { setTgImportText(e.target.value); setTgImportError(''); }}
+                      placeholder={`{\n  "isForum": true,\n  "topics": [{ "threadId": 12, "name": "Movies" }],\n  "files": [{ "messageId": 101, "threadId": 12, "name": "Movie.mkv", "size": 1048576 }]\n}`}
+                      className="w-full px-3.5 py-3 bg-[var(--bg)] border border-[var(--bd)] focus:border-sky-500 rounded-2xl outline-none transition-all font-mono text-xs text-[var(--tx)] resize-y"
+                    />
+                  </div>
+
+                  {tgImportError && (
+                    <p className="text-rose-500 text-xs font-bold px-1">{tgImportError}</p>
+                  )}
+
+                  <div className="flex gap-2.5 pt-1">
+                    <button
+                      type="button"
+                      disabled={tgImportLoading}
+                      onClick={() => setTgImportAccount(null)}
+                      className="flex-1 py-3.5 text-[var(--sub)] hover:text-[var(--tx)] font-bold hover:bg-[var(--bg)] rounded-[18px] transition-colors text-sm"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleImportTgJson}
+                      disabled={tgImportLoading || !preview.valid || (preview.topics === 0 && preview.files === 0)}
+                      className="flex-1 bg-sky-500 text-white font-bold py-3.5 rounded-[18px] hover:bg-sky-600 shadow-lg shadow-sky-500/20 transition-all active:scale-95 flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed text-sm"
+                    >
+                      {tgImportLoading ? (
+                        <><RefreshCw size={16} className="animate-spin" /><span>Importing...</span></>
+                      ) : (
+                        <><Upload size={16} /><span>Import Now</span></>
+                      )}
+                    </button>
+                  </div>
+                </motion.div>
+              </div>
+            );
+          })()}
         </AnimatePresence>
 
         {/* Prompt Modal */}
@@ -5278,16 +5633,63 @@ export default function App() {
                     className="max-w-full max-h-full flex items-center justify-center"
                     onClick={(e) => e.stopPropagation()}
                   >
-                    {previewFile.type === 'image' ? (
+                    {previewMediaError ? (
+                      <div className="rounded-2xl bg-slate-900/90 border border-rose-500/30 p-7 max-w-md text-center space-y-4 shadow-2xl">
+                        <div className="w-12 h-12 rounded-2xl bg-rose-500/15 text-rose-400 flex items-center justify-center mx-auto">
+                          <AlertTriangle size={22} />
+                        </div>
+                        <div className="space-y-1.5">
+                          <p className="text-base font-semibold text-white">Couldn't load file</p>
+                          <p className="text-sm text-slate-300 leading-relaxed">{previewMediaError}</p>
+                        </div>
+                        <div className="flex flex-wrap gap-2.5 justify-center pt-1">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setPreviewMediaError(null);
+                              fetchAccounts(true);
+                            }}
+                            className="h-9 px-4 rounded-xl bg-white/10 hover:bg-white/15 text-white text-xs font-semibold transition-colors"
+                          >
+                            Retry
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleDownload(previewFile.id)}
+                            className="h-9 px-4 rounded-xl bg-[#2563EB] hover:bg-blue-500 text-white text-xs font-semibold transition-colors"
+                          >
+                            Download
+                          </button>
+                        </div>
+                      </div>
+                    ) : previewFile.type === 'image' ? (
                       <img
                         src={previewFile.url || `/api/download/${selectedAccountId}/${previewFile.id}?preview=1`}
                         alt={previewFile.name}
+                        onError={() => {
+                          fetchAccounts(true);
+                          setPreviewMediaError(
+                            selectedAccount?.errorMessage ||
+                              (selectedAccount?.accountType === 'tgdrive'
+                                ? 'Unable to fetch this file from the Telegram channel. Make sure the bot is still an Admin in the channel.'
+                                : 'Unable to load this preview from the cloud provider.')
+                          );
+                        }}
                         className="max-w-full max-h-[82vh] rounded-xl shadow-2xl object-contain"
                       />
                     ) : previewFile.type === 'video' ? (
                       <video
                         controls
                         autoPlay
+                        onError={() => {
+                          fetchAccounts(true);
+                          setPreviewMediaError(
+                            selectedAccount?.errorMessage ||
+                              (selectedAccount?.accountType === 'tgdrive'
+                                ? 'Unable to stream this video from the Telegram channel. Make sure the bot is still an Admin in the channel.'
+                                : 'Unable to stream this video from the cloud provider.')
+                          );
+                        }}
                         className="max-w-full max-h-[82vh] rounded-xl shadow-2xl bg-black"
                         src={previewFile.url || `/api/download/${selectedAccountId}/${previewFile.id}?preview=1`}
                       />
@@ -5300,6 +5702,15 @@ export default function App() {
                         <audio
                           controls
                           autoPlay
+                          onError={() => {
+                            fetchAccounts(true);
+                            setPreviewMediaError(
+                              selectedAccount?.errorMessage ||
+                                (selectedAccount?.accountType === 'tgdrive'
+                                  ? 'Unable to stream this audio from the Telegram channel. Make sure the bot is still an Admin in the channel.'
+                                  : 'Unable to play this audio file.')
+                            );
+                          }}
                           className="w-full"
                           src={previewFile.url || `/api/download/${selectedAccountId}/${previewFile.id}?preview=1`}
                         />
@@ -5310,6 +5721,25 @@ export default function App() {
                         className="w-[90vw] max-w-5xl h-[82vh] rounded-xl bg-white shadow-2xl border border-white/10"
                         title={previewFile.name}
                       />
+                    ) : (previewTextLoading || previewTextContent !== null) ? (
+                      <div className="w-[90vw] max-w-3xl max-h-[82vh] rounded-2xl bg-slate-900/95 border border-white/10 shadow-2xl flex flex-col overflow-hidden">
+                        <div className="px-5 py-3 border-b border-white/10 flex items-center justify-between gap-3 bg-slate-950/50">
+                          <span className="text-xs font-semibold text-slate-300 truncate">{previewFile.name}</span>
+                          <span className="text-[11px] font-medium text-slate-400 shrink-0">{previewFile.size}</span>
+                        </div>
+                        <div className="p-5 overflow-auto flex-1">
+                          {previewTextLoading ? (
+                            <div className="py-12 flex items-center justify-center gap-2 text-slate-400 text-sm">
+                              <RefreshCw size={16} className="animate-spin" />
+                              <span>Loading note...</span>
+                            </div>
+                          ) : (
+                            <pre className="whitespace-pre-wrap break-words font-mono text-[13px] leading-relaxed text-slate-100 select-text">
+                              {previewTextContent || '(Empty note)'}
+                            </pre>
+                          )}
+                        </div>
+                      </div>
                     ) : (
                       <div className="rounded-2xl bg-slate-900/90 border border-white/10 p-8 max-w-md text-center space-y-5 shadow-2xl">
                         <div className="flex justify-center">

@@ -49,6 +49,141 @@ import {
   nanoid,
 } from './core.ts';
 
+// ─── Telegram Channel Access Diagnostics & Error Formatting ──────────────────
+const TG_CHANNEL_ACCESS_PATTERNS = [
+  'CHANNEL_INVALID',
+  'CHANNEL_PRIVATE',
+  'CHAT_ADMIN_REQUIRED',
+  'CHAT_WRITE_FORBIDDEN',
+  'CHAT_FORBIDDEN',
+  'PEER_ID_INVALID',
+  'USER_NOT_PARTICIPANT',
+  'CHAT_NOT_FOUND',
+  'chat not found',
+  'bot was kicked',
+  'bot is not a member',
+  'not enough rights',
+  'have no rights',
+  'need administrator rights',
+  'channel_invalid',
+  'channel_private',
+];
+
+function extractTgErrorText(err: any): string {
+  return [
+    err?.errorMessage,
+    err?.response?.description,
+    err?.description,
+    err?.message,
+  ]
+    .filter((v) => typeof v === 'string' && v.trim())
+    .join(' ');
+}
+
+function isTgChannelAccessError(err: any): boolean {
+  const combined = extractTgErrorText(err);
+  if (!combined) return false;
+  const lower = combined.toLowerCase();
+  return TG_CHANNEL_ACCESS_PATTERNS.some((pat) => lower.includes(pat.toLowerCase()));
+}
+
+function formatTgChannelError(err: any, channelId?: string): string {
+  const chLabel = channelId ? ` (${String(channelId).trim()})` : '';
+  if (isTgChannelAccessError(err)) {
+    return `Telegram bot does not have access to channel${chLabel}. Please add the bot to this channel as an Admin.`;
+  }
+  const msg = extractTgErrorText(err).trim();
+  return msg || 'Telegram provider error';
+}
+
+function tgChannelAccessCacheKey(channelId: string): string {
+  return `tg_channel_access:${String(channelId || '').trim()}`;
+}
+
+function markTgChannelInaccessible(channelId: string, err?: any): void {
+  const cleanId = String(channelId || '').trim();
+  if (!cleanId) return;
+  const message = formatTgChannelError(err || new Error('CHANNEL_INVALID'), cleanId);
+  driveCache.set(tgChannelAccessCacheKey(cleanId), {
+    ok: false,
+    code: 'TG_CHANNEL_ACCESS_DENIED',
+    message,
+    checkedAt: Date.now(),
+  }, 60);
+}
+
+function clearTgChannelAccessCache(channelId: string): void {
+  const cleanId = String(channelId || '').trim();
+  if (!cleanId) return;
+  driveCache.del(tgChannelAccessCacheKey(cleanId));
+}
+
+let cachedBotSelfId: number | null = null;
+
+async function checkTgChannelAccess(
+  channelId: string,
+  botInstance?: any,
+  forceRefresh = false
+): Promise<{ ok: boolean; code?: string; message?: string }> {
+  const cleanId = String(channelId || '').trim();
+  if (!cleanId) {
+    return {
+      ok: false,
+      code: 'TG_CHANNEL_ACCESS_DENIED',
+      message: 'No Telegram channel is configured for this TG Drive.',
+    };
+  }
+  const cacheKey = tgChannelAccessCacheKey(cleanId);
+  if (!forceRefresh) {
+    const cached = driveCache.get(cacheKey) as { ok: boolean; code?: string; message?: string } | undefined;
+    if (cached) return cached;
+  }
+
+  // In test mode or when Telegraf bot is disabled, rely only on live MTProto failure cache
+  if (!botInstance?.telegram) {
+    return { ok: true };
+  }
+
+  try {
+    if (!cachedBotSelfId) {
+      const me = await botInstance.telegram.getMe();
+      if (me?.id) cachedBotSelfId = Number(me.id);
+    }
+    const admins = await botInstance.telegram.getChatAdministrators(cleanId);
+    const isAdmin = Array.isArray(admins) && cachedBotSelfId
+      ? admins.some((a: any) => Number(a?.user?.id) === cachedBotSelfId)
+      : false;
+    if (!isAdmin) {
+      const result = {
+        ok: false,
+        code: 'TG_CHANNEL_ACCESS_DENIED',
+        message: `Telegram bot is not an admin in channel (${cleanId}). Please promote the bot to Admin to restore access.`,
+      };
+      driveCache.set(cacheKey, result, 30);
+      return result;
+    }
+    const okResult = { ok: true };
+    driveCache.set(cacheKey, okResult, 60);
+    return okResult;
+  } catch (err: any) {
+    const errCode = Number(err?.response?.error_code || err?.code || 0);
+    const isNetworkTransient = ['ETIMEDOUT', 'ECONNRESET', 'ENOTFOUND', 'EAI_AGAIN'].includes(String(err?.code || ''));
+    if (isNetworkTransient) {
+      return { ok: true };
+    }
+    if (isTgChannelAccessError(err) || errCode === 400 || errCode === 403) {
+      const result = {
+        ok: false,
+        code: 'TG_CHANNEL_ACCESS_DENIED',
+        message: formatTgChannelError(err, cleanId),
+      };
+      driveCache.set(cacheKey, result, 30);
+      return result;
+    }
+    return { ok: true };
+  }
+}
+
 // ─── GramJS peer resolver ────────────────────────────────────────────────────
 let testResolvePeer: ((telegram: any, id: string) => Promise<any>) | null = null;
 const resolvePeer = async (telegram: TelegramClient, id: string): Promise<any> => {
@@ -303,19 +438,41 @@ async function tgUploadFile(
       }
     }
     const effectiveCaption = isEncrypted ? TELEGRAM_ENCRYPTED_CAPTION_MARKER : caption;
+    let resolvedThreadId: number | null = null;
+    if (folder) {
+      const topFolder = String(folder).split('/')[0];
+      const folderDoc = await database.collection('tg_folders').findOne({
+        accountId: new ObjectId(accountId),
+        $or: [{ path: folder }, { path: topFolder }],
+      });
+      if (folderDoc && Number.isInteger(Number(folderDoc.threadId)) && Number(folderDoc.threadId) > 0) {
+        resolvedThreadId = Number(folderDoc.threadId);
+      }
+    }
     let result: any;
     try {
       const telegram   = await getTgClient();
       const peerEntity = await resolvePeer(telegram, channelId);
-      result           = await telegram.sendFile(peerEntity, {
+      const sendOpts: any = {
         file: filePath,
         caption: effectiveCaption,
         forceDocument: true,
         attributes: [new Api.DocumentAttributeFilename({ fileName: effectiveName })],
-      }) as any;
+      };
+      if (resolvedThreadId && resolvedThreadId > 1) {
+        sendOpts.replyTo = resolvedThreadId;
+      }
+      result           = await telegram.sendFile(peerEntity, sendOpts) as any;
       recordProviderCall('telegram', 'sendFile', Date.now() - startedAt, true, 0);
     } catch (tgErr: any) {
       recordProviderCall('telegram', 'sendFile', Date.now() - startedAt, false, 0, tgErr?.code || 'ERROR');
+      if (isTgChannelAccessError(tgErr)) {
+        markTgChannelInaccessible(channelId, tgErr);
+        const accessErr: any = new Error(formatTgChannelError(tgErr, channelId));
+        accessErr.code = 'TG_CHANNEL_ACCESS_DENIED';
+        accessErr.status = 403;
+        throw accessErr;
+      }
       throw tgErr;
     }
     const messageId = result.id as number;
@@ -328,6 +485,7 @@ async function tgUploadFile(
         accountId: new ObjectId(accountId),
         ...(userId ? { userId: String(userId) } : {}),
         messageId,
+        ...(resolvedThreadId ? { threadId: resolvedThreadId } : {}),
         shareId:                    null,
         name:                      effectiveName,
         mimeType:                  'application/octet-stream',
@@ -357,6 +515,7 @@ async function tgUploadFile(
       accountId:   new ObjectId(accountId),
       ...(userId ? { userId: String(userId) } : {}),
       messageId,
+      ...(resolvedThreadId ? { threadId: resolvedThreadId } : {}),
       shareId,
       name:        effectiveName,
       size:        stat.size,
@@ -482,22 +641,41 @@ async function tgStreamFile(messageId: number, channelId: string, req: any, res:
 
   try {
     resetIdle();
-    const telegram = await getTgClient();
-    const peer     = await resolvePeer(telegram, channelId);
-    const messages = await telegram.getMessages(peer, { ids: [messageId] });
-    if (!messages || !messages[0] || !messages[0].media) throw new Error('Message not found');
-    const media    = messages[0].media as any;
+    let noteBuffer: Buffer | null = null;
+    if (meta?.isNote === true && typeof meta?.textContent === 'string') {
+      noteBuffer = Buffer.from(meta.textContent, 'utf8');
+    }
+
+    let media: any = null;
+    let telegram: any = null;
+    if (!noteBuffer) {
+      telegram = await getTgClient();
+      const peer     = await resolvePeer(telegram, channelId);
+      const messages = await telegram.getMessages(peer, { ids: [messageId] });
+      const tgMsg: any = messages?.[0];
+      if (!tgMsg) throw new Error('Message not found');
+      if (tgMsg.media) {
+        media = tgMsg.media;
+      } else if (typeof tgMsg.message === 'string') {
+        noteBuffer = Buffer.from(tgMsg.message, 'utf8');
+      } else {
+        throw new Error('Message not found');
+      }
+    }
 
     const isEncrypted = meta?.isEncrypted === true;
-    let totalSize: number = isEncrypted ? Number(meta?.encryptedSizeBytes ?? meta?.size ?? 0) : Number(meta?.size || 0);
-    if (!totalSize && media?.document?.size) totalSize = Number(media.document.size);
-    if (!totalSize && Array.isArray(media?.photo?.sizes)) {
+    let totalSize: number = noteBuffer
+      ? noteBuffer.length
+      : (isEncrypted ? Number(meta?.encryptedSizeBytes ?? meta?.size ?? 0) : Number(meta?.size || 0));
+    if (!noteBuffer && !totalSize && media?.document?.size) totalSize = Number(media.document.size);
+    if (!noteBuffer && !totalSize && Array.isArray(media?.photo?.sizes)) {
       const largestPhoto = media.photo.sizes
         .map((s: any) => Number(s?.size || (Array.isArray(s?.sizes) ? s.sizes[s.sizes.length - 1] : 0) || 0))
         .reduce((max: number, val: number) => (val > max ? val : max), 0);
       if (largestPhoto > 0) totalSize = largestPhoto;
     }
-    const contentType = isEncrypted ? 'application/octet-stream' : (meta?.mimeType || 'application/octet-stream');
+    const baseMime = isEncrypted ? 'application/octet-stream' : (noteBuffer ? 'text/plain; charset=utf-8' : (meta?.mimeType || 'application/octet-stream'));
+    const contentType = baseMime === 'text/plain' ? 'text/plain; charset=utf-8' : baseMime;
 
     const currentEtag = String(res.getHeader('ETag') || '');
     const effectiveRange = shouldHonorRangeHeader(req.headers, currentEtag) ? req.headers['range'] : undefined;
@@ -513,6 +691,23 @@ async function tgStreamFile(messageId: number, channelId: string, req: any, res:
 
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('X-Accel-Buffering', 'no');
+
+    if (noteBuffer) {
+      if (parsedRange.kind === 'range') {
+        const { start, end, length: chunkSize } = parsedRange;
+        res.status(206);
+        res.setHeader('Content-Range', `bytes ${start}-${end}/${totalSize}`);
+        res.setHeader('Content-Length', String(chunkSize));
+        res.setHeader('Content-Type', contentType);
+        res.end(noteBuffer.subarray(start, end + 1));
+      } else {
+        res.setHeader('Content-Type', contentType);
+        res.setHeader('Content-Length', String(totalSize));
+        res.end(noteBuffer);
+      }
+      recordProviderCall('telegram', 'streamFile', Date.now() - startedAt, true, 0);
+      return;
+    }
 
     if (parsedRange.kind === 'range') {
       const { start, end, length: chunkSize } = parsedRange;
@@ -566,15 +761,34 @@ async function tgStreamFile(messageId: number, channelId: string, req: any, res:
   } catch (err: any) {
     recordProviderCall('telegram', 'streamFile', Date.now() - startedAt, false, 0, err?.code || 'ERROR');
     if (!clientAborted) {
-      console.error('tgStreamFile error:', err);
-      if (!res.headersSent) res.status(500).send('Streaming error');
-      else if (!res.writableEnded) res.destroy(err);
+      if (isTgChannelAccessError(err)) {
+        markTgChannelInaccessible(channelId, err);
+        const friendly = formatTgChannelError(err, channelId);
+        console.warn(`[TG Drive] Channel access error (${channelId}): ${err?.errorMessage || err?.message}`);
+        if (!res.headersSent) {
+          res.status(403).json({ error: friendly, code: 'TG_CHANNEL_ACCESS_DENIED' });
+        } else if (!res.writableEnded) {
+          res.destroy(err);
+        }
+      } else {
+        console.error('tgStreamFile error:', err);
+        if (!res.headersSent) res.status(500).send('Streaming error');
+        else if (!res.writableEnded) res.destroy(err);
+      }
     }
   } finally {
     clearIdle();
     res.off('close', onClose);
     req?.off?.('aborted', onClose);
   }
+}
+
+function formatTgDisplaySize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '-';
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 ** 3) return `${(bytes / (1024 ** 2)).toFixed(1)} MB`;
+  return `${(bytes / (1024 ** 3)).toFixed(2)} GB`;
 }
 
 // Normalise a raw tg_files doc to the standard file shape the frontend expects.
@@ -610,7 +824,7 @@ export function normaliseTgFile(f: any, accountId?: string) {
     };
   }
 
-  const mime = f.mimeType || '';
+  const mime = String(f.mimeType || '').toLowerCase();
   let type   = 'other';
   if (mime.includes('image'))        type = 'image';
   else if (mime.includes('video'))   type = 'video';
@@ -618,11 +832,12 @@ export function normaliseTgFile(f: any, accountId?: string) {
   else if (mime.includes('pdf'))     type = 'pdf';
   else if (mime.includes('zip') || mime.includes('rar') || mime.includes('7z')) type = 'zip';
   else if (mime.includes('spreadsheet') || mime.includes('excel')) type = 'sheet';
-  else if (mime.includes('document') || mime.includes('word'))     type = 'doc';
+  else if (mime.startsWith('text/') || mime.includes('document') || mime.includes('word')) type = 'doc';
   else if (mime.includes('presentation') || mime.includes('powerpoint')) type = 'slide';
 
   const isMedia = type === 'image' || type === 'video';
   const accIdStr = accountId || (f.accountId ? String(f.accountId) : '');
+  const numericSize = f.size ? Number(f.size) : (f.isNote && typeof f.textContent === 'string' ? Buffer.byteLength(f.textContent, 'utf8') : 0);
 
   return {
     id:                      idStr,
@@ -630,8 +845,9 @@ export function normaliseTgFile(f: any, accountId?: string) {
     name:                    f.name,
     type,
     mimeType:                f.mimeType,
-    size:                    f.size ? (Number(f.size) / (1024 ** 2)).toFixed(1) + ' MB' : '-',
-    sizeBytes:               f.size ? Number(f.size) : 0,
+    ...(f.isNote ? { isNote: true } : {}),
+    size:                    formatTgDisplaySize(numericSize),
+    sizeBytes:               numericSize,
     isEncrypted:             false,
     encryptionFormatVersion: null,
     encryptionKeyId:         null,
@@ -680,6 +896,10 @@ async function generateThumbnail(account: any, fileId: string, s: number, thumbP
   try {
     if (account.accountType === 'tgdrive') {
       if (!meta) return null;
+      const cachedChannelAccess = driveCache.get(tgChannelAccessCacheKey(account.channelId)) as { ok: boolean } | undefined;
+      if (cachedChannelAccess && cachedChannelAccess.ok === false) {
+        return null;
+      }
 
       const telegram = await getTgClient();
       const peer = await resolvePeer(telegram, account.channelId);
@@ -784,6 +1004,12 @@ async function generateThumbnail(account: any, fileId: string, s: number, thumbP
       return thumbPath;
     }
   } catch (err) {
+    if (account?.accountType === 'tgdrive' && isTgChannelAccessError(err)) {
+      markTgChannelInaccessible(account.channelId, err);
+      failedThumbCache.set(failKey, 2);
+      console.warn(`[Thumbs] TG channel inaccessible (${account.channelId}): ${(err as any)?.errorMessage || (err as any)?.message}`);
+      return null;
+    }
     failedThumbCache.set(failKey, priorFailCount + 1);
     throw err;
   }
@@ -1577,6 +1803,11 @@ async function findUploadAccount(req: any, accountId: string) {
 
 
 export {
+  isTgChannelAccessError,
+  formatTgChannelError,
+  markTgChannelInaccessible,
+  clearTgChannelAccessCache,
+  checkTgChannelAccess,
   resolvePeer,
   tgClient,
   getTgClient,
