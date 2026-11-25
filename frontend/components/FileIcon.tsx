@@ -13,17 +13,65 @@ import {
 } from 'lucide-react';
 import TelegramIcon from './Icons/TelegramIcon';
 
+function getFileExtensionLabel(file?: any, type?: string): string {
+  const name = String(file?.name || '');
+  const dotIdx = name.lastIndexOf('.');
+  if (dotIdx > 0 && dotIdx < name.length - 1) {
+    const ext = name.slice(dotIdx + 1).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
+    if (ext.length >= 1) return ext;
+  }
+  if (type === 'pdf') return 'PDF';
+  if (type === 'sheet') return 'XLS';
+  if (type === 'doc') return 'DOC';
+  if (type === 'slide') return 'PPT';
+  if (type === 'video') return 'MP4';
+  if (type === 'audio') return 'MP3';
+  if (type === 'zip') return 'ZIP';
+  if (type === 'image') return 'IMG';
+  return 'FILE';
+}
+
+function getBadgeStyleVars(extLabel: string, type: string): { bg: string; fg: string } {
+  if (extLabel === 'PDF' || type === 'pdf') {
+    return { bg: 'var(--cat-media-bg)', fg: 'var(--cat-media-fg)' };
+  }
+  if (extLabel === 'ZIP' || extLabel === 'RAR' || extLabel === '7Z' || extLabel === 'TAR' || extLabel === 'GZ' || type === 'zip') {
+    return { bg: 'var(--cat-zip-bg)', fg: 'var(--cat-zip-fg)' };
+  }
+  if (
+    extLabel === 'DOC' ||
+    extLabel === 'DOCX' ||
+    extLabel === 'TXT' ||
+    extLabel === 'MD' ||
+    extLabel === 'PPT' ||
+    extLabel === 'PPTX' ||
+    type === 'doc' ||
+    type === 'slide'
+  ) {
+    return { bg: 'var(--cat-doc-bg)', fg: 'var(--cat-doc-fg)' };
+  }
+  return { bg: 'var(--cat-other-bg)', fg: 'var(--cat-other-fg)' };
+}
+
+function getRowIconColor(type: string, isTg = false): string {
+  if (type === 'folder') return 'var(--folder-tint)';
+  if (isTg && type === 'other') return 'var(--tt)';
+  if (type === 'video' || type === 'pdf') return 'var(--cat-media-bg)';
+  if (type === 'image') return 'var(--cat-img-bg)';
+  if (type === 'audio' || type === 'sheet') return 'var(--cat-other-bg)';
+  if (type === 'doc' || type === 'slide') return 'var(--cat-doc-bg)';
+  if (type === 'zip') return 'var(--cat-zip-bg)';
+  return 'var(--sub)';
+}
+
 export function getFileTintClasses(type: string, isTg = false): string {
-  if (type === 'folder') return 'bg-[#F59E0B]/12 text-[#D97706] dark:text-[#F59E0B]';
-  if (isTg && type === 'other') return 'bg-[#38BDF8]/12 text-[#0284C7] dark:text-[#38BDF8]';
-  if (type === 'pdf') return 'bg-[#F43F5E]/12 text-[#E11D48] dark:text-[#FB7185]';
-  if (type === 'sheet') return 'bg-[#10B981]/12 text-[#059669] dark:text-[#34D399]';
-  if (type === 'doc') return 'bg-[#3B82F6]/12 text-[#2563EB] dark:text-[#60A5FA]';
-  if (type === 'video') return 'bg-[#A855F7]/12 text-[#9333EA] dark:text-[#C084FC]';
-  if (type === 'zip') return 'bg-[#94A3B8]/15 text-[#475569] dark:text-[#94A3B8]';
-  if (type === 'slide') return 'bg-[#F97316]/12 text-[#EA580C] dark:text-[#FB923C]';
-  if (type === 'image') return 'bg-[#14B8A6]/12 text-[#0D9488] dark:text-[#2DD4BF]';
-  if (type === 'audio') return 'bg-[#EC4899]/12 text-[#DB2777] dark:text-[#F472B6]';
+  if (type === 'folder') return 'bg-[var(--hover)] text-[var(--folder-tint)]';
+  if (isTg && type === 'other') return 'bg-[var(--hover)] text-[var(--tt)]';
+  if (type === 'pdf' || type === 'video') return 'bg-[var(--hover)] text-[var(--cat-media-bg)]';
+  if (type === 'image') return 'bg-[var(--hover)] text-[var(--cat-img-bg)]';
+  if (type === 'audio' || type === 'sheet') return 'bg-[var(--hover)] text-[var(--cat-other-bg)]';
+  if (type === 'doc' || type === 'slide') return 'bg-[var(--hover)] text-[var(--cat-doc-bg)]';
+  if (type === 'zip') return 'bg-[var(--hover)] text-[var(--cat-zip-bg)]';
   return 'bg-[var(--hover)] text-[var(--sub)]';
 }
 
@@ -41,24 +89,6 @@ export function renderFileTypeGlyph(type: string, iconSize: number, isTg = false
   return <FileIconLucide size={iconSize} />;
 }
 
-function getFileExtensionLabel(file?: any, type?: string): string {
-  const name = String(file?.name || '');
-  const dotIdx = name.lastIndexOf('.');
-  if (dotIdx > 0 && dotIdx < name.length - 1) {
-    const ext = name.slice(dotIdx + 1).toUpperCase().replace(/[^A-Z0-9]/g, '');
-    if (ext.length >= 2 && ext.length <= 5) return ext;
-  }
-  if (type === 'pdf') return 'PDF';
-  if (type === 'sheet') return 'SHEET';
-  if (type === 'doc') return 'DOC';
-  if (type === 'slide') return 'SLIDE';
-  if (type === 'video') return 'VIDEO';
-  if (type === 'audio') return 'AUDIO';
-  if (type === 'zip') return 'ZIP';
-  if (type === 'image') return 'IMG';
-  return '';
-}
-
 export default function FileIcon({
   file,
   type,
@@ -69,7 +99,7 @@ export default function FileIcon({
 }: {
   file?: any;
   type: string;
-  size?: 'sm' | 'lg' | 'card';
+  size?: 'sm' | 'row' | 'lg' | 'card';
   isTg?: boolean;
   accountId?: string | null;
   showThumbnails?: boolean;
@@ -80,24 +110,86 @@ export default function FileIcon({
     setImgFailed(false);
   }, [file?.id, accountId]);
 
-  const iconSize = size === 'card' ? 36 : size === 'lg' ? 36 : 19;
-  const containerClass =
-    size === 'card'
-      ? 'w-full h-[124px]'
-      : size === 'lg'
-      ? 'w-20 h-20 rounded-2xl'
-      : 'w-9 h-9 rounded-xl';
-  const tintClass = getFileTintClasses(type, isTg);
   const extLabel = getFileExtensionLabel(file, type);
+  const badgeVars = getBadgeStyleVars(extLabel, type);
+  const iconColor = getRowIconColor(type, isTg);
+
+  // Full-bleed Android FileGridItem / FolderGridItem top preview area
+  if (size === 'card') {
+    if (file?.type === 'image' && accountId && showThumbnails && !imgFailed) {
+      const token = localStorage.getItem('cloudyte_token');
+      const url = `/api/download/${accountId}/${file.id}?preview=1&token=${token}`;
+      return (
+        <div className="w-full h-full overflow-hidden bg-[var(--hover)]/50 relative flex items-center justify-center">
+          <img
+            src={url}
+            alt={file.name}
+            referrerPolicy="no-referrer"
+            className="w-full h-full object-cover"
+            loading="lazy"
+            onError={() => setImgFailed(true)}
+          />
+        </div>
+      );
+    }
+
+    if (type === 'folder') {
+      return (
+        <div className="w-full h-full flex items-center justify-center select-none" style={{ color: 'var(--folder-tint)' }}>
+          <Folder size={52} fill="currentColor" strokeWidth={1.6} />
+        </div>
+      );
+    }
+
+    if (type === 'video') {
+      return (
+        <div className="w-full h-full bg-[var(--hover)]/55 relative flex items-center justify-center select-none">
+          <span style={{ color: 'var(--cat-media-bg)' }}>
+            <Video size={42} strokeWidth={1.7} />
+          </span>
+          <span className="absolute w-10 h-10 rounded-full bg-black/55 text-white flex items-center justify-center shadow-sm">
+            <Play size={18} fill="currentColor" className="ml-0.5" />
+          </span>
+        </div>
+      );
+    }
+
+    if (type === 'image') {
+      return (
+        <div className="w-full h-full bg-[var(--hover)]/45 flex items-center justify-center select-none" style={{ color: 'var(--cat-img-bg)' }}>
+          <ImageIcon size={44} strokeWidth={1.7} />
+        </div>
+      );
+    }
+
+    // Android FileThumb non-media grid card: centered bold colored extension pill (PDF, ZIP, DOC, APK, TXT, etc.)
+    return (
+      <div className="w-full h-full flex items-center justify-center select-none">
+        <span
+          className="px-3.5 py-1.5 rounded-xl text-[13px] font-extrabold tracking-wide uppercase shadow-xs"
+          style={{ backgroundColor: badgeVars.bg, color: badgeVars.fg }}
+        >
+          {extLabel}
+        </span>
+      </div>
+    );
+  }
+
+  // Standard thumbnail / row / detail sizes (Android FileThumb rounded-xl box)
+  const iconSize = size === 'lg' ? 38 : size === 'row' ? 22 : 20;
+  const containerClass =
+    size === 'lg'
+      ? 'w-20 h-20 rounded-2xl'
+      : size === 'row'
+      ? 'w-11 h-11 rounded-xl'
+      : 'w-9 h-9 rounded-xl';
 
   if (file?.type === 'image' && accountId && showThumbnails && !imgFailed) {
     const token = localStorage.getItem('cloudyte_token');
     const url = `/api/download/${accountId}/${file.id}?preview=1&token=${token}`;
     return (
       <div
-        className={`${containerClass} shrink-0 overflow-hidden bg-[var(--hover)] relative flex items-center justify-center ${
-          size === 'card' ? '' : 'border border-[var(--bd)]/70'
-        }`}
+        className={`${containerClass} shrink-0 overflow-hidden bg-[var(--hover)] relative flex items-center justify-center`}
       >
         <img
           src={url}
@@ -111,32 +203,11 @@ export default function FileIcon({
     );
   }
 
-  if (size === 'card') {
-    return (
-      <div
-        className={`${containerClass} ${tintClass} relative flex flex-col items-center justify-center shrink-0 transition-colors select-none overflow-hidden`}
-      >
-        {/* Subtle document sheet motif */}
-        <div className="w-16 h-20 rounded-xl bg-[var(--sf)]/85 dark:bg-[var(--sf)]/65 border border-[var(--bd)]/70 shadow-xs flex flex-col items-center justify-center gap-1.5 relative">
-          {type === 'video' ? (
-            <span className="w-9 h-9 rounded-full bg-[#9333EA]/15 text-[#9333EA] dark:text-[#C084FC] flex items-center justify-center">
-              <Play size={16} fill="currentColor" className="ml-0.5" />
-            </span>
-          ) : (
-            renderFileTypeGlyph(type, 26, isTg)
-          )}
-          {extLabel && (
-            <span className="text-[10px] font-mono font-semibold tracking-wider text-[var(--sub)]">
-              {extLabel}
-            </span>
-          )}
-        </div>
-      </div>
-    );
-  }
-
   return (
-    <div className={`${containerClass} ${tintClass} flex items-center justify-center shrink-0 transition-colors`}>
+    <div
+      className={`${containerClass} bg-[var(--hover)]/80 flex items-center justify-center shrink-0 transition-colors`}
+      style={{ color: iconColor }}
+    >
       {renderFileTypeGlyph(type, iconSize, isTg)}
     </div>
   );

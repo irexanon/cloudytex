@@ -41,6 +41,9 @@ export default function App() {
     const saved = localStorage.getItem('cloudyte_theme');
     return saved === 'dark' || (!saved && window.matchMedia('(prefers-color-scheme: dark)').matches);
   });
+  const [colorTheme, setColorTheme] = useState<'default' | 'noir'>(() => {
+    return localStorage.getItem('cloudyte_color_theme') === 'noir' ? 'noir' : 'default';
+  });
   const [authToken, setAuthToken]   = useState<string | null>(() => localStorage.getItem('cloudyte_token'));
   const [tokenType, setTokenType]   = useState<string>(() => localStorage.getItem('cloudyte_token_type') || 'Bearer');
   const [username, setUsername]     = useState<string | null>(() => {
@@ -53,6 +56,8 @@ export default function App() {
   const [isInitializing, setIsInitializing] = useState(true);
   const [userProfile, setUserProfile]     = useState<any>(null);
   const [loading, setLoading]             = useState(false);
+  const [hasLoadedAccounts, setHasLoadedAccounts] = useState(false);
+  const [hasLoadedFiles, setHasLoadedFiles]       = useState(false);
   const [accounts, setAccounts]           = useState<any[]>([]);
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(initialRoute.accountId);
   const [files, setFiles]                 = useState<any[]>([]);
@@ -114,6 +119,7 @@ export default function App() {
   const [uploadMenuAnchor, setUploadMenuAnchor] = useState<'toolbar' | 'mobile' | null>(null);
   const [isBreadcrumbMenuOpen, setIsBreadcrumbMenuOpen] = useState(false);
   const [isMobileFolderMenuOpen, setIsMobileFolderMenuOpen] = useState(false);
+  const [isThemeMenuOpen, setIsThemeMenuOpen] = useState(false);
   const fileUploadInputRef = useRef<HTMLInputElement | null>(null);
   const folderUploadInputRef = useRef<HTMLInputElement | null>(null);
   const uploadControlRef = useRef<{
@@ -329,8 +335,18 @@ export default function App() {
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', isDarkMode);
+    document.documentElement.classList.toggle('noir', colorTheme === 'noir');
     localStorage.setItem('cloudyte_theme', isDarkMode ? 'dark' : 'light');
-  }, [isDarkMode]);
+    localStorage.setItem('cloudyte_color_theme', colorTheme);
+    const metaTheme = document.querySelector('meta[name="theme-color"]');
+    if (metaTheme) {
+      const themeHex =
+        colorTheme === 'noir'
+          ? isDarkMode ? '#0a0a0a' : '#e8ecf1'
+          : isDarkMode ? '#060918' : '#edf1f7';
+      metaTheme.setAttribute('content', themeHex);
+    }
+  }, [isDarkMode, colorTheme]);
 
   useEffect(() => {
     const fetchPlatformSettings = async () => {
@@ -413,7 +429,14 @@ export default function App() {
           );
         }
       }
-    } catch { /* ignore */ } finally { setLoading(false); clearTimeout(tId); }
+      if (list.length === 0) {
+        setHasLoadedFiles(true);
+      }
+    } catch { /* ignore */ } finally {
+      setHasLoadedAccounts(true);
+      setLoading(false);
+      clearTimeout(tId);
+    }
   }, [getAuthHeaders, selectedAccountId, isAuthenticated, syncUrl]);
 
   const fetchFiles = useCallback(async (accId: string, foldId: string | null, search?: string, trashMode = isTrashView) => {
@@ -448,7 +471,10 @@ export default function App() {
       setFiles(Array.isArray(data) ? data : []);
     } catch (err: any) {
       showToast(err?.message || 'Could not load files', 'error');
-    } finally { setLoading(false); }
+    } finally {
+      setHasLoadedFiles(true);
+      setLoading(false);
+    }
   }, [getAuthHeaders, isTrashView, showToast]);
 
   useEffect(() => { fetchAccounts(); }, [fetchAccounts]);
@@ -522,6 +548,12 @@ export default function App() {
   const selectAccount = (id: string, openTrash = false) => {
     const acc = accounts.find(a => a.id === id);
     const nextPath: BreadcrumbItem[] = [{ id: null, name: acc?.accountType === 'tgdrive' ? `📡 TG Drive` : 'My Drive' }];
+    const willRefetch = id !== selectedAccountId || openTrash !== isTrashView || currentFolderId !== null || debouncedSearch !== '';
+    if (willRefetch) {
+      setFiles([]);
+      setLoading(true);
+      setHasLoadedFiles(false);
+    }
     setSelectedAccountId(id);
     setIsTrashView(openTrash);
     setCurrentFolderId(null);
@@ -554,6 +586,11 @@ export default function App() {
   const toggleTrashView = (nextState?: boolean) => {
     const onAnotherPage = isSettingsOpen || isJobsDrawerOpen || isAdminPanelOpen;
     const target = typeof nextState === 'boolean' ? nextState : (onAnotherPage ? true : !isTrashView);
+    if (target !== isTrashView) {
+      setFiles([]);
+      setLoading(true);
+      setHasLoadedFiles(false);
+    }
     setIsSettingsOpen(false);
     setIsJobsDrawerOpen(false);
     setIsAdminPanelOpen(false);
@@ -1906,6 +1943,7 @@ export default function App() {
     // TG Drive folders use path strings prefixed with "folder:"
     const folderId = folder.id.startsWith('folder:') ? folder.id.replace('folder:', '') : folder.id;
     const nextPath = [...path, { id: folderId, name: folder.name }];
+    setLoading(true);
     setCurrentFolderId(folderId);
     setPath(nextPath);
     setSearchQuery('');
@@ -1929,6 +1967,7 @@ export default function App() {
   };
 
   const navigateUp = (index: number) => {
+    setLoading(true);
     setIsTrashView(false);
     const newPath = path.slice(0, index + 1);
     const nextFolderId = newPath[newPath.length - 1].id;
@@ -2355,6 +2394,7 @@ export default function App() {
         if (isSortMenuOpen) { setIsSortMenuOpen(false); return; }
         if (isBreadcrumbMenuOpen) { setIsBreadcrumbMenuOpen(false); return; }
         if (isMobileFolderMenuOpen) { setIsMobileFolderMenuOpen(false); return; }
+        if (isThemeMenuOpen) { setIsThemeMenuOpen(false); return; }
         if (uploadMenuAnchor) { setUploadMenuAnchor(null); return; }
         if (selectedFile) { openFileInspector(null); return; }
         if (selectedFileIds.size > 0) { setSelectedFileIds(new Set()); return; }
@@ -2428,6 +2468,7 @@ export default function App() {
     isSortMenuOpen,
     isBreadcrumbMenuOpen,
     isMobileFolderMenuOpen,
+    isThemeMenuOpen,
     uploadMenuAnchor,
     selectedFile,
     openFileInspector,
@@ -2467,7 +2508,7 @@ export default function App() {
   if (isInitializing || (isAuthenticated && !userProfile)) {
     return (
       <div className="min-h-screen bg-[var(--bg)] text-[var(--tx)] flex flex-col items-center justify-center gap-4">
-        <div className="w-12 h-12 rounded-2xl bg-[#2563EB] text-white flex items-center justify-center animate-pulse shadow-lg shadow-blue-600/30">
+        <div className="w-12 h-12 rounded-2xl bg-[var(--primary)] text-[var(--on-primary)] flex items-center justify-center animate-pulse shadow-lg shadow-blue-600/30">
           <Cloud size={26} />
         </div>
         <p className="text-[var(--sub)] font-semibold text-sm">Initializing Cloudyte...</p>
@@ -2495,7 +2536,7 @@ export default function App() {
 
         <div className="w-full max-w-[400px] bg-[var(--sf)] border border-[var(--bd)] rounded-[28px] p-8 shadow-sm">
           <div className="flex flex-col items-center text-center mb-7">
-            <div className="w-12 h-12 rounded-2xl bg-[#2563EB] text-white flex items-center justify-center shadow-md shadow-blue-600/20 mb-4">
+            <div className="w-12 h-12 rounded-2xl bg-[var(--primary)] text-[var(--on-primary)] flex items-center justify-center shadow-md shadow-black/20 mb-4">
               <Cloud size={24} fill="currentColor" />
             </div>
             <h1 className="text-2xl font-bold text-[var(--tx)] tracking-tight">
@@ -2515,7 +2556,7 @@ export default function App() {
                 placeholder="Enter username"
                 required
                 autoComplete="username"
-                className="w-full h-11 px-4 bg-[var(--bg)] border border-[var(--bd)] focus:border-[#2563EB] rounded-xl outline-none transition-colors text-sm font-medium text-[var(--tx)] placeholder:text-[var(--sub)]/70"
+                className="w-full h-11 px-4 bg-[var(--bg)] border border-[var(--bd)] focus:border-[var(--primary)] rounded-xl outline-none transition-colors text-sm font-medium text-[var(--tx)] placeholder:text-[var(--sub)]/70"
               />
             </div>
             <div className="space-y-1.5">
@@ -2526,7 +2567,7 @@ export default function App() {
                 placeholder="Enter password"
                 required
                 autoComplete={isRegisterMode ? 'new-password' : 'current-password'}
-                className="w-full h-11 px-4 bg-[var(--bg)] border border-[var(--bd)] focus:border-[#2563EB] rounded-xl outline-none transition-colors text-sm font-medium text-[var(--tx)] placeholder:text-[var(--sub)]/70"
+                className="w-full h-11 px-4 bg-[var(--bg)] border border-[var(--bd)] focus:border-[var(--primary)] rounded-xl outline-none transition-colors text-sm font-medium text-[var(--tx)] placeholder:text-[var(--sub)]/70"
               />
             </div>
             {isRegisterMode && (
@@ -2538,7 +2579,7 @@ export default function App() {
                   placeholder="Re-enter password"
                   required
                   autoComplete="new-password"
-                  className="w-full h-11 px-4 bg-[var(--bg)] border border-[var(--bd)] focus:border-[#2563EB] rounded-xl outline-none transition-colors text-sm font-medium text-[var(--tx)] placeholder:text-[var(--sub)]/70"
+                  className="w-full h-11 px-4 bg-[var(--bg)] border border-[var(--bd)] focus:border-[var(--primary)] rounded-xl outline-none transition-colors text-sm font-medium text-[var(--tx)] placeholder:text-[var(--sub)]/70"
                 />
               </div>
             )}
@@ -2551,7 +2592,7 @@ export default function App() {
 
             <button
               disabled={isLoggingIn}
-              className="w-full h-11 bg-[#2563EB] hover:bg-blue-700 text-white rounded-xl font-semibold text-sm transition-colors active:scale-[0.99] flex items-center justify-center gap-2 disabled:opacity-50 mt-2"
+              className="w-full h-11 bg-[var(--primary)] hover:bg-[var(--primary-hover)] text-[var(--on-primary)] rounded-xl font-semibold text-sm transition-colors active:scale-[0.99] flex items-center justify-center gap-2 disabled:opacity-50 mt-2"
             >
               {isLoggingIn ? (
                 <><RefreshCw size={16} className="animate-spin" /><span>{isRegisterMode ? 'Creating account...' : 'Signing in...'}</span></>
@@ -2575,7 +2616,7 @@ export default function App() {
                   setLoginError(null);
                   window.history.pushState(null, '', '/login');
                 }}
-                className="text-xs font-semibold text-[#2563EB] dark:text-[#60A5FA] hover:underline"
+                className="text-xs font-semibold text-[var(--primary)] dark:text-[var(--primary-accent)] hover:underline"
               >
                 Already have an account? Sign in
               </button>
@@ -2587,7 +2628,7 @@ export default function App() {
                   setLoginError(null);
                   window.history.pushState(null, '', '/register');
                 }}
-                className="text-xs font-semibold text-[#2563EB] dark:text-[#60A5FA] hover:underline"
+                className="text-xs font-semibold text-[var(--primary)] dark:text-[var(--primary-accent)] hover:underline"
               >
                 New here? Create an account
               </button>
@@ -2598,7 +2639,7 @@ export default function App() {
                 </p>
                 {regSettings?.botRegistrationEnabled !== false && !isRegDisabled && (
                   <p className="text-xs text-[var(--sub)]">
-                    Use <span className="font-mono text-[#2563EB] dark:text-[#60A5FA]">/register</span> in the Telegram bot.
+                    Use <span className="font-mono text-[var(--primary)] dark:text-[var(--primary-accent)]">/register</span> in the Telegram bot.
                   </p>
                 )}
               </div>
@@ -2661,7 +2702,22 @@ export default function App() {
       </div>
 
       <div className="flex-1 overflow-y-auto p-2 space-y-1.5 no-scrollbar">
-        {accounts.length === 0 ? (
+        {!hasLoadedAccounts ? (
+          <div className="space-y-2 pt-0.5">
+            {[...Array(3)].map((_, i) => (
+              <div key={i} className="rounded-[14px] p-2.5 bg-[var(--sf)] border border-[var(--bd)]/60 space-y-2 animate-pulse">
+                <div className="flex items-center gap-2">
+                  <div className="w-6 h-6 rounded-lg bg-[var(--hover)] shrink-0" />
+                  <div className="flex-1 space-y-1">
+                    <div className="h-3 w-24 rounded bg-[var(--hover)]" />
+                    <div className="h-2 w-16 rounded bg-[var(--hover)]" />
+                  </div>
+                </div>
+                <div className="h-1.5 w-full rounded-full bg-[var(--hover)]" />
+              </div>
+            ))}
+          </div>
+        ) : accounts.length === 0 ? (
           <div className="p-4 rounded-[18px] bg-[var(--sf)] border border-[var(--bd)] text-center space-y-2.5 mt-1">
             <p className="text-xs font-bold text-[var(--tx)]">No drives linked</p>
             <p className="text-[11px] text-[var(--sub)]">Connect Google Drive, OneDrive, or Telegram.</p>
@@ -2671,7 +2727,7 @@ export default function App() {
                 setLinkProviderModal(true);
                 syncUrl({ modal: 'link-account' });
               }}
-              className="w-full h-8 rounded-xl bg-[#2563EB] text-white text-xs font-bold hover:opacity-90 transition-opacity"
+              className="w-full h-8 rounded-xl bg-[var(--primary)] text-[var(--on-primary)] text-xs font-bold hover:opacity-90 transition-opacity"
             >
               Link Account
             </button>
@@ -2686,12 +2742,12 @@ export default function App() {
 
             const strokeColor =
               acc.accountType === 'tgdrive'
-                ? '#0EA5E9'
+                ? 'var(--tt)'
                 : pct > 90
-                ? '#F43F5E'
+                ? 'var(--error)'
                 : pct > 70
-                ? '#F59E0B'
-                : '#3B82F6';
+                ? '#F5B72E'
+                : 'var(--primary)';
 
             const clipId = `drive-wave-${String(acc.id || idx).replace(/[^a-zA-Z0-9_-]/g, '')}-${idx}`;
             const waveWidth = 180;
@@ -2708,7 +2764,7 @@ export default function App() {
                 title={acc.email || displayName}
                 className={`group rounded-[14px] px-2.5 py-2 border cursor-pointer transition-colors duration-150 ${
                   isSelected
-                    ? 'bg-[var(--sel)] border-[#2563EB]'
+                    ? 'bg-[var(--sel)] border-[var(--primary)]'
                     : 'bg-[var(--sf)] border-[var(--bd)] hover:border-[var(--sub)]/40'
                 }`}
               >
@@ -2725,7 +2781,7 @@ export default function App() {
                         </span>
                       )}
                       {acc.id === userSettings?.backupAccId && (
-                        <span className="text-[8.5px] font-extrabold uppercase tracking-wider bg-[#2563EB] text-white rounded px-1 py-[1px] leading-tight shrink-0">
+                        <span className="text-[8.5px] font-extrabold uppercase tracking-wider bg-[var(--primary)] text-[var(--on-primary)] rounded px-1 py-[1px] leading-tight shrink-0">
                           Backup
                         </span>
                       )}
@@ -2810,9 +2866,9 @@ export default function App() {
                 setIsSettingsOpen(true);
                 syncUrl({ page: 'settings', settingsTab: 'general' });
               }}
-              className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--sf)] transition-colors"
+              className="group w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--rail-hover-bg)] hover:text-[var(--rail-hover-fg)] transition-colors"
             >
-              <Settings size={16} className="text-[var(--sub)]" />
+              <Settings size={16} className="text-[var(--sub)] group-hover:text-[var(--rail-hover-fg)] transition-colors" />
               <span>Settings</span>
             </button>
           </div>
@@ -2850,13 +2906,13 @@ export default function App() {
       {/* Desktop / Tablet Navigation Rail + Extendable Drives Sidebar */}
       <aside
         className={`hidden md:flex shrink-0 bg-[var(--rail)] border-r border-[var(--bd)] transition-[width] duration-200 ease-out overflow-hidden z-40 ${
-          isDrivesExpanded ? 'w-[272px]' : 'w-24'
+          isDrivesExpanded ? 'w-[276px]' : 'w-24'
         }`}
       >
-        {/* Navigation Rail (96px default, compact 60px when Drives panel is expanded) */}
+        {/* Navigation Rail (96px default, compact 64px when Drives panel is expanded) */}
         <nav
           className={`shrink-0 py-5 flex flex-col items-center h-full select-none transition-[width,gap] duration-200 ease-out ${
-            isDrivesExpanded ? 'w-[60px] gap-2' : 'w-24 gap-2.5'
+            isDrivesExpanded ? 'w-[64px] gap-2' : 'w-24 gap-2.5'
           }`}
         >
           <div
@@ -2871,14 +2927,14 @@ export default function App() {
             className="flex flex-col items-center gap-1.5 cursor-pointer"
           >
             <span
-              className={`rounded-2xl bg-[#2563EB] text-white flex items-center justify-center shadow-lg shadow-blue-600/25 transition-all duration-200 ${
+              className={`rounded-2xl bg-[var(--primary)] text-[var(--on-primary)] flex items-center justify-center shadow-lg shadow-black/20 transition-all duration-200 ${
                 isDrivesExpanded ? 'w-10 h-10 rounded-[14px]' : 'w-12 h-12'
               }`}
             >
-              <Cloud size={isDrivesExpanded ? 20 : 24} fill="currentColor" />
+              <Cloud size={isDrivesExpanded ? 21 : 25} fill="currentColor" />
             </span>
             {!isDrivesExpanded && (
-              <span className="text-[11px] font-black tracking-tight text-[var(--tx)]">Cloudyte</span>
+              <span className="text-xs font-black tracking-tight text-[var(--tx)]">Cloudyte</span>
             )}
           </div>
 
@@ -2905,20 +2961,16 @@ export default function App() {
               if (isTrashView) toggleTrashView(false);
               else syncUrl({ page: 'drive' });
             }}
-            className={`flex flex-col items-center gap-0.5 transition-all duration-200 ${
-              isDrivesExpanded ? 'w-12 text-[9.5px]' : 'w-20 text-xs gap-1'
+            className={`flex flex-col items-center justify-center rounded-xl transition-all duration-150 ${
+              isDrivesExpanded ? 'w-[54px] py-2 gap-1 text-[10.5px]' : 'w-[74px] py-2.5 gap-1.5 text-[12px]'
             } ${
-              activeNavTab === 'files' ? 'text-[var(--tx)] font-extrabold' : 'text-[var(--sub)] font-semibold hover:text-[var(--tx)]'
+              activeNavTab === 'files'
+                ? 'bg-[var(--rail-hover-bg)] text-[var(--rail-hover-fg)] font-bold shadow-xs'
+                : 'text-[var(--sub)] font-semibold hover:bg-[var(--rail-hover-bg)] hover:text-[var(--rail-hover-fg)]'
             }`}
           >
-            <span
-              className={`rounded-2xl flex items-center justify-center transition-all duration-200 ${
-                isDrivesExpanded ? 'w-10 h-7 rounded-xl' : 'w-14 h-8'
-              } ${activeNavTab === 'files' ? 'bg-[var(--pi)] text-[var(--pit)]' : ''}`}
-            >
-              <Folder size={isDrivesExpanded ? 17 : 20} fill={activeNavTab === 'files' ? 'currentColor' : 'none'} />
-            </span>
-            <span>Files</span>
+            <Folder size={isDrivesExpanded ? 19 : 21} fill={activeNavTab === 'files' ? 'currentColor' : 'none'} />
+            <span className="leading-none">Files</span>
           </button>
 
           <button
@@ -2927,20 +2979,16 @@ export default function App() {
             onClick={() => {
               toggleTrashView();
             }}
-            className={`flex flex-col items-center gap-0.5 transition-all duration-200 ${
-              isDrivesExpanded ? 'w-12 text-[9.5px]' : 'w-20 text-xs gap-1'
+            className={`flex flex-col items-center justify-center rounded-xl transition-all duration-150 ${
+              isDrivesExpanded ? 'w-[54px] py-2 gap-1 text-[10.5px]' : 'w-[74px] py-2.5 gap-1.5 text-[12px]'
             } ${
-              activeNavTab === 'trash' ? 'text-[var(--tx)] font-extrabold' : 'text-[var(--sub)] font-semibold hover:text-[var(--tx)]'
+              activeNavTab === 'trash'
+                ? 'bg-[var(--rail-hover-bg)] text-[var(--rail-hover-fg)] font-bold shadow-xs'
+                : 'text-[var(--sub)] font-semibold hover:bg-[var(--rail-hover-bg)] hover:text-[var(--rail-hover-fg)]'
             }`}
           >
-            <span
-              className={`rounded-2xl flex items-center justify-center transition-all duration-200 ${
-                isDrivesExpanded ? 'w-10 h-7 rounded-xl' : 'w-14 h-8'
-              } ${activeNavTab === 'trash' ? 'bg-[var(--pi)] text-[var(--pit)]' : ''}`}
-            >
-              <Trash2 size={isDrivesExpanded ? 17 : 20} />
-            </span>
-            <span>Trash</span>
+            <Trash2 size={isDrivesExpanded ? 19 : 21} />
+            <span className="leading-none">Trash</span>
           </button>
 
           <button
@@ -2952,20 +3000,16 @@ export default function App() {
               setIsJobsDrawerOpen(true);
               syncUrl({ page: 'jobs' });
             }}
-            className={`flex flex-col items-center gap-0.5 transition-all duration-200 relative ${
-              isDrivesExpanded ? 'w-12 text-[9.5px]' : 'w-20 text-xs gap-1'
+            className={`flex flex-col items-center justify-center rounded-xl transition-all duration-150 relative ${
+              isDrivesExpanded ? 'w-[54px] py-2 gap-1 text-[10.5px]' : 'w-[74px] py-2.5 gap-1.5 text-[12px]'
             } ${
-              activeNavTab === 'transfers' ? 'text-[var(--tx)] font-extrabold' : 'text-[var(--sub)] font-semibold hover:text-[var(--tx)]'
+              activeNavTab === 'transfers'
+                ? 'bg-[var(--rail-hover-bg)] text-[var(--rail-hover-fg)] font-bold shadow-xs'
+                : 'text-[var(--sub)] font-semibold hover:bg-[var(--rail-hover-bg)] hover:text-[var(--rail-hover-fg)]'
             }`}
           >
-            <span
-              className={`rounded-2xl flex items-center justify-center transition-all duration-200 ${
-                isDrivesExpanded ? 'w-10 h-7 rounded-xl' : 'w-14 h-8'
-              } ${activeNavTab === 'transfers' ? 'bg-[var(--pi)] text-[var(--pit)]' : ''}`}
-            >
-              <ArrowLeftRight size={isDrivesExpanded ? 17 : 20} />
-            </span>
-            <span>Transfers</span>
+            <ArrowLeftRight size={isDrivesExpanded ? 19 : 21} />
+            <span className="leading-none">Transfers</span>
           </button>
 
           <button
@@ -2973,24 +3017,20 @@ export default function App() {
             title="Drives"
             onClick={() => setIsDrivesExpanded(prev => !prev)}
             aria-expanded={isDrivesExpanded}
-            className={`flex flex-col items-center gap-0.5 transition-all duration-200 ${
-              isDrivesExpanded ? 'w-12 text-[9.5px]' : 'w-20 text-xs gap-1'
+            className={`flex flex-col items-center justify-center rounded-xl transition-all duration-150 ${
+              isDrivesExpanded ? 'w-[54px] py-2 gap-1 text-[10.5px]' : 'w-[74px] py-2.5 gap-1.5 text-[12px]'
             } ${
-              activeNavTab === 'drives' ? 'text-[var(--tx)] font-extrabold' : 'text-[var(--sub)] font-semibold hover:text-[var(--tx)]'
+              activeNavTab === 'drives'
+                ? 'bg-[var(--rail-hover-bg)] text-[var(--rail-hover-fg)] font-bold shadow-xs'
+                : 'text-[var(--sub)] font-semibold hover:bg-[var(--rail-hover-bg)] hover:text-[var(--rail-hover-fg)]'
             }`}
           >
-            <span
-              className={`rounded-2xl flex items-center justify-center transition-all duration-200 ${
-                isDrivesExpanded ? 'w-10 h-7 rounded-xl' : 'w-14 h-8'
-              } ${activeNavTab === 'drives' ? 'bg-[var(--pi)] text-[var(--pit)]' : ''}`}
-            >
-              <Cloud size={isDrivesExpanded ? 17 : 20} fill={activeNavTab === 'drives' ? 'currentColor' : 'none'} />
-            </span>
-            <span>Drives</span>
+            <Cloud size={isDrivesExpanded ? 19 : 21} fill={activeNavTab === 'drives' ? 'currentColor' : 'none'} />
+            <span className="leading-none">Drives</span>
           </button>
 
           {/* Bottom Rail Items */}
-          <div className="mt-auto flex flex-col items-center gap-2.5 w-full">
+          <div className="mt-auto flex flex-col items-center gap-2 w-full">
             <button
               type="button"
               title="Settings"
@@ -3001,24 +3041,16 @@ export default function App() {
                 setIsSettingsOpen(true);
                 syncUrl({ page: 'settings', settingsTab: 'general' });
               }}
-              className={`flex flex-col items-center gap-0.5 transition-all duration-200 ${
-                isDrivesExpanded ? 'w-12 text-[9.5px]' : 'w-20 text-xs gap-1'
+              className={`flex flex-col items-center justify-center rounded-xl transition-all duration-150 ${
+                isDrivesExpanded ? 'w-[54px] py-2 gap-1 text-[10.5px]' : 'w-[74px] py-2.5 gap-1.5 text-[12px]'
               } ${
                 activeNavTab === 'settings' || activeNavTab === 'admin'
-                  ? 'text-[var(--tx)] font-extrabold'
-                  : 'text-[var(--sub)] font-semibold hover:text-[var(--tx)]'
+                  ? 'bg-[var(--rail-hover-bg)] text-[var(--rail-hover-fg)] font-bold shadow-xs'
+                  : 'text-[var(--sub)] font-semibold hover:bg-[var(--rail-hover-bg)] hover:text-[var(--rail-hover-fg)]'
               }`}
             >
-              <span
-                className={`rounded-2xl flex items-center justify-center transition-all duration-200 ${
-                  isDrivesExpanded ? 'w-10 h-7 rounded-xl' : 'w-14 h-8'
-                } ${
-                  activeNavTab === 'settings' || activeNavTab === 'admin' ? 'bg-[var(--pi)] text-[var(--pit)]' : ''
-                }`}
-              >
-                <Settings size={isDrivesExpanded ? 17 : 20} />
-              </span>
-              <span>Settings</span>
+              <Settings size={isDrivesExpanded ? 19 : 21} />
+              <span className="leading-none">Settings</span>
             </button>
           </div>
         </nav>
@@ -3040,9 +3072,9 @@ export default function App() {
         onDrop={handleDrop}
       >
         {isDragging && !isSettingsOpen && !isJobsDrawerOpen && !isAdminPanelOpen && (
-          <div className="absolute inset-0 z-50 bg-[#2563EB]/[0.06] ring-2 ring-inset ring-[#2563EB]/45 backdrop-blur-[1.5px] pointer-events-none flex items-end justify-center pb-10 px-4">
-            <div className="bg-[var(--sf)] border border-[#2563EB]/40 rounded-2xl shadow-xl px-5 py-3.5 flex items-center gap-3.5 max-w-md">
-              <span className="w-10 h-10 rounded-xl bg-[#2563EB]/12 text-[#2563EB] flex items-center justify-center shrink-0">
+          <div className="absolute inset-0 z-50 bg-[var(--primary)]/[0.06] ring-2 ring-inset ring-[var(--primary)]/45 backdrop-blur-[1.5px] pointer-events-none flex items-end justify-center pb-10 px-4">
+            <div className="bg-[var(--sf)] border border-[var(--primary)]/40 rounded-2xl shadow-xl px-5 py-3.5 flex items-center gap-3.5 max-w-md">
+              <span className="w-10 h-10 rounded-xl bg-[var(--primary)]/12 text-[var(--primary)] flex items-center justify-center shrink-0">
                 <UploadCloud size={20} />
               </span>
               <div className="min-w-0">
@@ -3094,7 +3126,7 @@ export default function App() {
             </button>
           ) : (
             <div className="md:hidden flex items-center gap-2">
-              <span className="w-8 h-8 rounded-xl bg-[#2563EB] text-white flex items-center justify-center">
+              <span className="w-8 h-8 rounded-xl bg-[var(--primary)] text-[var(--on-primary)] flex items-center justify-center">
                 <Cloud size={16} fill="currentColor" />
               </span>
               <span className="text-sm font-semibold text-[var(--tx)]">
@@ -3112,7 +3144,7 @@ export default function App() {
                   onClick={() => setIsDrivesExpanded(prev => !prev)}
                   className={`h-11 pl-2 pr-3 rounded-2xl border flex items-center gap-2 text-[13px] font-semibold transition-colors max-w-[220px] shrink-0 ${
                     isDrivesExpanded
-                      ? 'bg-[var(--sel)] border-[#2563EB]/40 text-[var(--tx)]'
+                      ? 'bg-[var(--sel)] border-[var(--primary)]/40 text-[var(--tx)]'
                       : 'bg-[var(--sf)] border-[var(--bd)] text-[var(--tx)] hover:bg-[var(--hover)]'
                   }`}
                   title="Switch connected drive"
@@ -3129,7 +3161,7 @@ export default function App() {
                 </button>
               )}
 
-              <label className="flex flex-1 min-w-0 h-11 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] items-center pl-3.5 pr-1.5 gap-2.5 text-[var(--sub)] focus-within:border-[#2563EB] transition-colors">
+              <label className="flex flex-1 min-w-0 h-11 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] items-center pl-3.5 pr-1.5 gap-2.5 text-[var(--sub)] focus-within:border-[var(--primary)] transition-colors">
                 <Search size={17} className="shrink-0" />
                 <input
                   value={searchQuery}
@@ -3176,11 +3208,11 @@ export default function App() {
                   setIsJobsDrawerOpen(true);
                   syncUrl({ page: 'jobs' });
                 }}
-                className="hidden sm:flex items-center gap-2.5 h-9 px-3.5 rounded-2xl border border-[var(--bd)] bg-[var(--sf)] text-xs font-medium text-[var(--tx)] hover:border-[#2563EB]/60 transition-colors tabular-nums whitespace-nowrap shrink-0"
+                className="hidden sm:flex items-center gap-2.5 h-9 px-3.5 rounded-2xl border border-[var(--bd)] bg-[var(--sf)] text-xs font-medium text-[var(--tx)] hover:border-[var(--primary)]/60 transition-colors tabular-nums whitespace-nowrap shrink-0"
                 title="View active transfers and uploads"
               >
                 <svg width="44" height="10" viewBox="0 0 48 12" aria-hidden="true">
-                  <path d="M2 6Q6 1 10 6T18 6T26 6T30 6" fill="none" stroke="#3B82F6" strokeWidth="3" strokeLinecap="round" />
+                  <path d="M2 6Q6 1 10 6T18 6T26 6T30 6" fill="none" stroke="var(--primary)" strokeWidth="3" strokeLinecap="round" />
                   <path d="M36 6H46" stroke="#64748B" strokeOpacity=".5" strokeWidth="3" strokeLinecap="round" />
                 </svg>
                 <span>
@@ -3241,7 +3273,7 @@ export default function App() {
                         >
                           <Folder
                             size={15}
-                            className={idx === 0 ? 'text-[#2563EB] shrink-0' : 'text-[#F59E0B] shrink-0'}
+                            className={idx === 0 ? 'text-[var(--primary)] shrink-0' : 'text-[#F59E0B] shrink-0'}
                             fill={idx === 0 ? 'none' : 'currentColor'}
                           />
                           <span className="truncate">{idx === 0 ? 'Files' : ancestor.name}</span>
@@ -3274,6 +3306,19 @@ export default function App() {
                         type="button"
                         onClick={() => {
                           setIsMobileFolderMenuOpen(false);
+                          setColorTheme(prev => (prev === 'noir' ? 'default' : 'noir'));
+                        }}
+                        className="w-full flex items-center justify-between gap-2.5 px-2.5 py-2 rounded-xl text-xs font-semibold text-[var(--tx)] hover:bg-[var(--hover)] transition-colors"
+                      >
+                        <span className="flex items-center gap-2.5">
+                          <span className={`w-3.5 h-3.5 rounded-full border shrink-0 ${colorTheme === 'noir' ? 'bg-[#2F6FEB] border-[#6FA2FF]' : 'bg-white border-neutral-500'}`} />
+                          <span>{colorTheme === 'noir' ? 'Midnight Blue theme' : 'Noir theme'}</span>
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsMobileFolderMenuOpen(false);
                           setIsJobsDrawerOpen(false);
                           setIsAdminPanelOpen(false);
                           setSettingsTab('general');
@@ -3291,22 +3336,107 @@ export default function App() {
               </div>
             )}
 
-            {/* Theme Toggle Circle */}
-            <button
-              type="button"
-              onClick={() => setIsDarkMode(!isDarkMode)}
-              className={`${isMobileSubfolderHeader ? 'hidden md:flex' : 'flex'} w-9 h-9 rounded-full bg-[var(--sf)] border border-[var(--bd)] text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--hover)] items-center justify-center transition-colors shrink-0`}
-              title={isDarkMode ? 'Switch to light mode' : 'Switch to dark mode'}
-            >
-              {isDarkMode ? <Sun size={16} /> : <Moon size={16} />}
-            </button>
+            {/* Theme & Palette Popover (Light/Dark + Midnight Blue/Noir) */}
+            <div className={`${isMobileSubfolderHeader ? 'hidden md:block' : 'block'} relative shrink-0`}>
+              <button
+                type="button"
+                onClick={() => setIsThemeMenuOpen(prev => !prev)}
+                className="w-9 h-9 rounded-full bg-[var(--sf)] border border-[var(--bd)] text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--hover)] flex items-center justify-center transition-colors shrink-0"
+                title="Appearance & theme"
+                aria-label="Appearance & theme"
+                aria-expanded={isThemeMenuOpen}
+              >
+                {isDarkMode ? <Sun size={16} /> : <Moon size={16} />}
+              </button>
+
+              {isThemeMenuOpen && (
+                <>
+                  <div className="fixed inset-0 z-40" onClick={() => setIsThemeMenuOpen(false)} />
+                  <div className="absolute right-0 mt-2 w-60 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] shadow-2xl z-50 p-2.5 space-y-2.5">
+                    <div className="space-y-1.5">
+                      <p className="px-1 text-[10px] font-bold uppercase tracking-wider text-[var(--sub)]">Mode</p>
+                      <div className="grid grid-cols-2 gap-1.5 bg-[var(--bg)] p-1 rounded-xl border border-[var(--bd)]">
+                        <button
+                          type="button"
+                          onClick={() => setIsDarkMode(false)}
+                          className={`h-8 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors ${
+                            !isDarkMode
+                              ? 'bg-[var(--primary)] text-[var(--on-primary)]'
+                              : 'text-[var(--sub)] hover:text-[var(--tx)]'
+                          }`}
+                        >
+                          <Sun size={13} />
+                          <span>Light</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setIsDarkMode(true)}
+                          className={`h-8 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors ${
+                            isDarkMode
+                              ? 'bg-[var(--primary)] text-[var(--on-primary)]'
+                              : 'text-[var(--sub)] hover:text-[var(--tx)]'
+                          }`}
+                        >
+                          <Moon size={13} />
+                          <span>Dark</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="space-y-1">
+                      <p className="px-1 text-[10px] font-bold uppercase tracking-wider text-[var(--sub)]">Palette</p>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setColorTheme('default');
+                          setIsThemeMenuOpen(false);
+                        }}
+                        className={`w-full flex items-center justify-between gap-2.5 px-2.5 py-2 rounded-xl text-xs font-semibold transition-colors ${
+                          colorTheme === 'default'
+                            ? 'bg-[var(--sel)] text-[var(--tx)]'
+                            : 'text-[var(--tx)] hover:bg-[var(--hover)]'
+                        }`}
+                      >
+                        <span className="flex items-center gap-2.5">
+                          <span className="w-5 h-5 rounded-md bg-[#060918] border border-[#1E2940] flex items-center justify-center shrink-0">
+                            <span className="w-2.5 h-2.5 rounded-full bg-[#2F6FEB]" />
+                          </span>
+                          <span>Midnight Blue</span>
+                        </span>
+                        {colorTheme === 'default' && <Check size={14} className="text-[var(--primary)]" />}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setColorTheme('noir');
+                          setIsThemeMenuOpen(false);
+                        }}
+                        className={`w-full flex items-center justify-between gap-2.5 px-2.5 py-2 rounded-xl text-xs font-semibold transition-colors ${
+                          colorTheme === 'noir'
+                            ? 'bg-[var(--sel)] text-[var(--tx)]'
+                            : 'text-[var(--tx)] hover:bg-[var(--hover)]'
+                        }`}
+                      >
+                        <span className="flex items-center gap-2.5">
+                          <span className="w-5 h-5 rounded-md bg-[#0A0A0A] border border-[#262626] flex items-center justify-center shrink-0">
+                            <span className="w-2.5 h-2.5 rounded-full bg-white" />
+                          </span>
+                          <span>Noir</span>
+                        </span>
+                        {colorTheme === 'noir' && <Check size={14} className="text-[var(--primary)]" />}
+                      </button>
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
 
             {/* Avatar Circle & Account Menu */}
             <div className={`${isMobileSubfolderHeader ? 'hidden md:block' : 'block'} relative`}>
               <button
                 type="button"
                 onClick={() => setIsProfileMenuOpen(prev => !prev)}
-                className="w-9 h-9 rounded-full bg-[#2563EB] text-white text-xs font-semibold flex items-center justify-center shadow-sm hover:opacity-90 transition-opacity shrink-0"
+                className="w-9 h-9 rounded-full bg-[var(--primary)] text-[var(--on-primary)] text-xs font-semibold flex items-center justify-center shadow-sm hover:opacity-90 transition-opacity shrink-0"
                 title={username ? `@${username}` : 'Account'}
               >
                 {userInitials}
@@ -3364,7 +3494,7 @@ export default function App() {
         {/* Mobile Inline Search Bar */}
         {mobileSearchOpen && !isSettingsOpen && !isJobsDrawerOpen && !isAdminPanelOpen && (
           <div className="md:hidden px-4 pb-3 shrink-0">
-            <label className="w-full h-11 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] flex items-center pl-3.5 pr-1.5 gap-2 text-[var(--sub)] focus-within:border-[#2563EB]">
+            <label className="w-full h-11 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] flex items-center pl-3.5 pr-1.5 gap-2 text-[var(--sub)] focus-within:border-[var(--primary)]">
               <Search size={16} />
               <input
                 autoFocus
@@ -3416,7 +3546,7 @@ export default function App() {
                   >
                     <ArrowLeft size={18} />
                   </button>
-                  <div className="w-11 h-11 rounded-2xl bg-blue-600 text-white flex items-center justify-center shadow-lg shadow-blue-600/20 shrink-0">
+                  <div className="w-11 h-11 rounded-2xl bg-[var(--primary)] text-[var(--on-primary)] flex items-center justify-center shadow-lg shadow-black/20 shrink-0">
                     <Shield size={20} />
                   </div>
                   <div>
@@ -3490,9 +3620,9 @@ export default function App() {
                             <button
                               type="button"
                               onClick={() => toggleRegSetting(reg.key, !adminRegSettings?.[reg.key])}
-                              className={`w-14 h-8 rounded-full relative transition-all duration-300 outline-none shrink-0 ${adminRegSettings?.[reg.key] ? 'bg-blue-600' : 'bg-slate-300 dark:bg-slate-700'}`}
+                              className={`w-14 h-8 rounded-full relative transition-all duration-300 outline-none shrink-0 ${adminRegSettings?.[reg.key] ? 'bg-[var(--primary)]' : 'bg-[var(--tr)]'}`}
                             >
-                              <div className={`absolute top-1 w-6 h-6 rounded-full bg-white transition-all shadow-md ${adminRegSettings?.[reg.key] ? 'right-1' : 'left-1'}`} />
+                              <div className={`absolute top-1 w-6 h-6 rounded-full bg-[var(--on-primary)] transition-all shadow-md ${adminRegSettings?.[reg.key] ? 'right-1' : 'left-1'}`} />
                             </button>
                           </div>
                         ))}
@@ -3526,7 +3656,7 @@ export default function App() {
                           ) : selectedAdminUserDetails && (
                             <div className="space-y-6">
                               <div className="flex items-center gap-5 p-6 bg-[var(--sf)] rounded-[24px] border border-[var(--bd)]">
-                                <div className="w-16 h-16 rounded-2xl bg-blue-600 flex items-center justify-center text-white text-2xl font-black shrink-0">
+                                <div className="w-16 h-16 rounded-2xl bg-[var(--primary)] flex items-center justify-center text-[var(--on-primary)] text-2xl font-black shrink-0">
                                   {selectedAdminUserDetails.user.username[0].toUpperCase()}
                                 </div>
                                 <div className="flex-1 min-w-0">
@@ -3587,7 +3717,7 @@ export default function App() {
                             <div
                               key={u.id}
                               onClick={() => fetchUserDetails(u.id)}
-                              className="p-4 bg-[var(--sf)] rounded-[20px] flex items-center gap-4 hover:border-[#2563EB]/50 transition-all border border-[var(--bd)] cursor-pointer group"
+                              className="p-4 bg-[var(--sf)] rounded-[20px] flex items-center gap-4 hover:border-[var(--primary)]/50 transition-all border border-[var(--bd)] cursor-pointer group"
                             >
                               <div className={`w-10 h-10 rounded-xl flex items-center justify-center font-black uppercase transition-transform group-hover:scale-105 ${u.isActive ? 'bg-blue-500/15 text-blue-500' : 'bg-[var(--bg)] text-[var(--sub)]'}`}>
                                 {u.username?.[0] || '?'}
@@ -3683,14 +3813,26 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => { setIsSettingsOpen(false); setLinkProviderModal(true); syncUrl({ page: 'drive', modal: 'link-account' }); }}
-                        className="h-9 px-4 rounded-xl bg-[#2563EB] hover:bg-blue-700 text-white text-xs font-bold flex items-center gap-1.5 transition-colors shadow-sm shrink-0"
+                        className="h-9 px-4 rounded-xl bg-[var(--primary)] hover:bg-[var(--primary-hover)] text-[var(--on-primary)] text-xs font-bold flex items-center gap-1.5 transition-colors shadow-sm shrink-0"
                       >
                         <Plus size={15} />
                         <span>Connect New Drive</span>
                       </button>
                     </div>
 
-                    {accounts.length === 0 ? (
+                    {!hasLoadedAccounts ? (
+                      <div className="space-y-3">
+                        {[...Array(2)].map((_, i) => (
+                          <div key={i} className="p-4 bg-[var(--sf)] border border-[var(--bd)] rounded-[22px] flex items-center gap-3 animate-pulse">
+                            <div className="w-10 h-10 rounded-xl bg-[var(--hover)] shrink-0" />
+                            <div className="flex-1 space-y-2">
+                              <div className="h-3.5 w-36 rounded bg-[var(--hover)]" />
+                              <div className="h-2.5 w-48 rounded bg-[var(--hover)]" />
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : accounts.length === 0 ? (
                       <div className="p-10 text-center bg-[var(--sf)] border border-[var(--bd)] rounded-[22px] space-y-3">
                         <div className="w-12 h-12 mx-auto rounded-2xl bg-[var(--pi)] text-[var(--pit)] flex items-center justify-center">
                           <HardDrive size={22} />
@@ -3769,7 +3911,7 @@ export default function App() {
                                             }}
                                             className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"
                                           >
-                                            <Check size={14} className="text-[#2563EB]" />
+                                            <Check size={14} className="text-[var(--primary)]" />
                                             <span>Set as default</span>
                                           </button>
                                         )}
@@ -3781,7 +3923,7 @@ export default function App() {
                                           }}
                                           className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"
                                         >
-                                          <Copy size={14} className="text-[#2563EB]" />
+                                          <Copy size={14} className="text-[var(--primary)]" />
                                           <span>Copy Drive</span>
                                         </button>
                                         <button
@@ -3858,7 +4000,7 @@ export default function App() {
                             </div>
                           );
                         })}
-                        <button type="button" onClick={() => { setIsSettingsOpen(false); setLinkProviderModal(true); syncUrl({ page: 'drive', modal: 'link-account' }); }} className="w-full flex items-center justify-center gap-2 py-3.5 border-2 border-dashed border-[var(--bd)] rounded-[22px] text-sm font-bold text-[var(--sub)] hover:text-[#2563EB] hover:border-[#2563EB] transition-all">
+                        <button type="button" onClick={() => { setIsSettingsOpen(false); setLinkProviderModal(true); syncUrl({ page: 'drive', modal: 'link-account' }); }} className="w-full flex items-center justify-center gap-2 py-3.5 border-2 border-dashed border-[var(--bd)] rounded-[22px] text-sm font-bold text-[var(--sub)] hover:text-[var(--primary)] hover:border-[var(--primary)] transition-all">
                           <Plus size={16} /><span>Link Another Account</span>
                         </button>
                       </div>
@@ -3888,10 +4030,10 @@ export default function App() {
                           setIsAdminPanelOpen(true);
                           syncUrl({ page: 'admin', adminTab: 'overview', adminUserId: null });
                         }}
-                        className="p-5 sm:p-6 bg-[var(--sf)] border border-[var(--bd)] hover:border-[#2563EB] rounded-2xl flex items-center justify-between gap-4 cursor-pointer transition-colors group"
+                        className="p-5 sm:p-6 bg-[var(--sf)] border border-[var(--bd)] hover:border-[var(--primary)] rounded-2xl flex items-center justify-between gap-4 cursor-pointer transition-colors group"
                       >
                         <div className="flex items-center gap-4 min-w-0">
-                          <div className="w-11 h-11 rounded-2xl bg-blue-600 text-white flex items-center justify-center shadow-sm shrink-0">
+                          <div className="w-11 h-11 rounded-2xl bg-[var(--primary)] text-[var(--on-primary)] flex items-center justify-center shadow-sm shrink-0">
                             <Shield size={20} />
                           </div>
                           <div className="min-w-0">
@@ -3915,7 +4057,7 @@ export default function App() {
                       <h3 className="text-xs font-semibold text-[var(--sub)] px-1">Identity &amp; access</h3>
                       <div className="p-5 sm:p-6 bg-[var(--sf)] border border-[var(--bd)] rounded-2xl space-y-4">
                         <div className="flex items-center gap-3.5">
-                          <div className="w-11 h-11 bg-[#2563EB] rounded-2xl flex items-center justify-center text-white font-bold text-lg">
+                          <div className="w-11 h-11 bg-[var(--primary)] rounded-2xl flex items-center justify-center text-[var(--on-primary)] font-bold text-lg">
                             {userProfile?.username?.[0]?.toUpperCase()}
                           </div>
                           <div>
@@ -3946,16 +4088,97 @@ export default function App() {
 
                     <div className="space-y-2.5">
                       <h3 className="text-xs font-semibold text-[var(--sub)] px-1">Appearance &amp; behavior</h3>
+
+                      {/* Color Theme (Matches Cloudyte Android: Midnight Blue & Noir) */}
+                      <div className="p-5 bg-[var(--sf)] border border-[var(--bd)] rounded-2xl space-y-4">
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <div>
+                            <p className="text-sm font-semibold text-[var(--tx)]">Color palette</p>
+                            <p className="text-xs text-[var(--sub)]">Synced with Cloudyte Android palettes</p>
+                          </div>
+                          <div className="flex items-center gap-1.5 bg-[var(--bg)] p-1 rounded-xl border border-[var(--bd)]">
+                            <button
+                              type="button"
+                              onClick={() => setIsDarkMode(false)}
+                              className={`h-8 px-3 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors ${
+                                !isDarkMode
+                                  ? 'bg-[var(--primary)] text-[var(--on-primary)]'
+                                  : 'text-[var(--sub)] hover:text-[var(--tx)]'
+                              }`}
+                            >
+                              <Sun size={13} />
+                              <span>Light</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setIsDarkMode(true)}
+                              className={`h-8 px-3 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors ${
+                                isDarkMode
+                                  ? 'bg-[var(--primary)] text-[var(--on-primary)]'
+                                  : 'text-[var(--sub)] hover:text-[var(--tx)]'
+                              }`}
+                            >
+                              <Moon size={13} />
+                              <span>Dark</span>
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                          <button
+                            type="button"
+                            onClick={() => setColorTheme('default')}
+                            className={`p-3.5 rounded-2xl border text-left transition-all flex items-center justify-between gap-3 ${
+                              colorTheme === 'default'
+                                ? 'bg-[var(--sel)] border-[var(--primary)]'
+                                : 'bg-[var(--bg)] border-[var(--bd)] hover:border-[var(--sub)]/50'
+                            }`}
+                          >
+                            <div className="flex items-center gap-3 min-w-0">
+                              <span className="w-9 h-9 rounded-xl bg-[#060918] border border-[#1E2940] flex items-center justify-center shrink-0">
+                                <span className="w-4 h-4 rounded-full bg-[#2F6FEB] ring-2 ring-[#6FA2FF]/40" />
+                              </span>
+                              <div className="min-w-0">
+                                <p className="text-xs font-bold text-[var(--tx)] truncate">Midnight Blue</p>
+                                <p className="text-[11px] text-[var(--sub)] truncate">Default Cloudyte palette</p>
+                              </div>
+                            </div>
+                            {colorTheme === 'default' && <Check size={15} className="text-[var(--primary)] shrink-0" />}
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => setColorTheme('noir')}
+                            className={`p-3.5 rounded-2xl border text-left transition-all flex items-center justify-between gap-3 ${
+                              colorTheme === 'noir'
+                                ? 'bg-[var(--sel)] border-[var(--primary)]'
+                                : 'bg-[var(--bg)] border-[var(--bd)] hover:border-[var(--sub)]/50'
+                            }`}
+                          >
+                            <div className="flex items-center gap-3 min-w-0">
+                              <span className="w-9 h-9 rounded-xl bg-[#0A0A0A] border border-[#262626] flex items-center justify-center shrink-0">
+                                <span className="w-4 h-4 rounded-full bg-white ring-2 ring-white/25" />
+                              </span>
+                              <div className="min-w-0">
+                                <p className="text-xs font-bold text-[var(--tx)] truncate">Noir</p>
+                                <p className="text-[11px] text-[var(--sub)] truncate">Monochrome black &amp; white</p>
+                              </div>
+                            </div>
+                            {colorTheme === 'noir' && <Check size={15} className="text-[var(--primary)] shrink-0" />}
+                          </button>
+                        </div>
+                      </div>
+
                       <div className="flex items-center justify-between p-5 bg-[var(--sf)] border border-[var(--bd)] rounded-2xl">
                         <div className="flex items-center gap-3">
-                          <div className="w-10 h-10 bg-purple-500/12 rounded-xl flex items-center justify-center text-purple-500"><Eye size={18} /></div>
+                          <div className="w-10 h-10 bg-[var(--pi)] rounded-xl flex items-center justify-center text-[var(--pit)]"><Eye size={18} /></div>
                           <div>
                             <p className="text-sm font-semibold text-[var(--tx)]">Image thumbnails</p>
                             <p className="text-xs text-[var(--sub)]">Show inline previews for image files</p>
                           </div>
                         </div>
-                        <button type="button" onClick={() => updateUserSettings({ showThumbnails: !(userSettings?.showThumbnails ?? true) })} className={`w-11 h-6 rounded-full transition-all relative ${(userSettings?.showThumbnails ?? true) ? 'bg-purple-600' : 'bg-slate-300 dark:bg-slate-700'}`}>
-                          <div className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-all ${(userSettings?.showThumbnails ?? true) ? 'left-6' : 'left-1'}`} />
+                        <button type="button" onClick={() => updateUserSettings({ showThumbnails: !(userSettings?.showThumbnails ?? true) })} className={`w-11 h-6 rounded-full transition-all relative ${(userSettings?.showThumbnails ?? true) ? 'bg-[var(--primary)]' : 'bg-[var(--tr)]'}`}>
+                          <div className={`absolute top-1 w-4 h-4 rounded-full bg-[var(--on-primary)] transition-all ${(userSettings?.showThumbnails ?? true) ? 'left-6' : 'left-1'}`} />
                         </button>
                       </div>
                     </div>
@@ -3971,7 +4194,7 @@ export default function App() {
                               <p className="text-xs text-[var(--sub)]">Mirror bot uploads to a backup drive</p>
                             </div>
                           </div>
-                          <button type="button" onClick={() => updateUserSettings({ backupEnabled: !userSettings?.backupEnabled })} className={`w-11 h-6 rounded-full transition-all relative ${userSettings?.backupEnabled ? 'bg-[#2563EB]' : 'bg-slate-300 dark:bg-slate-700'}`}>
+                          <button type="button" onClick={() => updateUserSettings({ backupEnabled: !userSettings?.backupEnabled })} className={`w-11 h-6 rounded-full transition-all relative ${userSettings?.backupEnabled ? 'bg-[var(--primary)]' : 'bg-slate-300 dark:bg-slate-700'}`}>
                             <div className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-all ${userSettings?.backupEnabled ? 'left-6' : 'left-1'}`} />
                           </button>
                         </div>
@@ -4014,7 +4237,7 @@ export default function App() {
                                         }`}
                                       >
                                         <span>None (disabled)</span>
-                                        {!userSettings?.backupAccId && <Check size={14} className="text-[#2563EB]" />}
+                                        {!userSettings?.backupAccId && <Check size={14} className="text-[var(--primary)]" />}
                                       </button>
                                       {accounts.map(acc => {
                                         const isActive = userSettings?.backupAccId === acc.id;
@@ -4037,7 +4260,7 @@ export default function App() {
                                               {renderProviderBadge(acc.accountType, 'sm')}
                                               <span className="truncate">{label}</span>
                                             </span>
-                                            {isActive && <Check size={14} className="text-[#2563EB] shrink-0" />}
+                                            {isActive && <Check size={14} className="text-[var(--primary)] shrink-0" />}
                                           </button>
                                         );
                                       })}
@@ -4067,24 +4290,38 @@ export default function App() {
                 if (selectedAccountId) fetchFiles(selectedAccountId, currentFolderId, debouncedSearch, isTrashView);
               }}
             />
-          ) : loading && accounts.length === 0 ? (
+          ) : !hasLoadedAccounts || (loading && accounts.length === 0) ? (
             <div className="space-y-4 pt-1">
-              <div className="h-8 w-44 bg-[var(--sf)] border border-[var(--bd)] rounded-xl animate-pulse" />
-              <div className="rounded-2xl bg-[var(--sf)] border border-[var(--bd)] divide-y divide-[var(--bd)]/60 overflow-hidden">
-                {[...Array(7)].map((_, i) => (
-                  <div key={i} className="h-[52px] px-4 flex items-center gap-4">
-                    <div className="w-8 h-8 rounded-lg bg-[var(--bg)] animate-pulse shrink-0" />
-                    <div className="h-3.5 rounded-md bg-[var(--bg)] animate-pulse flex-1 max-w-[260px]" />
-                    <div className="hidden md:block h-3 w-20 rounded-md bg-[var(--bg)] animate-pulse ml-auto" />
-                    <div className="hidden md:block h-3 w-14 rounded-md bg-[var(--bg)] animate-pulse" />
-                  </div>
-                ))}
-              </div>
+              <div className="h-8 w-44 bg-[var(--sf)] border border-[var(--bd)]/55 rounded-xl animate-pulse" />
+              {viewMode === 'list' ? (
+                <div className="rounded-[20px] bg-[var(--sf)] border border-[var(--bd)]/55 divide-y divide-[var(--bd)]/45 overflow-hidden">
+                  {[...Array(7)].map((_, i) => (
+                    <div key={i} className="h-[58px] px-4 flex items-center gap-4">
+                      <div className="w-9 h-9 rounded-xl bg-[var(--hover)] animate-pulse shrink-0" />
+                      <div className="h-3.5 rounded-md bg-[var(--hover)] animate-pulse flex-1 max-w-[260px]" />
+                      <div className="hidden md:block h-3 w-20 rounded-md bg-[var(--hover)] animate-pulse ml-auto" />
+                      <div className="hidden md:block h-3 w-14 rounded-md bg-[var(--hover)] animate-pulse" />
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3">
+                  {[...Array(12)].map((_, i) => (
+                    <div key={i} className="rounded-[20px] bg-[var(--sf)] border border-[var(--bd)]/45 overflow-hidden animate-pulse">
+                      <div className="w-full h-[116px] sm:h-[130px] bg-[var(--hover)]/65" />
+                      <div className="px-3.5 py-2.5 space-y-1.5">
+                        <div className="h-3.5 w-3/4 rounded bg-[var(--hover)]" />
+                        <div className="h-2.5 w-1/3 rounded bg-[var(--hover)]" />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
-          ) : !loading && accounts.length === 0 ? (
+          ) : hasLoadedAccounts && !loading && accounts.length === 0 ? (
             <div className="max-w-xl mx-auto py-8 md:py-14 space-y-6">
               <div className="text-center space-y-3">
-                <div className="w-16 h-16 rounded-[22px] bg-[#2563EB] text-white flex items-center justify-center mx-auto shadow-xl shadow-blue-600/25">
+                <div className="w-16 h-16 rounded-[22px] bg-[var(--primary)] text-[var(--on-primary)] flex items-center justify-center mx-auto shadow-xl shadow-black/20">
                   <Cloud size={32} fill="currentColor" />
                 </div>
                 <h1 className="text-2xl sm:text-3xl font-bold text-[var(--tx)] tracking-tight">
@@ -4124,7 +4361,7 @@ export default function App() {
                       onClick={() => setWelcomeProvider(opt.id)}
                       className={`w-full flex items-center gap-3.5 p-3.5 rounded-[20px] border text-left transition-all ${
                         selected
-                          ? 'bg-[var(--sel)] border-[#2563EB]'
+                          ? 'bg-[var(--sel)] border-[var(--primary)]'
                           : 'bg-[var(--bg)]/50 border-[var(--bd)] hover:border-[var(--sub)]/40'
                       }`}
                     >
@@ -4136,7 +4373,7 @@ export default function App() {
                       <span
                         className={`w-5 h-5 rounded-full border-2 flex items-center justify-center shrink-0 transition-colors ${
                           selected
-                            ? 'border-[#2563EB] bg-[#2563EB] text-white'
+                            ? 'border-[var(--primary)] bg-[var(--primary)] text-[var(--on-primary)]'
                             : 'border-[var(--sub)]/50'
                         }`}
                       >
@@ -4159,7 +4396,7 @@ export default function App() {
                         syncUrl({ modal: 'tg-drive' });
                       }
                     }}
-                    className="w-full h-11 rounded-2xl bg-[#2563EB] hover:bg-blue-700 text-white text-sm font-semibold flex items-center justify-center gap-2 shadow-sm active:scale-[0.99] transition-all"
+                    className="w-full h-11 rounded-2xl bg-[var(--primary)] hover:bg-[var(--primary-hover)] text-[var(--on-primary)] text-sm font-semibold flex items-center justify-center gap-2 shadow-sm active:scale-[0.99] transition-all"
                   >
                     <span>
                       {welcomeProvider === 'google'
@@ -4294,7 +4531,7 @@ export default function App() {
                                 }`}
                               >
                                 <span>{opt.label}</span>
-                                {sortBy === opt.id && <Check size={13} className="text-[#2563EB]" />}
+                                {sortBy === opt.id && <Check size={13} className="text-[var(--primary)]" />}
                               </button>
                             ))}
                             <div className="my-1 border-t border-[var(--bd)]" />
@@ -4322,7 +4559,7 @@ export default function App() {
                                   {dir.icon}
                                   <span>{dir.label}</span>
                                 </span>
-                                {sortOrder === dir.id && <Check size={13} className="text-[#2563EB]" />}
+                                {sortOrder === dir.id && <Check size={13} className="text-[var(--primary)]" />}
                               </button>
                             ))}
                           </div>
@@ -4358,7 +4595,7 @@ export default function App() {
                       onClick={() => navigateUp(0)}
                       className="flex items-center gap-2 py-1 px-1.5 rounded-lg text-[15px] font-semibold text-[var(--tx)] whitespace-nowrap shrink-0 transition-colors"
                     >
-                      <Folder size={18} className="text-[#2563EB] shrink-0" fill="currentColor" />
+                      <Folder size={18} className="text-[var(--primary)] shrink-0" fill="currentColor" />
                       <span>Files</span>
                     </button>
                   ) : (
@@ -4397,7 +4634,7 @@ export default function App() {
                                 >
                                   <Folder
                                     size={15}
-                                    className={idx === 0 ? 'text-[#2563EB] shrink-0' : 'text-[#F59E0B] shrink-0'}
+                                    className={idx === 0 ? 'text-[var(--primary)] shrink-0' : 'text-[#F59E0B] shrink-0'}
                                     fill={idx === 0 ? 'none' : 'currentColor'}
                                   />
                                   <span className="truncate">{idx === 0 ? 'Files' : ancestor.name}</span>
@@ -4412,7 +4649,7 @@ export default function App() {
                         className="flex items-center gap-2 py-1 px-1.5 rounded-lg text-[15px] font-semibold text-[var(--tx)] min-w-0"
                         title={path[path.length - 1]?.name}
                       >
-                        <Folder size={17} className="text-[#2563EB] shrink-0" fill="currentColor" />
+                        <Folder size={17} className="text-[var(--primary)] shrink-0" fill="currentColor" />
                         <span className="truncate max-w-[180px] sm:max-w-[320px] md:max-w-[420px]">
                           {path[path.length - 1]?.name}
                         </span>
@@ -4465,7 +4702,7 @@ export default function App() {
                               }`}
                             >
                               <span>{opt.label}</span>
-                              {sortBy === opt.id && <Check size={13} className="text-[#2563EB]" />}
+                              {sortBy === opt.id && <Check size={13} className="text-[var(--primary)]" />}
                             </button>
                           ))}
                           <div className="my-1 border-t border-[var(--bd)]" />
@@ -4493,7 +4730,7 @@ export default function App() {
                                 {dir.icon}
                                 <span>{dir.label}</span>
                               </span>
-                              {sortOrder === dir.id && <Check size={13} className="text-[#2563EB]" />}
+                              {sortOrder === dir.id && <Check size={13} className="text-[var(--primary)]" />}
                             </button>
                           ))}
                         </div>
@@ -4589,7 +4826,7 @@ export default function App() {
                                 }}
                                 className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"
                               >
-                                <UploadCloud size={16} className="text-[#2563EB]" />
+                                <UploadCloud size={16} className="text-[var(--primary)]" />
                                 <span>Upload files</span>
                               </button>
                               <button
@@ -4737,35 +4974,35 @@ export default function App() {
                       initial={{ width: '0%', x: '-100%' }}
                       animate={{ width: '100%', x: '100%' }}
                       transition={{ repeat: Infinity, duration: 1.2, ease: 'easeInOut' }}
-                      className="h-full bg-[#2563EB] rounded-full"
+                      className="h-full bg-[var(--primary)] rounded-full"
                     />
                   </div>
                 )}
 
-                {loading && displayedFiles.length === 0 ? (
+                {(!hasLoadedFiles || loading) && displayedFiles.length === 0 ? (
                   viewMode === 'list' ? (
-                    <div className="rounded-2xl bg-[var(--sf)] border border-[var(--bd)] divide-y divide-[var(--bd)]/60 overflow-hidden">
+                    <div className="rounded-[20px] bg-[var(--sf)] border border-[var(--bd)]/55 divide-y divide-[var(--bd)]/45 overflow-hidden">
                       {[...Array(8)].map((_, i) => (
-                        <div key={i} className="h-[52px] px-4 flex items-center gap-3.5">
-                          <div className="hidden md:block w-4 h-4 rounded bg-[var(--bg)] animate-pulse shrink-0" />
-                          <div className="w-8 h-8 rounded-lg bg-[var(--bg)] animate-pulse shrink-0" />
+                        <div key={i} className="h-[58px] px-4 flex items-center gap-3.5">
+                          <div className="hidden md:block w-4 h-4 rounded-full bg-[var(--hover)] animate-pulse shrink-0" />
+                          <div className="w-9 h-9 rounded-xl bg-[var(--hover)] animate-pulse shrink-0" />
                           <div
-                            className="h-3.5 rounded-md bg-[var(--bg)] animate-pulse"
+                            className="h-3.5 rounded-md bg-[var(--hover)] animate-pulse"
                             style={{ width: `${140 + ((i * 37) % 160)}px` }}
                           />
-                          <div className="hidden md:block h-3 w-20 rounded-md bg-[var(--bg)] animate-pulse ml-auto" />
-                          <div className="hidden md:block h-3 w-14 rounded-md bg-[var(--bg)] animate-pulse ml-6" />
+                          <div className="hidden md:block h-3 w-20 rounded-md bg-[var(--hover)] animate-pulse ml-auto" />
+                          <div className="hidden md:block h-3 w-14 rounded-md bg-[var(--hover)] animate-pulse ml-6" />
                         </div>
                       ))}
                     </div>
                   ) : (
-                    <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4">
+                    <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3">
                       {[...Array(12)].map((_, i) => (
-                        <div key={i} className="p-4 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] flex flex-col items-center gap-3">
-                          <div className="w-20 h-20 rounded-2xl bg-[var(--bg)] animate-pulse" />
-                          <div className="w-full space-y-1.5 flex flex-col items-center">
-                            <div className="h-3.5 w-3/4 rounded-md bg-[var(--bg)] animate-pulse" />
-                            <div className="h-3 w-1/3 rounded-md bg-[var(--bg)] animate-pulse" />
+                        <div key={i} className="rounded-[20px] bg-[var(--sf)] border border-[var(--bd)]/45 overflow-hidden animate-pulse">
+                          <div className="w-full h-[116px] sm:h-[130px] bg-[var(--hover)]/65" />
+                          <div className="px-3.5 py-2.5 space-y-1.5">
+                            <div className="h-3.5 w-3/4 rounded bg-[var(--hover)]" />
+                            <div className="h-2.5 w-1/3 rounded bg-[var(--hover)]" />
                           </div>
                         </div>
                       ))}
@@ -4827,7 +5064,7 @@ export default function App() {
                     </div>
                   ) : (
                     <div className="border border-dashed border-[var(--bd)] rounded-2xl bg-[var(--sf)]/50 flex flex-col items-center justify-center py-20 px-6 text-[var(--sub)] gap-4">
-                      <div className="w-14 h-14 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] flex items-center justify-center text-[#2563EB]">
+                      <div className="w-14 h-14 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] flex items-center justify-center text-[var(--primary)]">
                         {isTgDrive ? <TelegramIcon size={28} /> : <UploadCloud size={28} />}
                       </div>
                       <div className="text-center space-y-1 max-w-sm">
@@ -4839,7 +5076,7 @@ export default function App() {
                         </p>
                       </div>
                       <div className="flex flex-wrap items-center justify-center gap-2.5 pt-1">
-                        <label className="h-9 px-4 rounded-xl bg-[#2563EB] text-white font-semibold text-xs flex items-center gap-2 cursor-pointer hover:bg-blue-700 transition-colors">
+                        <label className="h-9 px-4 rounded-xl bg-[var(--primary)] text-[var(--on-primary)] font-semibold text-xs flex items-center gap-2 cursor-pointer hover:bg-[var(--primary-hover)] transition-colors">
                           <Upload size={15} />
                           <span>Upload files</span>
                           <input type="file" className="hidden" onChange={handleUpload} multiple />
@@ -4857,10 +5094,10 @@ export default function App() {
                   )
                 ) : viewMode === 'list' ? (
                   <>
-                    {/* Clean Hairline Desktop File Table */}
-                    <div className="hidden md:block rounded-2xl bg-[var(--sf)] border border-[var(--bd)] overflow-hidden">
+                    {/* Desktop Android-Styled Grouped List Table */}
+                    <div className="hidden md:block rounded-[20px] bg-[var(--sf)] border border-[var(--bd)]/55 overflow-hidden">
                       {/* Table Header */}
-                      <div className="grid grid-cols-[32px_38px_1fr_140px_100px_132px] gap-3 items-center px-4 h-10 bg-[var(--bg)]/45 border-b border-[var(--bd)] text-xs font-medium text-[var(--sub)] select-none">
+                      <div className="grid grid-cols-[32px_44px_1fr_140px_100px_132px] gap-3 items-center px-4 h-10 bg-[var(--bg)]/40 border-b border-[var(--bd)]/60 text-xs font-medium text-[var(--sub)] select-none">
                         <div className="flex items-center justify-center">
                           {(() => {
                             const allSelected = displayedFiles.length > 0 && selectedFileIds.size === displayedFiles.length;
@@ -4875,16 +5112,16 @@ export default function App() {
                                   if (allSelected) setSelectedFileIds(new Set());
                                   else setSelectedFileIds(new Set(displayedFiles.map(f => f.id)));
                                 }}
-                                className={`w-4 h-4 rounded-[5px] border flex items-center justify-center transition-colors ${
+                                className={`w-4 h-4 rounded-full border flex items-center justify-center transition-colors ${
                                   allSelected || someSelected
-                                    ? 'bg-[#2563EB] border-[#2563EB] text-white'
-                                    : 'border-[var(--sub)]/45 hover:border-[#2563EB] bg-transparent'
+                                    ? 'bg-[var(--primary)] border-[var(--primary)] text-[var(--on-primary)]'
+                                    : 'border-[var(--sub)]/45 hover:border-[var(--primary)] bg-transparent'
                                 }`}
                               >
                                 {allSelected ? (
                                   <Check size={11} strokeWidth={3} />
                                 ) : someSelected ? (
-                                  <span className="w-2 h-0.5 rounded-full bg-white" />
+                                  <span className="w-2 h-0.5 rounded-full bg-[var(--on-primary)]" />
                                 ) : null}
                               </button>
                             );
@@ -4934,7 +5171,7 @@ export default function App() {
                       </div>
 
                       {/* Table Rows */}
-                      <div className="divide-y divide-[var(--bd)]/60">
+                      <div className="divide-y divide-[var(--bd)]/45">
                         {displayedFiles.map((file) => {
                           const isChecked = selectedFileIds.has(file.id);
                           const isFocused = focusedFileId === file.id || selectedFile?.id === file.id;
@@ -4945,10 +5182,10 @@ export default function App() {
                               onClick={(e) => handleSingleClick(file, e)}
                               onDoubleClick={(e) => handleDoubleClick(file, e)}
                               onContextMenu={(e) => handleRowContextMenu(file, e)}
-                              className={`group grid grid-cols-[32px_38px_1fr_140px_100px_132px] gap-3 items-center px-4 h-[52px] cursor-pointer transition-colors select-none ${
+                              className={`group grid grid-cols-[32px_44px_1fr_140px_100px_132px] gap-3 items-center px-4 h-[58px] cursor-pointer transition-colors select-none ${
                                 isHighlighted
-                                  ? 'bg-[var(--sel)] shadow-[inset_3px_0_0_#2563EB]'
-                                  : 'hover:bg-[var(--hover)]'
+                                  ? 'bg-[var(--pi)]/75'
+                                  : 'hover:bg-[var(--hover)]/65'
                               }`}
                             >
                               <div className="flex items-center justify-center" onClick={(e) => e.stopPropagation()}>
@@ -4958,15 +5195,15 @@ export default function App() {
                                   aria-checked={isChecked}
                                   aria-label={isChecked ? `Deselect ${file.name}` : `Select ${file.name}`}
                                   onClick={(e) => toggleSelection(e, file.id)}
-                                  className={`w-4 h-4 rounded-[5px] border flex items-center justify-center transition-all ${
+                                  className={`w-5 h-5 rounded-full border flex items-center justify-center transition-all ${
                                     isChecked
-                                      ? 'bg-[#2563EB] border-[#2563EB] text-white opacity-100'
+                                      ? 'bg-[var(--primary)] border-[var(--primary)] text-[var(--on-primary)] opacity-100'
                                       : selectedFileIds.size > 0
-                                      ? 'border-[var(--sub)]/45 hover:border-[#2563EB] opacity-100'
-                                      : 'border-[var(--sub)]/45 hover:border-[#2563EB] opacity-0 group-hover:opacity-100 focus:opacity-100'
+                                      ? 'border-[var(--sub)]/45 hover:border-[var(--primary)] opacity-100'
+                                      : 'border-[var(--sub)]/45 hover:border-[var(--primary)] opacity-0 group-hover:opacity-100 focus:opacity-100'
                                   }`}
                                 >
-                                  {isChecked && <Check size={11} strokeWidth={3} />}
+                                  {isChecked && <Check size={12} strokeWidth={3} />}
                                 </button>
                               </div>
 
@@ -4974,6 +5211,7 @@ export default function App() {
                                 <FileIcon
                                   file={file}
                                   type={file.type}
+                                  size="sm"
                                   isTg={file.isTgDrive}
                                   accountId={selectedAccountId}
                                   showThumbnails={userSettings?.showThumbnails !== false}
@@ -4982,20 +5220,20 @@ export default function App() {
 
                               <div className="min-w-0">
                                 {file.isNote && file.textPreview ? (
-                                  <p className="text-sm font-normal text-[var(--tx)] truncate" title={file.textPreview}>
+                                  <p className="text-[14px] font-medium text-[var(--tx)] truncate" title={file.textPreview}>
                                     {file.textPreview.replace(/\s+/g, ' ')}
                                   </p>
                                 ) : (
-                                  <p className="text-sm font-medium text-[var(--tx)] truncate">{file.name}</p>
+                                  <p className="text-[14px] font-semibold text-[var(--tx)] truncate">{file.name}</p>
                                 )}
                               </div>
 
-                              <span className="text-[13px] font-normal text-[var(--sub)] truncate tabular-nums">
+                              <span className="text-[12.5px] font-medium text-[var(--sub)] truncate tabular-nums">
                                 {file.modified || '—'}
                               </span>
 
                               <span className="font-mono text-xs text-[var(--sub)] tabular-nums truncate">
-                                {file.type === 'folder' ? '—' : file.size}
+                                {file.type === 'folder' ? 'Folder' : file.size}
                               </span>
 
                               <div className="flex items-center justify-end gap-0.5" onClick={(e) => e.stopPropagation()}>
@@ -5012,16 +5250,16 @@ export default function App() {
                                   ) : (
                                     <>
                                       {file.type !== 'folder' && (
-                                        <button type="button" onClick={() => openPreview(file)} className="p-1.5 rounded-lg text-[var(--sub)] hover:text-[#2563EB] hover:bg-[var(--bg)]/70" title="Preview">
+                                        <button type="button" onClick={() => openPreview(file)} className="p-1.5 rounded-lg text-[var(--sub)] hover:text-[var(--primary)] hover:bg-[var(--bg)]/70" title="Preview">
                                           <Eye size={15} />
                                         </button>
                                       )}
                                       {file.type !== 'folder' && (
-                                        <button type="button" onClick={() => handleDownload(file.id)} className="p-1.5 rounded-lg text-[var(--sub)] hover:text-[#2563EB] hover:bg-[var(--bg)]/70" title="Download">
+                                        <button type="button" onClick={() => handleDownload(file.id)} className="p-1.5 rounded-lg text-[var(--sub)] hover:text-[var(--primary)] hover:bg-[var(--bg)]/70" title="Download">
                                           <Download size={15} />
                                         </button>
                                       )}
-                                      <button type="button" onClick={() => handleRename(file.id, file.name)} className="p-1.5 rounded-lg text-[var(--sub)] hover:text-[#2563EB] hover:bg-[var(--bg)]/70" title="Rename">
+                                      <button type="button" onClick={() => handleRename(file.id, file.name)} className="p-1.5 rounded-lg text-[var(--sub)] hover:text-[var(--primary)] hover:bg-[var(--bg)]/70" title="Rename">
                                         <Edit3 size={15} />
                                       </button>
                                     </>
@@ -5033,7 +5271,7 @@ export default function App() {
                                     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
                                     setContextMenu({ file, x: rect.left - 160, y: rect.bottom });
                                   }}
-                                  className="p-1.5 rounded-lg text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--bg)]/70 transition-colors"
+                                  className="p-1.5 rounded-full text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--bg)]/70 transition-colors"
                                   title="More actions"
                                   aria-label={`More actions for ${file.name}`}
                                 >
@@ -5046,59 +5284,79 @@ export default function App() {
                       </div>
                     </div>
 
-                    {/* Mobile Hairline List */}
-                    <div className="md:hidden rounded-2xl bg-[var(--sf)] border border-[var(--bd)] divide-y divide-[var(--bd)]/60 overflow-hidden">
-                      {displayedFiles.map((file) => {
+                    {/* Mobile Android Material 3 Expressive GroupedList (20dp outer, 4dp inner, 2dp gap) */}
+                    <div className="md:hidden space-y-[2px]">
+                      {displayedFiles.map((file, idx) => {
                         const isChecked = selectedFileIds.has(file.id);
+                        const isFirst = idx === 0;
+                        const isLast = idx === displayedFiles.length - 1;
+                        const radiusClass =
+                          isFirst && isLast
+                            ? 'rounded-[20px]'
+                            : isFirst
+                            ? 'rounded-t-[20px] rounded-b-[6px]'
+                            : isLast
+                            ? 'rounded-t-[6px] rounded-b-[20px]'
+                            : 'rounded-[6px]';
                         return (
                           <div
                             key={file.id}
                             onClick={(e) => handleSingleClick(file, e)}
                             onContextMenu={(e) => handleRowContextMenu(file, e)}
-                            className={`grid grid-cols-[40px_1fr_28px] gap-3 items-center px-3.5 py-2.5 cursor-pointer transition-colors ${
-                              isChecked ? 'bg-[var(--sel)]' : 'active:bg-[var(--hover)]'
+                            className={`flex items-center gap-3 px-3.5 py-2.5 cursor-pointer transition-colors ${radiusClass} ${
+                              isChecked
+                                ? 'bg-[var(--pi)] border border-[var(--primary)]/50'
+                                : 'bg-[var(--sf)] active:bg-[var(--hover)]'
                             }`}
                           >
-                            <div onClick={(e) => toggleSelection(e, file.id)}>
+                            {isChecked && (
+                              <button
+                                type="button"
+                                onClick={(e) => toggleSelection(e, file.id)}
+                                className="w-[22px] h-[22px] rounded-full bg-[var(--primary)] text-[var(--on-primary)] flex items-center justify-center shrink-0"
+                                aria-label={`Deselect ${file.name}`}
+                              >
+                                <Check size={13} strokeWidth={3} />
+                              </button>
+                            )}
+                            <div onClick={(e) => toggleSelection(e, file.id)} className="shrink-0">
                               <FileIcon
                                 file={file}
                                 type={file.type}
+                                size="row"
                                 isTg={file.isTgDrive}
                                 accountId={selectedAccountId}
                                 showThumbnails={userSettings?.showThumbnails !== false}
                               />
                             </div>
-                            <div className="min-w-0">
+                            <div className="flex-1 min-w-0">
                               {file.isNote && file.textPreview ? (
-                                <p className="text-[13.5px] font-normal text-[var(--tx)] line-clamp-2 leading-snug">
+                                <p className="text-[13.5px] font-medium text-[var(--tx)] line-clamp-2 leading-[18px]">
                                   {file.textPreview}
                                 </p>
                               ) : (
-                                <p className="text-[14.5px] font-medium text-[var(--tx)] truncate">{file.name}</p>
+                                <p className="text-[14px] font-semibold text-[var(--tx)] truncate leading-[18px]">
+                                  {file.name}
+                                </p>
                               )}
-                              <p className="text-xs text-[var(--sub)] truncate mt-0.5 tabular-nums">
+                              <p className="text-[11.5px] font-medium text-[var(--sub)] truncate mt-0.5 tabular-nums">
                                 {file.type === 'folder'
-                                  ? `Folder · ${file.modified || '—'}`
-                                  : `${file.modified || '—'} · ${file.size}`}
+                                  ? `${file.modified && file.modified !== '-' ? `${file.modified} • ` : ''}Folder`
+                                  : `${file.modified && file.modified !== '-' ? `${file.modified} • ` : ''}${file.size || '—'}`}
                               </p>
                             </div>
-                            <div onClick={(e) => e.stopPropagation()} className="flex justify-end">
-                              {isChecked ? (
-                                <button type="button" onClick={(e) => toggleSelection(e, file.id)}>
-                                  <CheckCircle2 size={20} fill="currentColor" className="text-[#2563EB]" />
-                                </button>
-                              ) : (
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                                    setContextMenu({ file, x: rect.left - 160, y: rect.bottom });
-                                  }}
-                                  className="p-1 text-[var(--sub)]"
-                                >
-                                  <MoreVertical size={17} />
-                                </button>
-                              )}
+                            <div onClick={(e) => e.stopPropagation()} className="shrink-0">
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                                  setContextMenu({ file, x: rect.left - 160, y: rect.bottom });
+                                }}
+                                className="w-9 h-9 -mr-1.5 rounded-full flex items-center justify-center text-[var(--sub)] active:bg-[var(--hover)]"
+                                aria-label={`More actions for ${file.name}`}
+                              >
+                                <MoreVertical size={18} />
+                              </button>
                             </div>
                           </div>
                         );
@@ -5106,90 +5364,103 @@ export default function App() {
                     </div>
                   </>
                 ) : (
-                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4">
+                  /* Android Cloudyte Grid View (FolderGridItem & FileGridItem — 20dp cards, full-bleed top preview, left-aligned footer) */
+                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3">
                     {displayedFiles.map(file => {
                       const isChecked = selectedFileIds.has(file.id);
                       const isFocused = focusedFileId === file.id || selectedFile?.id === file.id;
+                      const isMediaPhoto = file.type === 'image' && userSettings?.showThumbnails !== false;
                       return (
                         <div
                           key={file.id}
                           onClick={(e) => handleSingleClick(file, e)}
                           onDoubleClick={(e) => handleDoubleClick(file, e)}
                           onContextMenu={(e) => handleRowContextMenu(file, e)}
-                          className={`group relative rounded-2xl p-4 border flex flex-col items-center text-center cursor-pointer transition-all select-none ${
-                            isChecked || isFocused
-                              ? 'bg-[var(--sel)] border-[#2563EB] ring-1 ring-[#2563EB]/30'
-                              : 'bg-[var(--sf)] border-[var(--bd)] hover:border-[#2563EB]/45 hover:bg-[var(--hover)]/60'
+                          className={`group relative rounded-[20px] border overflow-hidden flex flex-col cursor-pointer transition-colors select-none ${
+                            isChecked
+                              ? 'bg-[var(--pi)] border-[var(--primary)]/60'
+                              : isFocused
+                              ? 'bg-[var(--sel)] border-[var(--primary)]/50'
+                              : 'bg-[var(--sf)] border-[var(--bd)]/45 hover:border-[var(--primary)]/40'
                           }`}
                         >
-                          {/* Top-left selection checkbox */}
-                          <button
-                            type="button"
-                            onClick={(e) => toggleSelection(e, file.id)}
-                            aria-label={isChecked ? `Deselect ${file.name}` : `Select ${file.name}`}
-                            className={`absolute top-2.5 left-2.5 w-5 h-5 rounded-[6px] flex items-center justify-center z-10 transition-all ${
-                              isChecked
-                                ? 'bg-[#2563EB] text-white opacity-100 shadow-sm'
-                                : selectedFileIds.size > 0
-                                ? 'bg-[var(--sf)] border border-[var(--sub)]/45 text-transparent opacity-100'
-                                : 'bg-[var(--sf)]/90 border border-[var(--bd)] text-transparent opacity-0 group-hover:opacity-100'
-                            }`}
-                          >
-                            <Check size={12} strokeWidth={3} />
-                          </button>
-
-                          {/* Top-right actions menu */}
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                              setContextMenu({ file, x: rect.left - 160, y: rect.bottom });
-                            }}
-                            aria-label={`More actions for ${file.name}`}
-                            className="absolute top-2 right-2 p-1 rounded-lg text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--bg)]/80 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity z-10"
-                          >
-                            <MoreVertical size={16} />
-                          </button>
-
-                          {file.isNote && file.textPreview ? (
-                            <>
-                              <div className="mt-2 mb-3 w-full h-[92px] rounded-xl bg-[var(--bg)]/85 border border-[var(--bd)]/80 p-3 text-left overflow-hidden flex flex-col justify-start">
+                          {/* Top Preview Area (116px mobile / 130px desktop — exact Android FileGridItem/FolderGridItem geometry) */}
+                          <div className="relative w-full h-[116px] sm:h-[130px] overflow-hidden flex items-center justify-center bg-[var(--sf)]">
+                            {file.isNote && file.textPreview ? (
+                              <div className="w-full h-full p-3.5 pt-4 text-left bg-[var(--hover)]/35 overflow-hidden flex flex-col justify-start">
                                 <p className="text-[12px] leading-relaxed text-[var(--tx)] font-normal whitespace-pre-wrap break-words line-clamp-4">
                                   {file.textPreview}
                                 </p>
                               </div>
-                              <div className="w-full min-w-0 space-y-0.5">
-                                <p className="text-[11.5px] text-[var(--sub)] truncate tabular-nums">
-                                  {file.modified && file.modified !== '-' ? `${file.modified} · ${file.size}` : file.size || '—'}
-                                </p>
-                              </div>
-                            </>
-                          ) : (
-                            <>
-                              {/* Centered Large Icon or Image Thumbnail */}
-                              <div className="mt-2 mb-3 flex items-center justify-center">
-                                <FileIcon
-                                  file={file}
-                                  type={file.type}
-                                  size="lg"
-                                  isTg={file.isTgDrive}
-                                  accountId={selectedAccountId}
-                                  showThumbnails={userSettings?.showThumbnails !== false}
-                                />
-                              </div>
+                            ) : (
+                              <FileIcon
+                                file={file}
+                                type={file.type}
+                                size="card"
+                                isTg={file.isTgDrive}
+                                accountId={selectedAccountId}
+                                showThumbnails={userSettings?.showThumbnails !== false}
+                              />
+                            )}
 
-                              {/* Centered Name & Subtle Meta */}
-                              <div className="w-full min-w-0 space-y-0.5">
-                                <p className="text-[13.5px] font-semibold text-[var(--tx)] truncate" title={file.name}>
-                                  {file.name}
-                                </p>
-                                <p className="text-[11.5px] text-[var(--sub)] truncate tabular-nums">
-                                  {file.type === 'folder' ? 'Folder' : file.size || file.modified || '—'}
-                                </p>
-                              </div>
-                            </>
-                          )}
+                            {/* Top-left subtle desktop selection toggle (visible on hover or multi-select) */}
+                            <button
+                              type="button"
+                              onClick={(e) => toggleSelection(e, file.id)}
+                              aria-label={isChecked ? `Deselect ${file.name}` : `Select ${file.name}`}
+                              className={`hidden md:flex absolute top-2.5 left-2.5 w-6 h-6 rounded-full items-center justify-center z-10 transition-all ${
+                                isChecked
+                                  ? 'bg-[var(--primary)] text-[var(--on-primary)] opacity-100 shadow-xs'
+                                  : selectedFileIds.size > 0
+                                  ? 'bg-[var(--sf)]/90 border border-[var(--sub)]/50 text-transparent opacity-100'
+                                  : 'bg-[var(--sf)]/85 border border-[var(--bd)] text-transparent opacity-0 group-hover:opacity-100'
+                              }`}
+                            >
+                              <Check size={13} strokeWidth={3} />
+                            </button>
+
+                            {/* Top-right Selected Badge (Android style) OR 3-Dot Menu Button */}
+                            {isChecked ? (
+                              <button
+                                type="button"
+                                onClick={(e) => toggleSelection(e, file.id)}
+                                aria-label={`Deselect ${file.name}`}
+                                className="absolute top-2.5 right-2.5 w-6 h-6 rounded-full bg-[var(--primary)] text-[var(--on-primary)] flex items-center justify-center z-10 shadow-xs"
+                              >
+                                <Check size={13} strokeWidth={3} />
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                                  setContextMenu({ file, x: rect.left - 160, y: rect.bottom });
+                                }}
+                                aria-label={`More actions for ${file.name}`}
+                                className={`absolute top-2 right-2 w-7 h-7 rounded-full flex items-center justify-center z-10 transition-colors ${
+                                  isMediaPhoto
+                                    ? 'bg-black/45 text-white hover:bg-black/65'
+                                    : 'text-[var(--sub)] hover:text-[var(--tx)] hover:bg-[var(--hover)]'
+                                }`}
+                              >
+                                <MoreVertical size={16} />
+                              </button>
+                            )}
+                          </div>
+
+                          {/* Bottom Metadata Area (Android left-aligned 14px title + 11px subtitle) */}
+                          <div className="w-full px-3.5 py-2.5 text-left min-w-0">
+                            <p
+                              className="text-[13.5px] sm:text-[14px] font-semibold text-[var(--tx)] truncate leading-[18px]"
+                              title={file.isNote && file.textPreview ? file.textPreview : file.name}
+                            >
+                              {file.isNote && file.textPreview ? file.textPreview.replace(/\s+/g, ' ') : file.name}
+                            </p>
+                            <p className="text-[11px] font-medium text-[var(--sub)] truncate leading-[14px] mt-0.5 tabular-nums">
+                              {file.type === 'folder' ? 'Folder' : file.size || file.modified || '—'}
+                            </p>
+                          </div>
                         </div>
                       );
                     })}
@@ -5212,7 +5483,7 @@ export default function App() {
                   animate={{ y: 0, opacity: 1, x: '-50%' }}
                   exit={{ y: 80, opacity: 0, x: '-50%' }}
                   transition={{ type: 'spring', damping: 26, stiffness: 320 }}
-                  className="fixed bottom-24 md:bottom-6 left-1/2 h-14 md:h-16 rounded-[32px] bg-[#2563EB] text-white px-5 md:px-6 shadow-[0_8px_20px_rgba(37,99,235,0.4)] flex items-center gap-4 md:gap-5 z-50 max-w-[95vw] overflow-x-auto no-scrollbar"
+                  className="fixed bottom-24 md:bottom-6 left-1/2 h-14 md:h-16 rounded-[32px] bg-[var(--primary)] text-[var(--on-primary)] px-5 md:px-6 shadow-[0_8px_20px_var(--primary-shadow)] flex items-center gap-4 md:gap-5 z-50 max-w-[95vw] overflow-x-auto no-scrollbar"
                 >
                   <div className="flex items-center gap-2.5 shrink-0">
                     <button
@@ -5337,7 +5608,7 @@ export default function App() {
                       className="flex items-center gap-2.5 pl-4 pr-3.5 h-11 rounded-2xl bg-[var(--sf)] border border-[var(--bd)] shadow-xl text-[13px] font-semibold text-[var(--tx)] active:scale-95 transition-transform whitespace-nowrap"
                     >
                       <span>Upload files</span>
-                      <span className="w-7 h-7 rounded-xl bg-[#2563EB]/15 text-[#2563EB] flex items-center justify-center shrink-0">
+                      <span className="w-7 h-7 rounded-xl bg-[var(--primary)]/15 text-[var(--primary)] flex items-center justify-center shrink-0">
                         <UploadCloud size={16} />
                       </span>
                     </button>
@@ -5351,7 +5622,7 @@ export default function App() {
               onClick={() => setUploadMenuAnchor(prev => (prev === 'mobile' ? null : 'mobile'))}
               aria-label={uploadMenuAnchor === 'mobile' ? 'Close create menu' : 'Create or upload'}
               aria-expanded={uploadMenuAnchor === 'mobile'}
-              className="relative z-40 w-14 h-14 rounded-2xl bg-[#2563EB] text-white flex items-center justify-center shadow-[0_8px_22px_rgba(37,99,235,0.42)] active:scale-95 transition-all"
+              className="relative z-40 w-14 h-14 rounded-2xl bg-[var(--primary)] text-[var(--on-primary)] flex items-center justify-center shadow-[0_8px_22px_var(--primary-shadow)] active:scale-95 transition-all"
             >
               <Plus
                 size={26}
@@ -5427,15 +5698,15 @@ export default function App() {
                     ) : (
                       <>
                         {selectedFile.type !== 'folder' && (
-                          <button type="button" onClick={() => handleDownload(selectedFile.id)} className="flex flex-col items-center gap-1.5 p-3.5 bg-[var(--bg)] rounded-xl hover:bg-[var(--sel)] text-[var(--sub)] hover:text-[#2563EB] transition-colors border border-[var(--bd)]">
+                          <button type="button" onClick={() => handleDownload(selectedFile.id)} className="flex flex-col items-center gap-1.5 p-3.5 bg-[var(--bg)] rounded-xl hover:bg-[var(--sel)] text-[var(--sub)] hover:text-[var(--primary)] transition-colors border border-[var(--bd)]">
                             <Download size={18} /><span className="text-xs font-medium">Download</span>
                           </button>
                         )}
-                        <button type="button" onClick={() => handleRename(selectedFile.id, selectedFile.name)} className="flex flex-col items-center gap-1.5 p-3.5 bg-[var(--bg)] rounded-xl hover:bg-[var(--sel)] text-[var(--sub)] hover:text-[#2563EB] transition-colors border border-[var(--bd)]">
+                        <button type="button" onClick={() => handleRename(selectedFile.id, selectedFile.name)} className="flex flex-col items-center gap-1.5 p-3.5 bg-[var(--bg)] rounded-xl hover:bg-[var(--sel)] text-[var(--sub)] hover:text-[var(--primary)] transition-colors border border-[var(--bd)]">
                           <Edit3 size={18} /><span className="text-xs font-medium">Rename</span>
                         </button>
                         {selectedFile.type !== 'folder' && (
-                          <button type="button" onClick={() => handleShare(selectedFile.id)} className="flex flex-col items-center gap-1.5 p-3.5 bg-[var(--bg)] rounded-xl hover:bg-[var(--sel)] text-[var(--sub)] hover:text-[#2563EB] transition-colors border border-[var(--bd)]">
+                          <button type="button" onClick={() => handleShare(selectedFile.id)} className="flex flex-col items-center gap-1.5 p-3.5 bg-[var(--bg)] rounded-xl hover:bg-[var(--sel)] text-[var(--sub)] hover:text-[var(--primary)] transition-colors border border-[var(--bd)]">
                             <Share2 size={18} /><span className="text-xs font-medium">Share</span>
                           </button>
                         )}
@@ -5445,7 +5716,7 @@ export default function App() {
                           </button>
                         )}
                         {selectedFile.name.toLowerCase().endsWith('.zip') && (
-                          <button type="button" onClick={() => handleUnzip(selectedFile)} className="flex flex-col items-center gap-1.5 p-3.5 bg-[var(--bg)] rounded-xl hover:bg-[var(--sel)] text-[var(--sub)] hover:text-[#2563EB] transition-colors border border-[var(--bd)]">
+                          <button type="button" onClick={() => handleUnzip(selectedFile)} className="flex flex-col items-center gap-1.5 p-3.5 bg-[var(--bg)] rounded-xl hover:bg-[var(--sel)] text-[var(--sub)] hover:text-[var(--primary)] transition-colors border border-[var(--bd)]">
                             <FileArchive size={18} /><span className="text-xs font-medium">Unzip</span>
                           </button>
                         )}
@@ -5458,7 +5729,7 @@ export default function App() {
                   {/* Open in Google Drive / OneDrive link */}
                   {selectedFile.webViewLink && !selectedFile.isTgDrive && (
                     <div className="pt-1">
-                      <a href={selectedFile.webViewLink} target="_blank" rel="noopener noreferrer" className="flex items-center justify-center gap-2 w-full py-3 bg-[var(--sel)] text-[#2563EB] dark:text-[#60A5FA] text-sm font-semibold rounded-xl hover:opacity-90 transition-opacity">
+                      <a href={selectedFile.webViewLink} target="_blank" rel="noopener noreferrer" className="flex items-center justify-center gap-2 w-full py-3 bg-[var(--sel)] text-[var(--primary)] dark:text-[var(--primary-accent)] text-sm font-semibold rounded-xl hover:opacity-90 transition-opacity">
                         <ExternalLink size={16} /><span>Open in {selectedAccount?.accountType === 'onedrive' ? 'OneDrive' : 'Google Drive'}</span>
                       </a>
                     </div>
@@ -5482,7 +5753,7 @@ export default function App() {
             const waveWidth = 220;
             const activeEnd = activePct <= 0 ? 0 : Math.min(waveWidth - 2, Math.max(8, (activePct / 100) * (waveWidth - 4) + 2));
             const trackStart = activePct <= 0 ? 2 : Math.min(waveWidth - 4, activeEnd + 5);
-            const waveColor = isPaused ? '#F59E0B' : (isTgDrive ? '#0EA5E9' : '#2563EB');
+            const waveColor = isPaused ? '#F59E0B' : (isTgDrive ? 'var(--tt)' : 'var(--primary)');
 
             const headerTitle = failedItems.length > 0 && !isWorking
               ? `${failedItems.length} upload${failedItems.length === 1 ? '' : 's'} failed`
@@ -5527,7 +5798,7 @@ export default function App() {
                           <button
                             type="button"
                             onClick={resumeCurrentUpload}
-                            className="w-7 h-7 rounded-lg bg-[#2563EB] text-white flex items-center justify-center hover:bg-blue-700 transition-colors"
+                            className="w-7 h-7 rounded-lg bg-[var(--primary)] text-[var(--on-primary)] flex items-center justify-center hover:bg-[var(--primary-hover)] transition-colors"
                             title="Resume upload"
                           >
                             <Play size={13} fill="currentColor" />
@@ -5664,7 +5935,7 @@ export default function App() {
             >
               <span
                 className={`w-6 h-6 rounded-full flex items-center justify-center shrink-0 ${
-                  toast.type === 'error' ? 'bg-white/20 text-white' : 'bg-[#2563EB] text-white'
+                  toast.type === 'error' ? 'bg-white/20 text-white' : 'bg-[var(--primary)] text-[var(--on-primary)]'
                 }`}
               >
                 {toast.type === 'error' ? <X size={14} /> : <Check size={14} strokeWidth={2.75} />}
@@ -5710,11 +5981,11 @@ export default function App() {
                   <p className="text-[var(--sub)] text-sm font-medium mt-1">Choose a cloud provider to connect</p>
                 </div>
                 <div className="grid gap-2.5">
-                  <button onClick={() => handleConnect('google')} className="w-full flex items-center gap-3.5 p-3.5 rounded-[20px] border border-[var(--bd)] hover:border-[#2563EB] bg-[var(--bg)]/60 hover:bg-[var(--sel)] transition-all text-left">
+                  <button onClick={() => handleConnect('google')} className="w-full flex items-center gap-3.5 p-3.5 rounded-[20px] border border-[var(--bd)] hover:border-[var(--primary)] bg-[var(--bg)]/60 hover:bg-[var(--sel)] transition-all text-left">
                     {renderProviderBadge('google', 'md')}
                     <div><div className="font-extrabold text-sm text-[var(--tx)]">Google Drive</div><div className="text-[11px] font-semibold text-[var(--sub)]">Personal &amp; Workspace</div></div>
                   </button>
-                  <button onClick={() => handleConnect('onedrive')} className="w-full flex items-center gap-3.5 p-3.5 rounded-[20px] border border-[var(--bd)] hover:border-[#2563EB] bg-[var(--bg)]/60 hover:bg-[var(--sel)] transition-all text-left">
+                  <button onClick={() => handleConnect('onedrive')} className="w-full flex items-center gap-3.5 p-3.5 rounded-[20px] border border-[var(--bd)] hover:border-[var(--primary)] bg-[var(--bg)]/60 hover:bg-[var(--sel)] transition-all text-left">
                     {renderProviderBadge('onedrive', 'md')}
                     <div><div className="font-extrabold text-sm text-[var(--tx)]">Microsoft OneDrive</div><div className="text-[11px] font-semibold text-[var(--sub)]">Outlook &amp; Microsoft 365</div></div>
                   </button>
@@ -5935,7 +6206,7 @@ export default function App() {
                 >
                   <div className="flex items-start justify-between gap-3">
                     <div className="flex items-center gap-3 min-w-0">
-                      <div className={`w-11 h-11 rounded-2xl flex items-center justify-center shrink-0 ${isMoveAction ? 'bg-amber-500/15 text-amber-500' : 'bg-[#2563EB]/15 text-[#2563EB]'}`}>
+                      <div className={`w-11 h-11 rounded-2xl flex items-center justify-center shrink-0 ${isMoveAction ? 'bg-amber-500/15 text-amber-500' : 'bg-[var(--primary)]/15 text-[var(--primary)]'}`}>
                         {isMoveAction ? <ArrowLeftRight size={20} /> : <Copy size={20} />}
                       </div>
                       <div className="min-w-0">
@@ -5988,7 +6259,7 @@ export default function App() {
                               onClick={() => setDriveTransferTargetId(dest.id)}
                               className={`w-full flex items-center justify-between gap-3 p-3 rounded-2xl border text-left transition-colors ${
                                 selected
-                                  ? 'bg-[var(--sel)] border-[#2563EB]'
+                                  ? 'bg-[var(--sel)] border-[var(--primary)]'
                                   : 'bg-[var(--bg)] border-[var(--bd)] hover:border-[var(--sub)]/50'
                               }`}
                             >
@@ -5999,7 +6270,7 @@ export default function App() {
                                   <p className="text-[11px] text-[var(--sub)] truncate">{dest.email}</p>
                                 </div>
                               </div>
-                              {selected && <Check size={16} className="text-[#2563EB] shrink-0" />}
+                              {selected && <Check size={16} className="text-[var(--primary)] shrink-0" />}
                             </button>
                           );
                         })}
@@ -6019,7 +6290,7 @@ export default function App() {
                           value={driveTransferTargetFolder}
                           onChange={(e) => setDriveTransferTargetFolder(e.target.value)}
                           placeholder="Leave empty for drive root (e.g. Backups/OldDrive)"
-                          className="w-full h-11 px-3.5 rounded-2xl bg-[var(--bg)] border border-[var(--bd)] focus:border-[#2563EB] text-xs font-medium text-[var(--tx)] outline-none"
+                          className="w-full h-11 px-3.5 rounded-2xl bg-[var(--bg)] border border-[var(--bd)] focus:border-[var(--primary)] text-xs font-medium text-[var(--tx)] outline-none"
                         />
                       </div>
 
@@ -6077,10 +6348,10 @@ export default function App() {
                       type="button"
                       disabled={driveTransferSubmitting || !driveTransferTargetId || destinationOptions.length === 0}
                       onClick={handleStartDriveTransfer}
-                      className={`flex-1 h-11 rounded-[18px] text-sm font-bold text-white shadow-lg transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed ${
+                      className={`flex-1 h-11 rounded-[18px] text-sm font-bold shadow-lg transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed ${
                         isMoveAction
-                          ? 'bg-amber-600 hover:bg-amber-700 shadow-amber-600/20'
-                          : 'bg-[#2563EB] hover:bg-blue-700 shadow-blue-600/20'
+                          ? 'bg-amber-600 hover:bg-amber-700 text-white shadow-amber-600/20'
+                          : 'bg-[var(--primary)] hover:bg-[var(--primary-hover)] text-[var(--on-primary)] shadow-black/20'
                       }`}
                     >
                       {driveTransferSubmitting ? (
@@ -6144,7 +6415,7 @@ export default function App() {
                       </>
                     ) : (
                       <>
-                        {contextMenu.file.type !== 'folder' && <button onClick={() => { openPreview(contextMenu.file); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--sel)] hover:text-[#2563EB] transition-colors"><Eye size={15} /> Preview</button>}
+                        {contextMenu.file.type !== 'folder' && <button onClick={() => { openPreview(contextMenu.file); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--sel)] hover:text-[var(--primary)] transition-colors"><Eye size={15} /> Preview</button>}
                         {contextMenu.file.type !== 'folder' && <button onClick={() => { openFileInspector(contextMenu.file); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"><Info size={15} /> Details</button>}
                         <button onClick={() => { handleRename(contextMenu.file.id, contextMenu.file.name); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"><Edit3 size={15} /> Rename</button>
                         {contextMenu.file.type !== 'folder' && <button onClick={() => { handleDownload(contextMenu.file.id); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-bold text-[var(--tx)] hover:bg-[var(--bg)] transition-colors"><Download size={15} /> Download</button>}
@@ -6253,7 +6524,7 @@ export default function App() {
                     onClick={() => setPreviewInfoOpen(prev => !prev)}
                     className={`w-9 h-9 rounded-xl flex items-center justify-center transition-colors ${
                       previewInfoOpen
-                        ? 'bg-[#2563EB] text-white'
+                        ? 'bg-[var(--primary)] text-[var(--on-primary)]'
                         : 'bg-white/10 hover:bg-white/15 text-white'
                     }`}
                     title="File details (I)"
@@ -6314,7 +6585,7 @@ export default function App() {
                           <button
                             type="button"
                             onClick={() => handleDownload(previewFile.id)}
-                            className="h-9 px-4 rounded-xl bg-[#2563EB] hover:bg-blue-500 text-white text-xs font-semibold transition-colors"
+                            className="h-9 px-4 rounded-xl bg-[var(--primary)] hover:bg-[var(--primary-hover)] text-[var(--on-primary)] text-xs font-semibold transition-colors"
                           >
                             Download
                           </button>
@@ -6423,7 +6694,7 @@ export default function App() {
                           <button
                             type="button"
                             onClick={() => handleDownload(previewFile.id)}
-                            className="h-10 px-5 rounded-xl bg-[#2563EB] hover:bg-blue-700 text-white text-sm font-semibold inline-flex items-center gap-2 transition-colors"
+                            className="h-10 px-5 rounded-xl bg-[var(--primary)] hover:bg-[var(--primary-hover)] text-[var(--on-primary)] text-sm font-semibold inline-flex items-center gap-2 transition-colors"
                           >
                             <Download size={15} /> Download
                           </button>
@@ -6555,7 +6826,7 @@ export default function App() {
                         onClick={() => navigateMoveAccount(acc.id)}
                         className={`h-9 pl-1.5 pr-3 rounded-[14px] border flex items-center gap-2 text-xs font-bold whitespace-nowrap shrink-0 transition-all ${
                           isTarget
-                            ? 'bg-[var(--sel)] border-[#2563EB] text-[var(--tx)]'
+                            ? 'bg-[var(--sel)] border-[var(--primary)] text-[var(--tx)]'
                             : 'bg-[var(--sf)] border-[var(--bd)] text-[var(--sub)] hover:text-[var(--tx)]'
                         }`}
                       >
@@ -6614,13 +6885,13 @@ export default function App() {
                       onChange={e => setMoveInlineFolderName(e.target.value)}
                       onKeyDown={e => { if (e.key === 'Enter') handleCreateMoveFolderInline(); }}
                       placeholder="Folder name..."
-                      className="flex-1 h-9 px-3 rounded-xl bg-[var(--sf)] border border-[var(--bd)] focus:border-[#2563EB] text-xs font-bold text-[var(--tx)] outline-none"
+                      className="flex-1 h-9 px-3 rounded-xl bg-[var(--sf)] border border-[var(--bd)] focus:border-[var(--primary)] text-xs font-bold text-[var(--tx)] outline-none"
                     />
                     <button
                       type="button"
                       onClick={handleCreateMoveFolderInline}
                       disabled={moveCreatingFolder || !moveInlineFolderName.trim()}
-                      className="h-9 px-3.5 rounded-xl bg-[#2563EB] text-white text-xs font-bold disabled:opacity-50"
+                      className="h-9 px-3.5 rounded-xl bg-[var(--primary)] text-[var(--on-primary)] text-xs font-bold disabled:opacity-50"
                     >
                       {moveCreatingFolder ? 'Creating...' : 'Create'}
                     </button>
@@ -6638,7 +6909,7 @@ export default function App() {
                 <div className="flex-1 overflow-y-auto p-4 bg-[var(--bg)]/35">
                   {moveLoading ? (
                     <div className="flex items-center justify-center h-full">
-                      <RefreshCw className="animate-spin text-[#2563EB]" size={24} />
+                      <RefreshCw className="animate-spin text-[var(--primary)]" size={24} />
                     </div>
                   ) : (
                     <div className="space-y-1.5">
@@ -6675,7 +6946,7 @@ export default function App() {
                             key={f.id}
                             type="button"
                             onClick={() => navigateMoveFolder(f)}
-                            className="w-full flex items-center gap-3 p-3 rounded-[16px] bg-[var(--sf)] border border-[var(--bd)] hover:border-[#2563EB]/60 text-left transition-colors group"
+                            className="w-full flex items-center gap-3 p-3 rounded-[16px] bg-[var(--sf)] border border-[var(--bd)] hover:border-[var(--primary)]/60 text-left transition-colors group"
                           >
                             <span className="w-9 h-9 rounded-xl bg-amber-500/15 text-[#F59E0B] flex items-center justify-center shrink-0">
                               <Folder size={17} fill="currentColor" />
@@ -6713,7 +6984,7 @@ export default function App() {
                       type="button"
                       onClick={() => handleMoveConfirm(false)}
                       disabled={moveLoading}
-                      className="h-10 px-5 rounded-[18px] font-bold text-sm bg-[#2563EB] text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-lg shadow-blue-600/20 capitalize whitespace-nowrap shrink-0"
+                      className="h-10 px-5 rounded-[18px] font-bold text-sm bg-[var(--primary)] text-[var(--on-primary)] hover:bg-[var(--primary-hover)] disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-lg shadow-black/20 capitalize whitespace-nowrap shrink-0"
                     >
                       {modalAction} here
                     </button>

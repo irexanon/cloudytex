@@ -49,7 +49,7 @@ export default function PromptModal({ isOpen, title, value, onChange, onConfirm,
               onKeyDown={(e) => {
                 if (e.key === 'Enter') onConfirm();
               }}
-              className="w-full px-4 py-3.5 bg-[var(--bg)] border border-[var(--bd)] focus:border-[#2563EB] rounded-2xl outline-none transition-colors font-bold text-sm text-[var(--tx)]"
+              className="w-full px-4 py-3.5 bg-[var(--bg)] border border-[var(--bd)] focus:border-[var(--primary)] rounded-2xl outline-none transition-colors font-bold text-sm text-[var(--tx)]"
             />
             <div className="flex gap-2.5">
               <button
@@ -62,7 +62,7 @@ export default function PromptModal({ isOpen, title, value, onChange, onConfirm,
               <button
                 type="button"
                 onClick={onConfirm}
-                className="flex-1 py-3 bg-[#2563EB] text-white text-sm font-bold rounded-[18px] hover:bg-blue-700 shadow-lg shadow-blue-600/20 transition-all active:scale-95"
+                className="flex-1 py-3 bg-[var(--primary)] text-[var(--on-primary)] text-sm font-bold rounded-[18px] hover:bg-[var(--primary-hover)] shadow-lg transition-all active:scale-95"
               >
                 Save
               </button>

@@ -164,7 +164,7 @@ export default function ShareModal({
                       <button
                         type="button"
                         onClick={copyLink}
-                        className="px-4 h-10 rounded-full bg-[#2563EB] hover:bg-blue-700 text-white text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-all active:scale-[0.97]"
+                        className="px-4 h-10 rounded-full bg-[var(--primary)] hover:bg-[var(--primary-hover)] text-[var(--on-primary)] text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-all active:scale-[0.97]"
                       >
                         {copied ? <Check size={14} /> : <Copy size={14} />}
                         <span>{copied ? 'Copied' : 'Copy'}</span>
@@ -199,7 +199,7 @@ export default function ShareModal({
                     <button
                       type="button"
                       onClick={onClose}
-                      className="px-5 h-10 rounded-full bg-[#2563EB] hover:bg-blue-700 text-white text-xs font-semibold transition-all active:scale-[0.97]"
+                      className="px-5 h-10 rounded-full bg-[var(--primary)] hover:bg-[var(--primary-hover)] text-[var(--on-primary)] text-xs font-semibold transition-all active:scale-[0.97]"
                     >
                       Done
                     </button>
@@ -216,7 +216,7 @@ export default function ShareModal({
                       <select
                         value={expiresInHours}
                         onChange={(e) => setExpiresInHours(e.target.value)}
-                        className="w-full h-10 px-3.5 rounded-2xl bg-[var(--bg)] border border-[var(--bd)] text-xs font-semibold text-[var(--tx)] outline-none focus:border-[#2563EB]"
+                        className="w-full h-10 px-3.5 rounded-2xl bg-[var(--bg)] border border-[var(--bd)] text-xs font-semibold text-[var(--tx)] outline-none focus:border-[var(--primary)]"
                       >
                         <option value="">Never expires</option>
                         <option value="1">1 hour</option>
@@ -237,7 +237,7 @@ export default function ShareModal({
                         placeholder="Unlimited"
                         value={maxDownloads}
                         onChange={(e) => setMaxDownloads(e.target.value)}
-                        className="w-full h-10 px-3.5 rounded-2xl bg-[var(--bg)] border border-[var(--bd)] text-xs font-semibold text-[var(--tx)] outline-none focus:border-[#2563EB] tabular-nums"
+                        className="w-full h-10 px-3.5 rounded-2xl bg-[var(--bg)] border border-[var(--bd)] text-xs font-semibold text-[var(--tx)] outline-none focus:border-[var(--primary)] tabular-nums"
                       />
                     </div>
                   </div>
@@ -253,7 +253,7 @@ export default function ShareModal({
                       placeholder="Leave blank for open access"
                       value={pin}
                       onChange={(e) => setPin(e.target.value)}
-                      className="w-full h-10 px-3.5 rounded-2xl bg-[var(--bg)] border border-[var(--bd)] text-xs font-semibold text-[var(--tx)] outline-none focus:border-[#2563EB]"
+                      className="w-full h-10 px-3.5 rounded-2xl bg-[var(--bg)] border border-[var(--bd)] text-xs font-semibold text-[var(--tx)] outline-none focus:border-[var(--primary)]"
                     />
                   </div>
 
@@ -266,7 +266,7 @@ export default function ShareModal({
                       type="checkbox"
                       checked={allowDownload}
                       onChange={(e) => setAllowDownload(e.target.checked)}
-                      className="w-4 h-4 rounded border-[var(--bd)] text-[#2563EB] focus:ring-[#2563EB]"
+                      className="w-4 h-4 rounded border-[var(--bd)] accent-[var(--primary)]"
                     />
                   </label>
 
@@ -285,7 +285,7 @@ export default function ShareModal({
                     <button
                       type="submit"
                       disabled={submitting}
-                      className="px-6 h-10 rounded-full bg-[#2563EB] hover:bg-blue-700 text-white text-xs font-semibold transition-all active:scale-[0.97] disabled:opacity-50"
+                      className="px-6 h-10 rounded-full bg-[var(--primary)] hover:bg-[var(--primary-hover)] text-[var(--on-primary)] text-xs font-semibold transition-all active:scale-[0.97] disabled:opacity-50"
                     >
                       {submitting ? 'Generating...' : 'Create & Copy Link'}
                     </button>

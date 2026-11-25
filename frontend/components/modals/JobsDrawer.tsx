@@ -224,7 +224,7 @@ export default function JobsDrawer({
             const waveWidth = 260;
             const activeEnd = pct <= 0 ? 0 : Math.min(waveWidth - 2, Math.max(8, (pct / 100) * (waveWidth - 4) + 2));
             const trackStart = pct <= 0 ? 2 : Math.min(waveWidth - 4, activeEnd + 6);
-            const strokeColor = isFailed ? '#F43F5E' : isCompleted ? '#10B981' : '#2563EB';
+            const strokeColor = isFailed ? 'var(--error)' : isCompleted ? 'var(--success)' : 'var(--primary)';
             const primaryName = job.fileName || job.payload?.fileName || formatJobTypeLabel(job.type, job.isMove);
             const showTypeSubtitle = Boolean(job.fileName || job.payload?.fileName);
             const showItemProgress = job.type === 'drive_transfer' || Number(job.totalItems || 0) > 1;

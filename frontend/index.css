@@ -5,57 +5,226 @@
 @theme {
   --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-  --color-brand: #2563eb;
-  --color-brand-dark: #1d4ed8;
-  --color-brand-darker: #1e3a8a;
+  --color-brand: #2f6feb;
+  --color-brand-dark: #255cd1;
+  --color-brand-darker: #0f2d7a;
 }
 
+/* ── Android Cloudyte Light Theme (Clean Slate Canvas — Color.kt) ── */
 :root {
-  --bg: #f8fafc;
-  --rail: #ffffff;
-  --sf: #ffffff;
-  --hover: #f1f5f9;
-  --bd: #e2e8f0;
+  --primary: #2f6feb;
+  --primary-hover: #255cd1;
+  --primary-accent: #4c8dff;
+  --on-primary: #ffffff;
+  --primary-soft: rgba(47, 111, 235, 0.14);
+  --primary-shadow: rgba(47, 111, 235, 0.36);
+
+  --bg: #edf1f7;
+  --rail: #f4f7fb;
+  --sf: #fafbfd;
+  --hover: #e1e8f4;
+  --bd: #c2cee0;
   --tx: #0f172a;
-  --sub: #64748b;
-  --sel: #eff6ff;
-  --pi: #dbeafe;
-  --pit: #1e3a8a;
-  --tr: #e2e8f0;
-  --gb: #ecfdf5;
-  --gt: #059669;
-  --ob: #eff6ff;
-  --ot: #2563eb;
-  --tb: #f0f9ff;
-  --tt: #0ea5e9;
-  --chip: #e2e8f0;
-  --chipt: #334155;
-  --tonal: #dbeafe;
-  --tonalt: #1d4ed8;
+  --sub: #475569;
+
+  --sel: #dce8ff;
+  --pi: #d8e6ff;
+  --pit: #0f2d7a;
+  --tr: #d5dfef;
+
+  --gb: #dbeafe;
+  --gt: #4285f4;
+  --ob: #e0f2fe;
+  --ot: #3b9bff;
+  --tb: #dcf2fc;
+  --tt: #2aabee;
+
+  --chip: #e1e8f4;
+  --chipt: #38425e;
+  --tonal: #d8e6ff;
+  --tonalt: #0f2d7a;
+
+  --success: #52c592;
+  --error: #dc2626;
+  --rail-hover-bg: #2f6feb;
+  --rail-hover-fg: #ffffff;
+
+  /* Android FileThumb & Folder Semantic Tokens (Color.kt) */
+  --folder-tint: #2f6feb;
+  --cat-img-bg: #4361ee;
+  --cat-img-fg: #ffffff;
+  --cat-doc-bg: #f5b72e;
+  --cat-doc-fg: #2b1e00;
+  --cat-media-bg: #ef4b4b;
+  --cat-media-fg: #ffffff;
+  --cat-zip-bg: #9b5ce8;
+  --cat-zip-fg: #ffffff;
+  --cat-other-bg: #52c592;
+  --cat-other-fg: #05261a;
+  --cat-unknown-bg: #e2e8f0;
+  --cat-unknown-fg: #141a2b;
 }
 
-.dark {
-  --bg: #070b14;
-  --rail: #090e1a;
-  --sf: #0f172a;
-  --hover: #162033;
-  --bd: #1e293b;
-  --tx: #f1f5f9;
-  --sub: #94a3b8;
-  --sel: #172554;
-  --pi: #1e3a8a;
-  --pit: #dbeafe;
-  --tr: #1e293b;
-  --gb: #0d222d;
-  --gt: #34d399;
-  --ob: #121e3d;
-  --ot: #60a5fa;
-  --tb: #0e2138;
-  --tt: #38bdf8;
-  --chip: #1e293b;
-  --chipt: #cbd5e1;
-  --tonal: #1e293b;
-  --tonalt: #dbeafe;
+/* ── Android Cloudyte Dark Theme (Deep Midnight Navy Expressive — Color.kt) ── */
+html.dark {
+  --primary: #2f6feb;
+  --primary-hover: #4c8dff;
+  --primary-accent: #6fa2ff;
+  --on-primary: #ffffff;
+  --primary-soft: rgba(47, 111, 235, 0.22);
+  --primary-shadow: rgba(47, 111, 235, 0.42);
+
+  --bg: #060918;
+  --rail: #0d1528;
+  --sf: #121b2e;
+  --hover: #1b2538;
+  --bd: #1e2940;
+  --tx: #f4f6fc;
+  --sub: #9aa4bc;
+
+  --sel: #1b2a5e;
+  --pi: #18275a;
+  --pit: #6fa2ff;
+  --tr: #222e46;
+
+  --gb: #162f5e;
+  --gt: #4285f4;
+  --ob: #0a2f57;
+  --ot: #3b9bff;
+  --tb: #0f3a52;
+  --tt: #2aabee;
+
+  --chip: #1b2538;
+  --chipt: #c9d1e6;
+  --tonal: #1b2a5e;
+  --tonalt: #ffffff;
+
+  --success: #52c592;
+  --error: #ef4b4b;
+  --rail-hover-bg: #2f6feb;
+  --rail-hover-fg: #ffffff;
+
+  --folder-tint: #4c8dff;
+  --cat-img-bg: #4361ee;
+  --cat-img-fg: #ffffff;
+  --cat-doc-bg: #f5b72e;
+  --cat-doc-fg: #2b1e00;
+  --cat-media-bg: #ef4b4b;
+  --cat-media-fg: #ffffff;
+  --cat-zip-bg: #9b5ce8;
+  --cat-zip-fg: #ffffff;
+  --cat-other-bg: #52c592;
+  --cat-other-fg: #05261a;
+  --cat-unknown-bg: #1b2640;
+  --cat-unknown-fg: #a7afc8;
+}
+
+/* ── Android Cloudyte Noir Light Theme (NoirColors.kt) ── */
+html.noir {
+  --primary: #000000;
+  --primary-hover: #1f2937;
+  --primary-accent: #111827;
+  --on-primary: #ffffff;
+  --primary-soft: rgba(17, 24, 39, 0.1);
+  --primary-shadow: rgba(0, 0, 0, 0.28);
+
+  --bg: #e8ecf1;
+  --rail: #f1f4f8;
+  --sf: #f8fafc;
+  --hover: #d8dee7;
+  --bd: #bcc5d3;
+  --tx: #0f172a;
+  --sub: #475569;
+
+  --sel: #e5e7eb;
+  --pi: #e5e7eb;
+  --pit: #111827;
+  --tr: #ccd4e0;
+
+  --gb: #dadde3;
+  --gt: #1f2937;
+  --ob: #e5e7eb;
+  --ot: #374151;
+  --tb: #e5e7eb;
+  --tt: #111827;
+
+  --chip: #d8dee7;
+  --chipt: #404040;
+  --tonal: #e5e7eb;
+  --tonalt: #111827;
+
+  --success: #111827;
+  --error: #dc2626;
+  --rail-hover-bg: #111827;
+  --rail-hover-fg: #ffffff;
+
+  --folder-tint: #111827;
+  --cat-img-bg: #e2e5ea;
+  --cat-img-fg: #111827;
+  --cat-doc-bg: #e5e7eb;
+  --cat-doc-fg: #111827;
+  --cat-media-bg: #d1d5db;
+  --cat-media-fg: #111827;
+  --cat-zip-bg: #374151;
+  --cat-zip-fg: #ffffff;
+  --cat-other-bg: #111827;
+  --cat-other-fg: #ffffff;
+  --cat-unknown-bg: #dadde3;
+  --cat-unknown-fg: #1f2937;
+}
+
+/* ── Android Cloudyte Noir Dark Theme (NoirColors.kt) ── */
+html.dark.noir {
+  --primary: #ffffff;
+  --primary-hover: #e5e5e5;
+  --primary-accent: #f5f5f5;
+  --on-primary: #0a0a0a;
+  --primary-soft: rgba(255, 255, 255, 0.14);
+  --primary-shadow: rgba(0, 0, 0, 0.55);
+
+  --bg: #0a0a0a;
+  --rail: #121212;
+  --sf: #181818;
+  --hover: #222222;
+  --bd: #262626;
+  --tx: #ffffff;
+  --sub: #a3a3a3;
+
+  --sel: #262626;
+  --pi: #262626;
+  --pit: #f5f5f5;
+  --tr: #2c2c2c;
+
+  --gb: #262626;
+  --gt: #e5e5e5;
+  --ob: #222222;
+  --ot: #d4d4d4;
+  --tb: #2a2a2a;
+  --tt: #f5f5f5;
+
+  --chip: #222222;
+  --chipt: #d4d4d4;
+  --tonal: #262626;
+  --tonalt: #ffffff;
+
+  --success: #f5f5f5;
+  --error: #ef4444;
+  --rail-hover-bg: #262626;
+  --rail-hover-fg: #ffffff;
+
+  --folder-tint: #f5f5f5;
+  --cat-img-bg: #2a2a2a;
+  --cat-img-fg: #ffffff;
+  --cat-doc-bg: #2e2e2e;
+  --cat-doc-fg: #f5f5f5;
+  --cat-media-bg: #383838;
+  --cat-media-fg: #ffffff;
+  --cat-zip-bg: #444444;
+  --cat-zip-fg: #ffffff;
+  --cat-other-bg: #f5f5f5;
+  --cat-other-fg: #0a0a0a;
+  --cat-unknown-bg: #222222;
+  --cat-unknown-fg: #d4d4d4;
 }
 
 @layer base {
@@ -75,7 +244,11 @@
     @apply bg-transparent;
   }
   ::-webkit-scrollbar-thumb {
-    @apply bg-slate-200 dark:bg-[#1C263D] rounded-full hover:bg-slate-300 dark:hover:bg-[#2A395B] transition-colors;
+    background-color: var(--bd);
+    border-radius: 9999px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: var(--sub);
   }
 
   .no-scrollbar::-webkit-scrollbar,
@@ -96,6 +269,10 @@
     @apply bg-transparent;
   }
   .scrollbar-thin::-webkit-scrollbar-thumb {
-    @apply bg-slate-200 dark:bg-slate-800 rounded-full hover:bg-slate-300 dark:hover:bg-slate-700 transition-colors;
+    background-color: var(--bd);
+    border-radius: 9999px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+    background-color: var(--sub);
   }
 }
