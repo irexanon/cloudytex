@@ -998,10 +998,15 @@ function parseDeviceNameFromRequest(req: any): string {
  * Enforces API-token scope ('read' | 'write' | 'delete' | 'share') and optional accountId / rootFolderId confinement.
  */
 function enforceTokenScopeAndConfinement(req: any, res: any): boolean {
+  const fullPath = String(req.originalUrl || req.url || req.path || '');
+  const pathOnly = fullPath.split('?')[0];
+  if (pathOnly === '/mcp' || pathOnly === '/api/mcp') {
+    return true;
+  }
+
   const scopes: string[] | undefined = req.tokenScopes;
   if (Array.isArray(scopes)) {
     const method = String(req.method || 'GET').toUpperCase();
-    const fullPath = String(req.originalUrl || req.url || req.path || '');
     let requiredScope = 'read';
     if (/^\/api\/share/i.test(fullPath) && method !== 'GET' && method !== 'HEAD') {
       requiredScope = 'share';

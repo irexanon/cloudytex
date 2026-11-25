@@ -3778,7 +3778,7 @@ export default function App() {
                   { id: 'general', label: 'General' },
                   { id: 'accounts', label: `Accounts (${accounts.length})` },
                   { id: 'sessions', label: 'Active Sessions' },
-                  { id: 'tokens', label: 'Access Tokens' },
+                  { id: 'tokens', label: 'AI & API Access' },
                   { id: 'shares', label: 'Shared Links' },
                 ].map((tab) => (
                   <button

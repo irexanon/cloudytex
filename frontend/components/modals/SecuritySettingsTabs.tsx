@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Shield, Key, Share2, Trash2, Copy, Check, RefreshCw, Plus, Monitor, Lock } from 'lucide-react';
+import { Shield, Key, Share2, Trash2, Copy, Check, RefreshCw, Plus, Monitor, Lock, BookOpen, ChevronDown, ChevronUp } from 'lucide-react';
 
 export interface SecuritySettingsTabsProps {
   activeTab: 'sessions' | 'tokens' | 'shares';
@@ -29,6 +29,7 @@ export default function SecuritySettingsTabs({
   const [creatingPat, setCreatingPat] = useState(false);
   const [newlyCreatedToken, setNewlyCreatedToken] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [showAiGuide, setShowAiGuide] = useState<boolean>(true);
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -249,32 +250,214 @@ export default function SecuritySettingsTabs({
     );
   }
 
+  const originUrl = typeof window !== 'undefined' ? window.location.origin : '';
+  const mcpUrl = `${originUrl}/mcp`;
+  const openApiUrl = `${originUrl}/api/openapi.json`;
+
+  const buildAiPromptText = (t: { token: string; name?: string; scopes?: string[]; accountId?: string | null; rootFolderId?: string | null }) => {
+    const scopeList = Array.isArray(t.scopes) && t.scopes.length > 0 ? t.scopes.join(', ') : 'read, write';
+    const matchedAcc = t.accountId ? accounts.find((a) => a.id === t.accountId) : null;
+    const driveScopeText = t.accountId
+      ? `${matchedAcc?.name || t.accountId} (accountId: ${t.accountId})`
+      : 'All connected drives (call GET /api/accounts or list_drives first)';
+    const folderScopeText = t.rootFolderId ? `/${t.rootFolderId}` : 'Any folder';
+
+    return [
+      `You have access to my Cloudyte cloud storage.`,
+      ``,
+      `Connection Details:`,
+      `- Base URL: ${originUrl}`,
+      `- MCP Server URL (Streamable HTTP): ${mcpUrl}`,
+      `- OpenAPI Schema URL: ${openApiUrl}`,
+      `- Auth Header: Authorization: Bearer ${t.token}`,
+      `- Allowed Scopes: ${scopeList}`,
+      `- Drive Access: ${driveScopeText}`,
+      `- Root Folder Lock: ${folderScopeText}`,
+      ``,
+      `Key Endpoints (if not using MCP directly):`,
+      `- List drives: GET ${originUrl}/api/accounts`,
+      `- List/search files: GET ${originUrl}/api/files?accountId=<id>&folderId=root&search=<query>`,
+      `- Create folder: POST ${originUrl}/api/folders?accountId=<id>  { "name": "...", "parentId": "root" }`,
+      `- Move file: POST ${originUrl}/api/files/move  { "sourceAccountId": "...", "fileId": "...", "targetAccountId": "...", "targetFolderId": "..." }`,
+      `- Batch move (up to 50): POST ${originUrl}/api/ai/files/batch-move  { "sourceAccountId": "...", "fileIds": [...], "targetAccountId": "...", "targetFolderId": "..." }`,
+      `- Upload text/markdown/json file: POST ${originUrl}/api/ai/upload-text/<accountId>  { "fileName": "...", "content": "...", "folderId": "..." }`,
+      `- Upload from public URL: POST ${originUrl}/api/ai/upload-from-url/<accountId>  { "url": "https://...", "fileName": "...", "folderId": "..." }`,
+      `- Share link: POST ${originUrl}/api/share  { "accountId": "...", "fileId": "..." }`,
+      ``,
+      `Always verify file IDs and folder IDs with list_files before moving or renaming.`,
+    ].join('\n');
+  };
+
+  const buildMcpJson = (tokenValue: string) =>
+    JSON.stringify(
+      {
+        mcpServers: {
+          cloudyte: {
+            url: mcpUrl,
+            headers: {
+              Authorization: `Bearer ${tokenValue}`,
+            },
+          },
+        },
+      },
+      null,
+      2
+    );
+
   if (activeTab === 'tokens') {
     return (
       <div className="space-y-5">
         <div>
-          <h3 className="text-base font-bold text-slate-900 dark:text-white flex items-center gap-2">
-            <Key size={18} className="text-blue-600 dark:text-blue-400" />
-            <span>Personal Access Tokens</span>
+          <h3 className="text-base font-bold text-[var(--tx)] flex items-center gap-2">
+            <Key size={18} className="text-[var(--primary)]" />
+            <span>AI Assistant &amp; API Access</span>
           </h3>
-          <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-            Issue scoped tokens for scripts or external tools, confined to an optional drive or folder
+          <p className="text-xs text-[var(--sub)] mt-0.5">
+            Connect any AI assistant (ChatGPT, Claude, Cursor, custom agents) using MCP or OpenAPI with a scoped token
           </p>
         </div>
 
-        <form onSubmit={handleCreatePat} className="p-5 rounded-3xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 space-y-4">
+        {/* Ready-to-Use AI Connector Endpoints */}
+        <div className="p-4 sm:p-5 rounded-3xl bg-[var(--sf)] border border-[var(--bd)] space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <p className="text-xs font-bold text-[var(--tx)]">AI Connector Endpoints</p>
+              <p className="text-[11px] text-[var(--sub)]">
+                Give your AI either link below along with a Bearer token created here.
+              </p>
+            </div>
+            <span className="px-2.5 py-1 rounded-full bg-[var(--pi)] text-[var(--pit)] text-[10px] font-bold uppercase tracking-wider">
+              MCP + OpenAPI Ready
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div className="p-3 rounded-2xl bg-[var(--bg)] border border-[var(--bd)] flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <p className="text-[10px] font-bold uppercase tracking-wider text-[var(--sub)]">MCP Server URL (Claude / Cursor / Agents)</p>
+                <p className="text-xs font-mono text-[var(--tx)] truncate mt-0.5">{mcpUrl}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => copyValue('mcp_url', mcpUrl)}
+                className="px-3 h-8 rounded-xl bg-[var(--pi)] text-[var(--pit)] text-[11px] font-bold flex items-center gap-1 shrink-0 hover:opacity-90 transition-opacity"
+              >
+                {copiedId === 'mcp_url' ? <Check size={13} /> : <Copy size={13} />}
+                <span>Copy</span>
+              </button>
+            </div>
+
+            <div className="p-3 rounded-2xl bg-[var(--bg)] border border-[var(--bd)] flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <p className="text-[10px] font-bold uppercase tracking-wider text-[var(--sub)]">OpenAPI Spec URL (ChatGPT Actions / n8n)</p>
+                <p className="text-xs font-mono text-[var(--tx)] truncate mt-0.5">{openApiUrl}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => copyValue('openapi_url', openApiUrl)}
+                className="px-3 h-8 rounded-xl bg-[var(--pi)] text-[var(--pit)] text-[11px] font-bold flex items-center gap-1 shrink-0 hover:opacity-90 transition-opacity"
+              >
+                {copiedId === 'openapi_url' ? <Check size={13} /> : <Copy size={13} />}
+                <span>Copy</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Step-by-Step User Guide */}
+          <div className="pt-1">
+            <button
+              type="button"
+              onClick={() => setShowAiGuide((prev) => !prev)}
+              className="w-full flex items-center justify-between gap-2 px-3.5 py-2.5 rounded-2xl bg-[var(--bg)] border border-[var(--bd)] text-left hover:border-[var(--primary)]/50 transition-colors"
+            >
+              <div className="flex items-center gap-2 min-w-0">
+                <BookOpen size={14} className="text-[var(--primary)] shrink-0" />
+                <span className="text-xs font-bold text-[var(--tx)]">How to Connect Your AI (Quick Guide)</span>
+              </div>
+              {showAiGuide ? (
+                <ChevronUp size={15} className="text-[var(--sub)] shrink-0" />
+              ) : (
+                <ChevronDown size={15} className="text-[var(--sub)] shrink-0" />
+              )}
+            </button>
+
+            {showAiGuide && (
+              <div className="mt-2.5 p-4 rounded-2xl bg-[var(--bg)] border border-[var(--bd)] space-y-3.5 text-xs">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  <div className="p-3 rounded-xl bg-[var(--sf)] border border-[var(--bd)] space-y-1">
+                    <p className="font-bold text-[var(--tx)]">1. Create a Safe Token</p>
+                    <p className="text-[11px] text-[var(--sub)] leading-relaxed">
+                      Click <span className="font-semibold text-[var(--tx)]">Preset: AI Organizer (No Delete)</span> below. Optionally lock the token to a single Drive or Root Folder, then create it.
+                    </p>
+                  </div>
+
+                  <div className="p-3 rounded-xl bg-[var(--sf)] border border-[var(--bd)] space-y-1">
+                    <p className="font-bold text-[var(--tx)]">2. Connect to Your AI</p>
+                    <p className="text-[11px] text-[var(--sub)] leading-relaxed">
+                      <span className="font-semibold text-[var(--tx)]">Claude / Cursor / Agents:</span> Click <span className="font-semibold text-[var(--tx)]">MCP JSON</span>.<br />
+                      <span className="font-semibold text-[var(--tx)]">ChatGPT Actions:</span> Import the OpenAPI URL + Bearer token.<br />
+                      <span className="font-semibold text-[var(--tx)]">Any AI Chat:</span> Click <span className="font-semibold text-[var(--tx)]">AI Prompt</span> and paste.
+                    </p>
+                  </div>
+
+                  <div className="p-3 rounded-xl bg-[var(--sf)] border border-[var(--bd)] space-y-1">
+                    <p className="font-bold text-[var(--tx)]">3. Ask AI to Manage Files</p>
+                    <p className="text-[11px] text-[var(--sub)] leading-relaxed">
+                      &ldquo;List my drives, create a folder named Invoices, move all PDFs into it, or upload this URL to my TG Drive.&rdquo;
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-[var(--sub)] pt-1 border-t border-[var(--bd)]">
+                  <span><strong className="text-[var(--tx)]">read:</strong> list &amp; search files</span>
+                  <span><strong className="text-[var(--tx)]">write:</strong> upload, create folder, move, copy, rename</span>
+                  <span><strong className="text-[var(--tx)]">share:</strong> create share links</span>
+                  <span><strong className="text-[var(--tx)]">delete:</strong> move files to Trash (off by default in AI preset)</span>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <form onSubmit={handleCreatePat} className="p-5 rounded-3xl bg-[var(--sf)] border border-[var(--bd)] space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="text-xs font-bold text-[var(--tx)]">Create Scoped Token</span>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setPatName('AI Organizer (Safe)');
+                  setPatScopes(['read', 'write']);
+                }}
+                className="px-3 py-1 rounded-xl bg-[var(--pi)] text-[var(--pit)] text-[11px] font-bold hover:opacity-90 transition-opacity"
+              >
+                Preset: AI Organizer (No Delete)
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setPatName('AI Reader');
+                  setPatScopes(['read']);
+                }}
+                className="px-3 py-1 rounded-xl bg-[var(--bg)] border border-[var(--bd)] text-[var(--sub)] hover:text-[var(--tx)] text-[11px] font-semibold transition-colors"
+              >
+                Preset: Read-Only
+              </button>
+            </div>
+          </div>
+
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <input
               type="text"
-              placeholder="Token name (e.g. Backup CLI)"
+              placeholder="Token name (e.g. ChatGPT Organizer)"
               value={patName}
               onChange={(e) => setPatName(e.target.value)}
-              className="h-10 px-4 rounded-2xl bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-800 dark:text-slate-100 outline-none focus:bg-white dark:focus:bg-slate-950 focus:border-blue-600 focus:ring-4 focus:ring-blue-500/15"
+              className="h-10 px-4 rounded-2xl bg-[var(--bg)] border border-[var(--bd)] text-xs font-semibold text-[var(--tx)] outline-none focus:border-[var(--primary)]"
             />
             <select
               value={patExpiresDays}
               onChange={(e) => setPatExpiresDays(e.target.value)}
-              className="h-10 px-4 rounded-2xl bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-800 dark:text-slate-100 outline-none focus:bg-white dark:focus:bg-slate-950 focus:border-blue-600 focus:ring-4 focus:ring-blue-500/15"
+              className="h-10 px-4 rounded-2xl bg-[var(--bg)] border border-[var(--bd)] text-xs font-semibold text-[var(--tx)] outline-none focus:border-[var(--primary)]"
             >
               <option value="7">Expires in 7 days</option>
               <option value="30">Expires in 30 days</option>
@@ -287,7 +470,7 @@ export default function SecuritySettingsTabs({
             <select
               value={patAccountId}
               onChange={(e) => setPatAccountId(e.target.value)}
-              className="h-10 px-4 rounded-2xl bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-800 dark:text-slate-100 outline-none focus:bg-white dark:focus:bg-slate-950 focus:border-blue-600 focus:ring-4 focus:ring-blue-500/15"
+              className="h-10 px-4 rounded-2xl bg-[var(--bg)] border border-[var(--bd)] text-xs font-semibold text-[var(--tx)] outline-none focus:border-[var(--primary)]"
             >
               <option value="">All linked drives (no account limit)</option>
               {accounts.map((acc) => (
@@ -298,23 +481,23 @@ export default function SecuritySettingsTabs({
             </select>
             <input
               type="text"
-              placeholder="Optional root folder confinement (e.g. backups)"
+              placeholder="Optional root folder lock (e.g. Inbox)"
               value={patRootFolderId}
               onChange={(e) => setPatRootFolderId(e.target.value)}
-              className="h-10 px-4 rounded-2xl bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-800 dark:text-slate-100 outline-none focus:bg-white dark:focus:bg-slate-950 focus:border-blue-600 focus:ring-4 focus:ring-blue-500/15"
+              className="h-10 px-4 rounded-2xl bg-[var(--bg)] border border-[var(--bd)] text-xs font-semibold text-[var(--tx)] outline-none focus:border-[var(--primary)]"
             />
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
             <div className="flex flex-wrap items-center gap-3">
-              <span className="text-xs font-semibold text-slate-600 dark:text-slate-300">Scopes:</span>
+              <span className="text-xs font-semibold text-[var(--sub)]">Scopes:</span>
               {ALL_SCOPES.map((sc) => (
-                <label key={sc} className="flex items-center gap-1.5 text-xs font-medium text-slate-700 dark:text-slate-300 cursor-pointer">
+                <label key={sc} className="flex items-center gap-1.5 text-xs font-medium text-[var(--tx)] cursor-pointer">
                   <input
                     type="checkbox"
                     checked={patScopes.includes(sc)}
                     onChange={() => toggleScope(sc)}
-                    className="w-4 h-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                    className="w-4 h-4 rounded border-[var(--bd)] accent-[var(--primary)]"
                   />
                   <span>{sc}</span>
                 </label>
@@ -323,47 +506,77 @@ export default function SecuritySettingsTabs({
             <button
               type="submit"
               disabled={creatingPat}
-              className="px-5 h-9 rounded-full bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0 disabled:opacity-50 transition-all active:scale-[0.97]"
+              className="px-5 h-9 rounded-full bg-[var(--primary)] hover:bg-[var(--primary-hover)] text-[var(--on-primary)] text-xs font-bold flex items-center gap-1.5 whitespace-nowrap shrink-0 disabled:opacity-50 transition-all active:scale-[0.97]"
             >
               <Plus size={14} />
-              <span>{creatingPat ? 'Creating...' : 'Create Token'}</span>
+              <span>{creatingPat ? 'Creating...' : 'Create AI Token'}</span>
             </button>
           </div>
         </form>
 
         {newlyCreatedToken && (
-          <div className="p-4 rounded-3xl bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200 dark:border-emerald-800/50 space-y-2">
-            <p className="text-xs font-bold text-emerald-800 dark:text-emerald-200">New Token Ready</p>
+          <div className="p-4 rounded-3xl bg-emerald-500/10 border border-emerald-500/30 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="text-xs font-bold text-emerald-500">New Token Ready — Paste Setup Into Your AI</p>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() =>
+                    copyValue(
+                      'new_pat_prompt',
+                      buildAiPromptText({
+                        token: newlyCreatedToken,
+                        scopes: patScopes,
+                        accountId: patAccountId || null,
+                        rootFolderId: patRootFolderId.trim() || null,
+                      })
+                    )
+                  }
+                  className="px-3.5 h-8 rounded-full bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-bold flex items-center gap-1.5 transition-colors"
+                >
+                  {copiedId === 'new_pat_prompt' ? <Check size={13} /> : <Copy size={13} />}
+                  <span>Copy AI Prompt</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => copyValue('new_pat_mcp', buildMcpJson(newlyCreatedToken))}
+                  className="px-3.5 h-8 rounded-full bg-[var(--sf)] border border-[var(--bd)] text-[var(--tx)] hover:border-[var(--primary)] text-[11px] font-bold flex items-center gap-1.5 transition-colors"
+                >
+                  {copiedId === 'new_pat_mcp' ? <Check size={13} /> : <Copy size={13} />}
+                  <span>Copy MCP JSON</span>
+                </button>
+              </div>
+            </div>
             <div className="flex items-center gap-2">
-              <code className="flex-1 text-xs font-mono bg-white dark:bg-slate-900 px-3.5 py-2 rounded-2xl border border-emerald-200 dark:border-emerald-800 text-slate-800 dark:text-slate-100 truncate">
+              <code className="flex-1 text-xs font-mono bg-[var(--sf)] px-3.5 py-2 rounded-2xl border border-[var(--bd)] text-[var(--tx)] truncate">
                 {newlyCreatedToken}
               </code>
               <button
                 type="button"
                 onClick={() => copyValue('new_pat', newlyCreatedToken)}
-                className="px-4 h-9 rounded-full bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold flex items-center gap-1.5 shrink-0 transition-colors"
+                className="px-4 h-9 rounded-full bg-[var(--primary)] hover:bg-[var(--primary-hover)] text-[var(--on-primary)] text-xs font-semibold flex items-center gap-1.5 shrink-0 transition-colors"
               >
                 {copiedId === 'new_pat' ? <Check size={14} /> : <Copy size={14} />}
-                <span>Copy</span>
+                <span>Copy Token</span>
               </button>
             </div>
           </div>
         )}
 
-        <div className="divide-y divide-slate-100 dark:divide-slate-800 border border-slate-200 dark:border-slate-800 rounded-3xl overflow-hidden bg-white dark:bg-slate-900">
+        <div className="divide-y divide-[var(--bd)] border border-[var(--bd)] rounded-3xl overflow-hidden bg-[var(--sf)]">
           {tokens.length === 0 ? (
-            <div className="py-10 text-center text-xs text-slate-400">
+            <div className="py-10 text-center text-xs text-[var(--sub)]">
               {loading ? 'Loading tokens...' : 'No active Personal Access Tokens yet.'}
             </div>
           ) : (
             tokens.map((t) => (
-              <div key={t.tokenId} className="p-4 sm:p-5 flex items-center justify-between gap-4">
+              <div key={t.tokenId} className="p-4 sm:p-5 flex flex-wrap items-center justify-between gap-4">
                 <div className="min-w-0 space-y-1">
-                  <div className="flex items-center gap-2 text-sm font-semibold text-slate-900 dark:text-white">
+                  <div className="flex items-center gap-2 text-sm font-semibold text-[var(--tx)]">
                     <span className="truncate">{t.name}</span>
-                    <span className="text-xs font-mono font-normal text-slate-400">· {(t.scopes || []).join(', ')}</span>
+                    <span className="text-xs font-mono font-normal text-[var(--sub)]">· {(t.scopes || []).join(', ')}</span>
                   </div>
-                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-slate-500 dark:text-slate-400 tabular-nums">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-[var(--sub)] tabular-nums">
                     {t.accountId && <span>Account: {t.accountId.slice(-6)}</span>}
                     {t.rootFolderId && (
                       <>
@@ -381,24 +594,44 @@ export default function SecuritySettingsTabs({
                     )}
                   </div>
                 </div>
-                <div className="flex items-center gap-2 shrink-0">
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
                   {t.token && (
-                    <button
-                      type="button"
-                      onClick={() => copyValue(t.tokenId, t.token)}
-                      className="w-9 h-9 rounded-full border border-slate-200 dark:border-slate-700 text-slate-500 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/20 flex items-center justify-center transition-colors"
-                      title="Copy Token"
-                    >
-                      {copiedId === t.tokenId ? <Check size={14} /> : <Copy size={14} />}
-                    </button>
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => copyValue(`prompt_${t.tokenId}`, buildAiPromptText(t))}
+                        className="px-3 h-8 rounded-full bg-[var(--pi)] text-[var(--pit)] text-[11px] font-bold flex items-center gap-1 hover:opacity-90 transition-opacity"
+                        title="Copy ready-to-paste AI setup prompt with URL, endpoints, and token"
+                      >
+                        {copiedId === `prompt_${t.tokenId}` ? <Check size={12} /> : <Copy size={12} />}
+                        <span>AI Prompt</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => copyValue(`mcp_${t.tokenId}`, buildMcpJson(t.token))}
+                        className="px-3 h-8 rounded-full border border-[var(--bd)] text-[var(--tx)] hover:border-[var(--primary)] text-[11px] font-semibold flex items-center gap-1 transition-colors"
+                        title="Copy MCP Server JSON config"
+                      >
+                        {copiedId === `mcp_${t.tokenId}` ? <Check size={12} /> : <Copy size={12} />}
+                        <span>MCP JSON</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => copyValue(t.tokenId, t.token)}
+                        className="w-8 h-8 rounded-full border border-[var(--bd)] text-[var(--sub)] hover:text-[var(--primary)] flex items-center justify-center transition-colors"
+                        title="Copy Raw Token"
+                      >
+                        {copiedId === t.tokenId ? <Check size={13} /> : <Copy size={13} />}
+                      </button>
+                    </>
                   )}
                   <button
                     type="button"
                     onClick={() => handleRevokePat(t.tokenId)}
-                    className="w-9 h-9 rounded-full border border-slate-200 dark:border-slate-700 text-slate-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 flex items-center justify-center transition-colors"
+                    className="w-8 h-8 rounded-full border border-[var(--bd)] text-[var(--sub)] hover:text-rose-500 hover:border-rose-500/40 flex items-center justify-center transition-colors"
                     title="Revoke Token"
                   >
-                    <Trash2 size={14} />
+                    <Trash2 size={13} />
                   </button>
                 </div>
               </div>

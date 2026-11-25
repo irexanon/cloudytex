@@ -16,6 +16,7 @@ import { Api } from 'telegram/tl/index.js';
 import { createServer as createViteServer } from 'vite';
 
 import { initBot } from './telegram.ts';
+import { registerAiBridgeRoutes } from './ai-bridge.ts';
 import {
   withSessionLock,
   validateUploadRequest,
@@ -204,6 +205,9 @@ app.use(compression({
   },
 }));
 app.use('/api/tgdrive/:accountId/import', express.json({ limit: '15mb' }));
+app.use('/api/ai/upload-text', express.json({ limit: '12mb' }));
+app.use('/mcp', express.json({ limit: '12mb' }));
+app.use('/api/mcp', express.json({ limit: '12mb' }));
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '1mb' }));
 app.use(originGuardMiddleware);
 // Correlate client-visible failures with server logs without logging credentials.
@@ -4699,6 +4703,8 @@ const bot = process.env.CLOUDYTE_TEST_MODE === '1' ? null : initBot({
   MICROSOFT_REDIRECT_URI,
 });
 
+registerAiBridgeRoutes(app, { getBot: () => bot });
+
 // ─── Vite / Static Middleware ────────────────────────────────────────────────
 if (process.env.CLOUDYTE_TEST_MODE !== '1') {
   if (process.env.NODE_ENV !== 'production') {
@@ -4708,7 +4714,7 @@ if (process.env.CLOUDYTE_TEST_MODE !== '1') {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (req, res, next) => {
-      if (req.path.startsWith('/api') || req.path.startsWith('/auth') || req.path.startsWith('/s/')) {
+      if (req.path.startsWith('/api') || req.path.startsWith('/auth') || req.path.startsWith('/s/') || req.path === '/mcp') {
         return next();
       }
       res.sendFile(path.join(distPath, 'index.html'));
