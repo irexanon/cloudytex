@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Shield, Key, Share2, Trash2, Copy, Check, RefreshCw, Plus, Monitor, Lock, BookOpen, ChevronDown, ChevronUp } from 'lucide-react';
+import { Shield, Key, Share2, Trash2, Copy, Check, RefreshCw, Plus, Monitor, Lock, BookOpen, ChevronDown, ChevronUp, Terminal } from 'lucide-react';
 
 export interface SecuritySettingsTabsProps {
   activeTab: 'sessions' | 'tokens' | 'shares';
@@ -30,6 +30,7 @@ export default function SecuritySettingsTabs({
   const [newlyCreatedToken, setNewlyCreatedToken] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [showAiGuide, setShowAiGuide] = useState<boolean>(true);
+  const [showCliGuide, setShowCliGuide] = useState<boolean>(false);
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -284,9 +285,41 @@ export default function SecuritySettingsTabs({
       `- Upload from public URL: POST ${originUrl}/api/ai/upload-from-url/<accountId>  { "url": "https://...", "fileName": "...", "folderId": "..." }`,
       `- Share link: POST ${originUrl}/api/share  { "accountId": "...", "fileId": "..." }`,
       ``,
-      `Always verify file IDs and folder IDs with list_files before moving or renaming.`,
+      `Terminal CLI (for Claude Code / Gemini CLI / Codex / Bash Agents):`,
+      `- Install CLI: curl -fsSL "${originUrl}/api/cli/download" -o cloudyte.mjs`,
+      `- Configure: node cloudyte.mjs login --url "${originUrl}" --token "${t.token}"`,
+      `- Commands: drives | ls <accountId> [folderId] | mkdir <accountId> <name> | upload <accountId> <file> [--folder <id>] | download <accountId> <fileId> [outPath] | share <accountId> <fileId>`,
+      `- Temp Drop (no auth): node cloudyte.mjs temp create|ls|upload|download`,
+      ``,
+      `Always verify file IDs and folder IDs with list_files or \`node cloudyte.mjs ls\` before moving or renaming.`,
     ].join('\n');
   };
+
+  const buildCliAiPromptText = (tokenValue = '<YOUR_TOKEN>') =>
+    [
+      `You are working in a terminal with access to my Cloudyte cloud storage via the official zero-dependency Node.js CLI.`,
+      ``,
+      `Setup (run once if cloudyte.mjs is not already in the current directory):`,
+      `curl -fsSL "${originUrl}/api/cli/download" -o cloudyte.mjs`,
+      `export CLOUDYTE_URL="${originUrl}"`,
+      `export CLOUDYTE_TOKEN="${tokenValue}"`,
+      `# Or save permanently to ~/.cloudyte.json:`,
+      `# node cloudyte.mjs login --url "${originUrl}" --token "${tokenValue}"`,
+      ``,
+      `Available Commands:`,
+      `- List connected drives & account IDs: node cloudyte.mjs drives`,
+      `- List files in folder: node cloudyte.mjs ls <accountId> [folderId] [--search <query>]`,
+      `- Create folder: node cloudyte.mjs mkdir <accountId> "<name>" [parentId]`,
+      `- Upload file (auto-chunks >8MB): node cloudyte.mjs upload <accountId> <localFilePath> [--folder <folderId>]`,
+      `- Download file: node cloudyte.mjs download <accountId> <fileId> [outPath]`,
+      `- Create share link: node cloudyte.mjs share <accountId> <fileId>`,
+      `- Public Temp Drop (no auth): node cloudyte.mjs temp create | ls <roomCode> | upload <roomCode> <file> | download <roomCode> <fileId|all>`,
+      ``,
+      `Rules:`,
+      `- Run \`node cloudyte.mjs drives\` first to discover valid accountIds.`,
+      `- Always verify destination folder IDs with \`node cloudyte.mjs ls\` before uploading.`,
+      `- Keep CLOUDYTE_TOKEN secret and never commit it to git.`,
+    ].join('\n');
 
   const buildMcpJson = (tokenValue: string) =>
     JSON.stringify(
@@ -413,6 +446,115 @@ export default function SecuritySettingsTabs({
                   <span><strong className="text-[var(--tx)]">write:</strong> upload, create folder, move, copy, rename</span>
                   <span><strong className="text-[var(--tx)]">share:</strong> create share links</span>
                   <span><strong className="text-[var(--tx)]">delete:</strong> move files to Trash (off by default in AI preset)</span>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Terminal / CLI Upload & Download Guide */}
+          <div className="pt-1">
+            <button
+              type="button"
+              onClick={() => setShowCliGuide((prev) => !prev)}
+              className="w-full flex items-center justify-between gap-2 px-3.5 py-2.5 rounded-2xl bg-[var(--bg)] border border-[var(--bd)] text-left hover:border-[var(--primary)]/50 transition-colors"
+            >
+              <div className="flex items-center gap-2 min-w-0">
+                <Terminal size={14} className="text-[var(--primary)] shrink-0" />
+                <span className="text-xs font-bold text-[var(--tx)]">Terminal &amp; CLI Upload / Download (Node CLI + curl)</span>
+              </div>
+              {showCliGuide ? (
+                <ChevronUp size={15} className="text-[var(--sub)] shrink-0" />
+              ) : (
+                <ChevronDown size={15} className="text-[var(--sub)] shrink-0" />
+              )}
+            </button>
+
+            {showCliGuide && (
+              <div className="mt-2.5 p-4 rounded-2xl bg-[var(--bg)] border border-[var(--bd)] space-y-3 text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2 p-2.5 rounded-xl bg-[var(--sf)] border border-[var(--bd)]">
+                  <div>
+                    <p className="font-bold text-[var(--tx)]">AI Terminal Prompt (Claude Code / Gemini CLI / Codex / Cursor)</p>
+                    <p className="text-[11px] text-[var(--sub)]">Paste this prompt into any terminal AI agent so it can upload &amp; download via CLI automatically.</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => copyValue('cli_ai_prompt_guide', buildCliAiPromptText(newlyCreatedToken || '<YOUR_TOKEN>'))}
+                    className="px-3 h-8 rounded-xl bg-[var(--pi)] text-[var(--pit)] text-[11px] font-bold inline-flex items-center gap-1.5 shrink-0 hover:opacity-90 transition-opacity"
+                  >
+                    {copiedId === 'cli_ai_prompt_guide' ? <Check size={12} /> : <Copy size={12} />}
+                    <span>Copy CLI AI Prompt</span>
+                  </button>
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="font-bold text-[var(--tx)]">1. Download standalone CLI (requires Node 18+)</span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        copyValue('cli_dl', `curl -fsSL "${originUrl}/api/cli/download" -o cloudyte.mjs && chmod +x cloudyte.mjs`)
+                      }
+                      className="text-[11px] font-semibold text-[var(--primary)] hover:underline inline-flex items-center gap-1"
+                    >
+                      {copiedId === 'cli_dl' ? <Check size={12} /> : <Copy size={12} />}
+                      <span>Copy</span>
+                    </button>
+                  </div>
+                  <pre className="p-2.5 rounded-xl bg-[var(--sf)] border border-[var(--bd)] font-mono text-[11px] text-[var(--tx)] overflow-x-auto">{`curl -fsSL "${originUrl}/api/cli/download" -o cloudyte.mjs && chmod +x cloudyte.mjs`}</pre>
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="font-bold text-[var(--tx)]">2. Login once with a token &amp; run Drive commands</span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        copyValue(
+                          'cli_cmds',
+                          [
+                            `node cloudyte.mjs login --url "${originUrl}" --token "<YOUR_TOKEN>"`,
+                            `node cloudyte.mjs drives`,
+                            `node cloudyte.mjs ls <accountId>`,
+                            `node cloudyte.mjs upload <accountId> ./file.zip`,
+                            `node cloudyte.mjs download <accountId> <fileId>`,
+                          ].join('\n')
+                        )
+                      }
+                      className="text-[11px] font-semibold text-[var(--primary)] hover:underline inline-flex items-center gap-1"
+                    >
+                      {copiedId === 'cli_cmds' ? <Check size={12} /> : <Copy size={12} />}
+                      <span>Copy</span>
+                    </button>
+                  </div>
+                  <pre className="p-2.5 rounded-xl bg-[var(--sf)] border border-[var(--bd)] font-mono text-[11px] text-[var(--tx)] overflow-x-auto">{`node cloudyte.mjs login --url "${originUrl}" --token "<YOUR_TOKEN>"
+node cloudyte.mjs drives
+node cloudyte.mjs ls <accountId>
+node cloudyte.mjs upload <accountId> ./file.zip --folder root
+node cloudyte.mjs download <accountId> <fileId>`}</pre>
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="font-bold text-[var(--tx)]">Or raw curl (no Node needed)</span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        copyValue(
+                          'cli_curl',
+                          [
+                            `curl -H "Authorization: Bearer <TOKEN>" -F "file=@./file.zip" "${originUrl}/api/upload/<accountId>?folderId=root"`,
+                            `curl -L -H "Authorization: Bearer <TOKEN>" -O -J "${originUrl}/api/download/<accountId>/<fileId>"`,
+                          ].join('\n')
+                        )
+                      }
+                      className="text-[11px] font-semibold text-[var(--primary)] hover:underline inline-flex items-center gap-1"
+                    >
+                      {copiedId === 'cli_curl' ? <Check size={12} /> : <Copy size={12} />}
+                      <span>Copy</span>
+                    </button>
+                  </div>
+                  <pre className="p-2.5 rounded-xl bg-[var(--sf)] border border-[var(--bd)] font-mono text-[11px] text-[var(--tx)] overflow-x-auto">{`curl -H "Authorization: Bearer <TOKEN>" -F "file=@./file.zip" "${originUrl}/api/upload/<accountId>?folderId=root"
+curl -L -H "Authorization: Bearer <TOKEN>" -O -J "${originUrl}/api/download/<accountId>/<fileId>"`}</pre>
                 </div>
               </div>
             )}
@@ -545,6 +687,27 @@ export default function SecuritySettingsTabs({
                   {copiedId === 'new_pat_mcp' ? <Check size={13} /> : <Copy size={13} />}
                   <span>Copy MCP JSON</span>
                 </button>
+                <button
+                  type="button"
+                  onClick={() => copyValue('new_pat_cli_prompt', buildCliAiPromptText(newlyCreatedToken))}
+                  className="px-3.5 h-8 rounded-full bg-[var(--sf)] border border-[var(--bd)] text-[var(--tx)] hover:border-[var(--primary)] text-[11px] font-bold flex items-center gap-1.5 transition-colors"
+                >
+                  {copiedId === 'new_pat_cli_prompt' ? <Check size={13} /> : <Copy size={13} />}
+                  <span>CLI AI Prompt</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    copyValue(
+                      'new_pat_cli',
+                      `node cloudyte.mjs login --url "${originUrl}" --token "${newlyCreatedToken}"`
+                    )
+                  }
+                  className="px-3.5 h-8 rounded-full bg-[var(--sf)] border border-[var(--bd)] text-[var(--tx)] hover:border-[var(--primary)] text-[11px] font-bold flex items-center gap-1.5 transition-colors"
+                >
+                  {copiedId === 'new_pat_cli' ? <Check size={13} /> : <Copy size={13} />}
+                  <span>CLI Login</span>
+                </button>
               </div>
             </div>
             <div className="flex items-center gap-2">
@@ -605,6 +768,15 @@ export default function SecuritySettingsTabs({
                       >
                         {copiedId === `prompt_${t.tokenId}` ? <Check size={12} /> : <Copy size={12} />}
                         <span>AI Prompt</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => copyValue(`cli_prompt_${t.tokenId}`, buildCliAiPromptText(t.token))}
+                        className="px-3 h-8 rounded-full border border-[var(--bd)] text-[var(--tx)] hover:border-[var(--primary)] text-[11px] font-semibold flex items-center gap-1 transition-colors"
+                        title="Copy Terminal AI Agent prompt for Claude Code, Gemini CLI, Codex, or Cursor"
+                      >
+                        {copiedId === `cli_prompt_${t.tokenId}` ? <Check size={12} /> : <Copy size={12} />}
+                        <span>CLI AI Prompt</span>
                       </button>
                       <button
                         type="button"

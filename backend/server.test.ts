@@ -23,6 +23,7 @@ const {
   setTestDependencies,
   sweepUploadSessions,
   sweepExpiredTrash,
+  sweepExpiredTempDrop,
   runJobWorker,
   runEncryptionMigration,
   TEMP_DIR,
@@ -169,6 +170,9 @@ class InMemoryCollection {
       count++;
       const copy = { ...d };
       if (update.$set) Object.assign(copy, update.$set);
+      if (update.$unset) {
+        for (const k of Object.keys(update.$unset)) delete copy[k];
+      }
       return copy;
     });
     return { matchedCount: count, modifiedCount: count };
@@ -1095,7 +1099,7 @@ test('Cloudyte E2EE Backend Suite (Tests 1-39)', async (t) => {
     for (const c of copies) {
       assert.equal(c.isEncrypted, true);
       assert.equal(c.name, tgOpaqueName);
-      assert.equal(c.shareId, null);
+      assert.equal(Object.prototype.hasOwnProperty.call(c, 'shareId'), false);
     }
 
     // 30 & 31. Cross-account copy from Telegram to Google Drive and OneDrive preserves encrypted bytes & metadata
@@ -2961,6 +2965,438 @@ test('Cloudyte E2EE Backend Suite (Tests 1-39)', async (t) => {
       if (origInvoke) (mockTgClient as any).invoke = origInvoke;
       else delete (mockTgClient as any).invoke;
     }
+  });
+
+  await t.test('64. Server-side ZIP download tickets, ZIP-to-cloud, and Unzip background jobs preserve folders and enforce security', async () => {
+    const zipAccId = new ObjectId();
+    await mockDb.collection('accounts').insertOne({
+      _id: zipAccId,
+      userId: user1Id,
+      accountType: 'tgdrive',
+      channelId: '-100999888777',
+      name: 'Archive Vault',
+      email: 'Channel: -100999888777',
+      createdAt: new Date(),
+    });
+
+    await mockDb.collection('tg_folders').insertOne({
+      accountId: zipAccId,
+      userId: user1Id,
+      name: 'Docs',
+      path: 'Docs',
+      parent: '',
+      createdAt: Math.floor(Date.now() / 1000),
+    });
+
+    const msgId1 = ++nextTgMsgId;
+    telegramBlobs.set(msgId1, { bytes: Buffer.from('root-file-content'), caption: '', fileName: 'hello.txt' });
+    const f1 = await mockDb.collection('tg_files').insertOne({
+      accountId: zipAccId,
+      userId: user1Id,
+      messageId: msgId1,
+      name: 'hello.txt',
+      size: Buffer.byteLength('root-file-content'),
+      mimeType: 'text/plain',
+      folder: '',
+      date: Math.floor(Date.now() / 1000),
+      isEncrypted: false,
+    });
+
+    const msgId2 = ++nextTgMsgId;
+    telegramBlobs.set(msgId2, { bytes: Buffer.from('nested-doc-content'), caption: '', fileName: 'guide.md' });
+    await mockDb.collection('tg_files').insertOne({
+      accountId: zipAccId,
+      userId: user1Id,
+      messageId: msgId2,
+      name: 'guide.md',
+      size: Buffer.byteLength('nested-doc-content'),
+      mimeType: 'text/markdown',
+      folder: 'Docs',
+      date: Math.floor(Date.now() / 1000),
+      isEncrypted: false,
+    });
+
+    const encFile = await mockDb.collection('tg_files').insertOne({
+      accountId: zipAccId,
+      userId: user1Id,
+      messageId: ++nextTgMsgId,
+      name: 'cyte_secret.cyte1',
+      opaqueRemoteName: 'cyte_secret.cyte1',
+      size: 64,
+      mimeType: 'application/octet-stream',
+      folder: '',
+      date: Math.floor(Date.now() / 1000),
+      isEncrypted: true,
+    });
+
+    // Encrypted CYTE1 unzip must be blocked with 422
+    const encUnzipRes = await apiFetch('/api/archive/unzip', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accountId: String(zipAccId), fileId: String(encFile.insertedId) }),
+    });
+    assert.equal(encUnzipRes.status, 422);
+
+    // 1. Streaming ZIP download ticket works once and burns on GET
+    const ticketRes = await apiFetch('/api/archive/zip-ticket', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        accountId: String(zipAccId),
+        fileIds: [String(f1.insertedId)],
+        folderIds: ['folder:Docs'],
+        archiveName: 'bundle.zip',
+      }),
+    });
+    assert.equal(ticketRes.status, 201);
+    const ticketJson: any = await ticketRes.json();
+    assert.ok(ticketJson.downloadUrl);
+    assert.ok(ticketJson.downloadPath);
+    assert.equal(ticketJson.entryCount, 2);
+
+    const testZipUrl = `${baseUrl}${ticketJson.downloadPath}`;
+    const headZip = await fetch(testZipUrl, { method: 'HEAD' });
+    assert.equal(headZip.status, 200);
+
+    const streamZip = await fetch(testZipUrl);
+    assert.equal(streamZip.status, 200);
+    const zipBytes = Buffer.from(await streamZip.arrayBuffer());
+    assert.equal(zipBytes.subarray(0, 2).toString('ascii'), 'PK');
+
+    const secondUse = await fetch(testZipUrl);
+    assert.equal(secondUse.status, 404);
+
+    // 2. Server-side Zip-to-Cloud job creates bundle_cloud.zip in root
+    const zipCloudRes = await apiFetch('/api/archive/zip', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        accountId: String(zipAccId),
+        fileIds: [String(f1.insertedId)],
+        folderIds: ['Docs'],
+        targetFolderId: 'root',
+        archiveName: 'bundle_cloud.zip',
+      }),
+    });
+    assert.equal(zipCloudRes.status, 202);
+    const zipCloudJson: any = await zipCloudRes.json();
+    let zipJobState: any = null;
+    for (let i = 0; i < 40; i++) {
+      await runJobWorker();
+      const jRes = await apiFetch(`/api/jobs/${zipCloudJson.job.id}`);
+      zipJobState = await jRes.json();
+      if (zipJobState.status === 'completed' || zipJobState.status === 'failed') break;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.equal(zipJobState.status, 'completed');
+    const createdZipDoc = await mockDb.collection('tg_files').findOne({ accountId: zipAccId, name: 'bundle_cloud.zip' });
+    assert.ok(createdZipDoc, 'Created ZIP should be saved in target folder');
+
+    // 3. Server-side Unzip job extracts bundle_cloud.zip into Extracted/ preserving Docs/guide.md
+    const unzipRes = await apiFetch('/api/archive/unzip', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        accountId: String(zipAccId),
+        fileId: String(createdZipDoc._id),
+        targetFolderId: 'Extracted',
+        conflictStrategy: 'rename',
+      }),
+    });
+    assert.equal(unzipRes.status, 202);
+    const unzipJson: any = await unzipRes.json();
+    let unzipJobState: any = null;
+    for (let i = 0; i < 40; i++) {
+      await runJobWorker();
+      const jRes = await apiFetch(`/api/jobs/${unzipJson.job.id}`);
+      unzipJobState = await jRes.json();
+      if (unzipJobState.status === 'completed' || unzipJobState.status === 'failed') break;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.equal(unzipJobState.status, 'completed');
+
+    const extractedRootFile = await mockDb.collection('tg_files').findOne({ accountId: zipAccId, folder: 'Extracted', name: 'hello.txt' });
+    const extractedNestedFile = await mockDb.collection('tg_files').findOne({ accountId: zipAccId, folder: 'Extracted/Docs', name: 'guide.md' });
+    assert.ok(extractedRootFile, 'Root file should be extracted into Extracted/');
+    assert.ok(extractedNestedFile, 'Nested file should be extracted into Extracted/Docs/');
+  });
+
+  // ── 65. Multiple encrypted uploads and copies omit shareId (no duplicate null) & migration unsets stale shareId: null ──
+  await t.test('65. Encrypted uploads & copies omit shareId and runEncryptionMigration unsets stale shareId: null', async () => {
+    const legacyId = new ObjectId();
+    await mockDb.collection('tg_files').insertOne({
+      _id: legacyId,
+      accountId: tgAccount1Id,
+      userId: user1Id,
+      messageId: 99001,
+      name: 'c1e2a3b4c5d6e7f8a9b0c1d2e3f4a5b6.cyte',
+      opaqueRemoteName: 'c1e2a3b4c5d6e7f8a9b0c1d2e3f4a5b6.cyte',
+      isEncrypted: true,
+      shareId: null,
+      date: Math.floor(Date.now() / 1000),
+    });
+
+    await runEncryptionMigration(mockDb);
+    const migrated = await mockDb.collection('tg_files').findOne({ _id: legacyId });
+    assert.ok(migrated, 'Legacy encrypted doc should exist');
+    assert.equal(Object.prototype.hasOwnProperty.call(migrated, 'shareId'), false, 'Migration must unset shareId: null');
+
+    const encIds: string[] = [];
+    for (let i = 0; i < 2; i++) {
+      const cyte = buildCyte1Blob(Buffer.from(`android-encrypted-payload-${i}`, 'utf8'));
+      const opaqueName = `cyte_android_multi_0${i}.cyte1`;
+      const meta = buildValidEncryptedMetadata(`key_multi_${i}`);
+      const sessRes = await apiFetch(`/api/upload-sessions/${String(tgAccount1Id)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fileName: opaqueName,
+          opaqueRemoteName: opaqueName,
+          mimeType: 'application/octet-stream',
+          size: cyte.blob.length,
+          encryptedSizeBytes: cyte.blob.length,
+          checksum: cyte.sha256,
+          idempotencyKey: `idem_multi_enc_${i}`,
+          isEncrypted: true,
+          encryptionFormatVersion: 1,
+          encryptionKeyId: `key_multi_${i}`,
+          encryptedMetadata: meta,
+        }),
+      });
+      assert.equal(sessRes.status, 201);
+      const { sessionId } = (await sessRes.json()) as any;
+      const chunkRes = await apiFetch(`/api/upload-sessions/${sessionId}/chunks`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Range': `bytes 0-${cyte.blob.length - 1}/${cyte.blob.length}`,
+        },
+        body: cyte.blob,
+      });
+      assert.equal(chunkRes.status, 200);
+      const completeRes = await apiFetch(`/api/upload-sessions/${sessionId}/complete`, { method: 'POST' });
+      assert.equal(completeRes.status, 200);
+      const storedDoc = await mockDb.collection('tg_files').findOne({ opaqueRemoteName: opaqueName });
+      assert.ok(storedDoc, `Encrypted doc ${i} should be stored`);
+      assert.equal(Object.prototype.hasOwnProperty.call(storedDoc, 'shareId'), false, `Encrypted doc ${i} must omit shareId`);
+      encIds.push(String(storedDoc._id));
+    }
+
+    const copyRes = await apiFetch('/api/files/copy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceAccountId: String(tgAccount1Id),
+        fileId: encIds[0],
+        targetAccountId: String(tgAccount1Id),
+        targetFolderId: 'CopiedVault',
+      }),
+    });
+    assert.equal(copyRes.status, 200);
+    const copiedDocs = await mockDb.collection('tg_files').find({ accountId: tgAccount1Id, folder: 'CopiedVault' }).toArray();
+    assert.equal(copiedDocs.length, 1);
+    assert.equal(Object.prototype.hasOwnProperty.call(copiedDocs[0], 'shareId'), false, 'Copied encrypted doc must omit shareId');
+  });
+
+  // ── 66. Temp Drop Area: no-auth creation/upload/download/range/ZIP, passcode, upload_only, save-to-drive & expiry sweep ──
+  await t.test('66. Temp Drop Area allows no-auth upload/access, enforces passcode & upload_only, supports save-to-drive, and sweeps expired rooms', async () => {
+    // 1. Anonymous user creates a Temp Room without auth
+    const createAnonRes = await fetch(`${baseUrl}/api/temp-rooms`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Public Drop Room', note: 'Drop files here', ttlHours: 12 }),
+    });
+    assert.equal(createAnonRes.status, 201);
+    const createdAnon: any = await createAnonRes.json();
+    assert.ok(createdAnon.room?.roomCode);
+    assert.ok(createdAnon.creatorToken);
+    const anonCode = createdAnon.room.roomCode;
+
+    // 2. Anonymous visitor uploads a file with zero auth
+    const payloadBuf = Buffer.from('Hello Cloudyte Temp Drop 0123456789', 'utf8');
+    const fd = new FormData();
+    fd.append('file', new Blob([payloadBuf], { type: 'text/html' }), '../evil<script>.html');
+    fd.append('uploadedByLabel', 'VisitorAli');
+    const upRes = await fetch(`${baseUrl}/api/temp-rooms/${anonCode}/upload`, {
+      method: 'POST',
+      body: fd,
+    });
+    assert.equal(upRes.status, 201);
+    const upJson: any = await upRes.json();
+    assert.ok(upJson.file?.id);
+    assert.equal(upJson.file.uploadedByLabel, 'VisitorAli');
+    assert.ok(!upJson.file.name.includes('..'));
+
+    // 3. Another anonymous visitor lists and downloads full + Range + ZIP with safe CSP/attachment headers
+    const roomGetRes = await fetch(`${baseUrl}/api/temp-rooms/${anonCode}`);
+    assert.equal(roomGetRes.status, 200);
+    const roomGetJson: any = await roomGetRes.json();
+    assert.equal(roomGetJson.files.length, 1);
+    assert.equal(roomGetJson.room.isOwner, false);
+
+    const dlRes = await fetch(`${baseUrl}/api/temp-rooms/${anonCode}/files/${upJson.file.id}/download`);
+    assert.equal(dlRes.status, 200);
+    assert.match(String(dlRes.headers.get('content-disposition') || ''), /^attachment;/);
+    assert.match(String(dlRes.headers.get('content-security-policy') || ''), /sandbox/);
+    assert.deepEqual(Buffer.from(await dlRes.arrayBuffer()), payloadBuf);
+
+    const rangeRes = await fetch(`${baseUrl}/api/temp-rooms/${anonCode}/files/${upJson.file.id}/download`, {
+      headers: { Range: 'bytes=0-4' },
+    });
+    assert.equal(rangeRes.status, 206);
+    assert.equal(Buffer.from(await rangeRes.arrayBuffer()).toString('utf8'), 'Hello');
+
+    const zipRes = await fetch(`${baseUrl}/api/temp-rooms/${anonCode}/zip`);
+    assert.equal(zipRes.status, 200);
+    const zipBytes = Buffer.from(await zipRes.arrayBuffer());
+    assert.equal(zipBytes.subarray(0, 2).toString('utf8'), 'PK');
+
+    // 4. Random visitor cannot delete room (403), while creator with X-Temp-Creator-Token can switch to upload_only
+    const badDelRes = await fetch(`${baseUrl}/api/temp-rooms/${anonCode}`, { method: 'DELETE' });
+    assert.equal(badDelRes.status, 403);
+
+    const patchModeRes = await fetch(`${baseUrl}/api/temp-rooms/${anonCode}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', 'X-Temp-Creator-Token': createdAnon.creatorToken },
+      body: JSON.stringify({ accessMode: 'upload_only' }),
+    });
+    assert.equal(patchModeRes.status, 200);
+
+    const visitorAfterMode = await fetch(`${baseUrl}/api/temp-rooms/${anonCode}`);
+    assert.equal(visitorAfterMode.status, 200);
+    const visitorAfterJson: any = await visitorAfterMode.json();
+    assert.equal(visitorAfterJson.filesHidden, true);
+    assert.equal(visitorAfterJson.files.length, 0);
+
+    const visitorDlBlocked = await fetch(`${baseUrl}/api/temp-rooms/${anonCode}/files/${upJson.file.id}/download`);
+    assert.equal(visitorDlBlocked.status, 403);
+
+    // 5. Optional passcode protection blocks unauthorized access and unlocks with X-Temp-Passcode
+    const passPatchRes = await fetch(`${baseUrl}/api/temp-rooms/${anonCode}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', 'X-Temp-Creator-Token': createdAnon.creatorToken },
+      body: JSON.stringify({ accessMode: 'both', passcode: 'drop999' }),
+    });
+    assert.equal(passPatchRes.status, 200);
+
+    const lockedRes = await fetch(`${baseUrl}/api/temp-rooms/${anonCode}`);
+    assert.equal(lockedRes.status, 403);
+    const unlockedRes = await fetch(`${baseUrl}/api/temp-rooms/${anonCode}`, {
+      headers: { 'X-Temp-Passcode': 'drop999' },
+    });
+    assert.equal(unlockedRes.status, 200);
+
+    // 6. Authenticated owner creates room, visitor uploads, owner saves file directly to TG Drive
+    const ownerRoomRes = await apiFetch('/api/temp-rooms', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Owner Vault Drop', ttlHours: 24 }),
+    });
+    assert.equal(ownerRoomRes.status, 201);
+    const ownerRoomJson: any = await ownerRoomRes.json();
+    const ownerCode = ownerRoomJson.room.roomCode;
+
+    const fd2 = new FormData();
+    fd2.append('file', new Blob([Buffer.from('Save me to TG Drive', 'utf8')], { type: 'text/plain' }), 'guest_note.txt');
+    const up2Res = await fetch(`${baseUrl}/api/temp-rooms/${ownerCode}/upload`, { method: 'POST', body: fd2 });
+    assert.equal(up2Res.status, 201);
+    const up2Json: any = await up2Res.json();
+
+    const saveRes = await apiFetch(`/api/temp-rooms/${ownerCode}/files/${up2Json.file.id}/save-to-drive`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ targetAccountId: String(tgAccount1Id), targetFolderId: 'root' }),
+    });
+    assert.equal(saveRes.status, 200);
+    const savedDoc = await mockDb.collection('tg_files').findOne({ accountId: tgAccount1Id, name: 'guest_note.txt' });
+    assert.ok(savedDoc, 'Temp file should be saved to TG Drive');
+
+    // 7. Expired temp room & disk files are purged cleanly by sweepExpiredTempDrop
+    await mockDb.collection('temp_rooms').updateOne(
+      { roomCode: ownerCode },
+      { $set: { expiresAt: new Date(Date.now() - 60_000) } }
+    );
+    const sweepResult = await sweepExpiredTempDrop(mockDb);
+    assert.ok(sweepResult.expiredRooms >= 1);
+    const goneRoomRes = await fetch(`${baseUrl}/api/temp-rooms/${ownerCode}`);
+    assert.equal(goneRoomRes.status, 404);
+  });
+
+  await t.test('67. Drive-backed Temp Drop rooms require owner auth to bind Drive, accept zero-auth uploads/downloads/ZIP, and preserve files on expiry', async () => {
+    // 1. Anonymous user cannot bind another user's Drive account
+    const unauthBindRes = await fetch(`${baseUrl}/api/temp-rooms`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: 'Unauthorized Bind',
+        targetAccountId: String(tgAccount1Id),
+      }),
+    });
+    assert.equal(unauthBindRes.status, 401);
+
+    // 2. Owner creates a Drive-backed Temp Drop room targeting TG Drive folder 'TempInbox'
+    const createDriveRoomRes = await apiFetch('/api/temp-rooms', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: 'Client Inbox on TG Drive',
+        targetAccountId: String(tgAccount1Id),
+        targetFolderId: 'folder:TempInbox',
+        targetFolderName: 'TempInbox',
+        deleteOnExpire: false,
+        ttlHours: 24,
+      }),
+    });
+    assert.equal(createDriveRoomRes.status, 201);
+    const createdJson: any = await createDriveRoomRes.json();
+    const driveRoomCode = createdJson.room.roomCode;
+    assert.equal(createdJson.room.storageMode, 'drive');
+    assert.equal(createdJson.room.targetAccountId, String(tgAccount1Id));
+    assert.equal(createdJson.room.targetFolderId, 'TempInbox');
+    assert.equal(createdJson.room.deleteOnExpire, false);
+
+    // 3. Anonymous visitor uploads directly into the Drive-backed room (no auth header)
+    const drivePayload = Buffer.from('Stored straight in Telegram Drive via Temp Drop!', 'utf8');
+    const fd = new FormData();
+    fd.append('uploadedByLabel', 'ExternalClient');
+    fd.append('file', new Blob([drivePayload], { type: 'text/plain' }), 'drive_backed_drop.txt');
+
+    const upRes = await fetch(`${baseUrl}/api/temp-rooms/${driveRoomCode}/upload`, {
+      method: 'POST',
+      body: fd,
+    });
+    assert.equal(upRes.status, 201);
+    const upJson: any = await upRes.json();
+    assert.equal(upJson.file.storageMode, 'drive');
+
+    const tgDoc = await mockDb.collection('tg_files').findOne({
+      accountId: tgAccount1Id,
+      folder: 'TempInbox',
+      name: 'drive_backed_drop.txt',
+    });
+    assert.ok(tgDoc, 'Uploaded temp file should be persisted straight into TG Drive');
+
+    // 4. Anonymous visitor downloads full + Range + ZIP directly from Drive-backed temp room
+    const dlRes = await fetch(`${baseUrl}/api/temp-rooms/${driveRoomCode}/files/${upJson.file.id}/download`);
+    assert.equal(dlRes.status, 200);
+    assert.deepEqual(Buffer.from(await dlRes.arrayBuffer()), drivePayload);
+
+    const zipRes = await fetch(`${baseUrl}/api/temp-rooms/${driveRoomCode}/zip`);
+    assert.equal(zipRes.status, 200);
+    const zipBytes = Buffer.from(await zipRes.arrayBuffer());
+    assert.equal(zipBytes.subarray(0, 2).toString('utf8'), 'PK');
+
+    // 5. Expiring room closes the public link while preserving the file in TG Drive (deleteOnExpire: false)
+    await mockDb.collection('temp_rooms').updateOne(
+      { roomCode: driveRoomCode },
+      { $set: { expiresAt: new Date(Date.now() - 60_000) } }
+    );
+    await sweepExpiredTempDrop(mockDb);
+
+    const expiredGet = await fetch(`${baseUrl}/api/temp-rooms/${driveRoomCode}`);
+    assert.equal(expiredGet.status, 404);
+    const stillInDrive = await mockDb.collection('tg_files').findOne({ _id: tgDoc._id });
+    assert.ok(stillInDrive, 'Drive file must remain preserved when deleteOnExpire is false');
   });
 });
 

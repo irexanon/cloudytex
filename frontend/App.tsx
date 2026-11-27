@@ -4,10 +4,9 @@ import {
   LogOut, Cloud, HardDrive, X, RefreshCw, Check, CheckCircle2, LayoutGrid, 
   List as ListIcon, Info, Moon, Sun, Eye, Settings, MoreVertical, MoreHorizontal, 
   Share2, Send, ArrowLeft, ArrowUp, ArrowDown, ExternalLink, Archive, FileArchive, Copy,
-  Upload, ArrowLeftRight, Shield, SlidersHorizontal, AlertTriangle, UploadCloud, FolderOpen, Pause, Play, ChevronUp
+  Upload, ArrowLeftRight, Shield, SlidersHorizontal, AlertTriangle, UploadCloud, FolderOpen, Pause, Play, ChevronUp, Inbox
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
 
 import ConfirmModal from "./components/modals/ConfirmModal";
@@ -16,6 +15,7 @@ import ShareModal from "./components/modals/ShareModal";
 import SecuritySettingsTabs from "./components/modals/SecuritySettingsTabs";
 import JobsDrawer from "./components/modals/JobsDrawer";
 import AdminObservabilityPanel from "./components/modals/AdminObservabilityPanel";
+import TempDropView from "./components/TempDropView";
 import DetailRow from "./components/DetailRow";
 import FileIcon from "./components/FileIcon";
 import TelegramIcon from "./components/Icons/TelegramIcon";
@@ -175,6 +175,8 @@ export default function App() {
   const [driveTransferConflict, setDriveTransferConflict] = useState<'skip' | 'rename' | 'overwrite'>('skip');
   const [driveTransferSubmitting, setDriveTransferSubmitting] = useState<boolean>(false);
   const [isJobsDrawerOpen, setIsJobsDrawerOpen] = useState(initialRoute.page === 'jobs');
+  const [isTempDropOpen, setIsTempDropOpen] = useState(initialRoute.page === 'temp');
+  const [tempRoomCode, setTempRoomCode] = useState<string | null>(initialRoute.tempRoomCode);
   const [adminTab, setAdminTab] = useState<'overview' | 'metrics' | 'audit'>(initialRoute.adminTab);
 
   const pathRef = useRef<BreadcrumbItem[]>(path);
@@ -194,7 +196,7 @@ export default function App() {
   const buildCurrentRouteState = useCallback((overrides: Partial<AppRouteState> = {}): AppRouteState => {
     const inferredPage: AppPage =
       overrides.page ??
-      (isAdminPanelOpen ? 'admin' : isSettingsOpen ? 'settings' : isJobsDrawerOpen ? 'jobs' : 'drive');
+      (isAdminPanelOpen ? 'admin' : isSettingsOpen ? 'settings' : isJobsDrawerOpen ? 'jobs' : isTempDropOpen ? 'temp' : 'drive');
     const inferredModal: OverlayModal =
       overrides.modal !== undefined
         ? overrides.modal
@@ -210,6 +212,7 @@ export default function App() {
       page: inferredPage,
       accountId: selectedAccountId,
       folderId: currentFolderId,
+      tempRoomCode,
       trash: isTrashView,
       settingsTab,
       adminTab,
@@ -226,6 +229,8 @@ export default function App() {
     isAdminPanelOpen,
     isSettingsOpen,
     isJobsDrawerOpen,
+    isTempDropOpen,
+    tempRoomCode,
     linkProviderModal,
     tgDriveModal,
     isMoveModalOpen,
@@ -535,14 +540,14 @@ export default function App() {
     return () => controller.abort();
   }, [previewFile?.id, selectedAccountId]);
 
-  // Keep /login and /register URLs in sync when unauthenticated
+  // Keep /login and /register URLs in sync when unauthenticated (unless on public /drop)
   useEffect(() => {
-    if (isInitializing || isAuthenticated) return;
+    if (isInitializing || isAuthenticated || isTempDropOpen) return;
     const expected = isRegisterMode ? '/register' : '/login';
     if (window.location.pathname !== expected) {
       window.history.replaceState(null, '', expected);
     }
-  }, [isAuthenticated, isInitializing, isRegisterMode]);
+  }, [isAuthenticated, isInitializing, isRegisterMode, isTempDropOpen]);
 
   // ── Account selection: reset path & folder ────────────────────────────────
   const selectAccount = (id: string, openTrash = false) => {
@@ -565,6 +570,7 @@ export default function App() {
     setIsSettingsOpen(false);
     setIsJobsDrawerOpen(false);
     setIsAdminPanelOpen(false);
+    setIsTempDropOpen(false);
     syncUrl(
       {
         page: 'drive',
@@ -584,7 +590,7 @@ export default function App() {
   };
 
   const toggleTrashView = (nextState?: boolean) => {
-    const onAnotherPage = isSettingsOpen || isJobsDrawerOpen || isAdminPanelOpen;
+    const onAnotherPage = isSettingsOpen || isJobsDrawerOpen || isAdminPanelOpen || isTempDropOpen;
     const target = typeof nextState === 'boolean' ? nextState : (onAnotherPage ? true : !isTrashView);
     if (target !== isTrashView) {
       setFiles([]);
@@ -594,6 +600,7 @@ export default function App() {
     setIsSettingsOpen(false);
     setIsJobsDrawerOpen(false);
     setIsAdminPanelOpen(false);
+    setIsTempDropOpen(false);
     setIsTrashView(target);
     setSelectedFile(null);
     setSelectedFileIds(new Set());
@@ -1196,7 +1203,7 @@ export default function App() {
     }
   };
 
-  const uploadFiles = async (filesToUpload: FileList | File[] | null) => {
+  const uploadFiles = async (filesToUpload: FileList | File[] | null, targetFolderMap?: WeakMap<File, string>) => {
     if (!filesToUpload || filesToUpload.length === 0 || !selectedAccountId) return;
     const rawFiles = Array.from(filesToUpload);
     const queueItems = rawFiles.map((file, idx) => ({
@@ -1250,7 +1257,8 @@ export default function App() {
         if (ctrl.cancelled) break;
         const qItem = queueItems[i];
         const file = qItem.file;
-        const idempotencyKey = `upl_${selectedAccountId}_${currentFolderId || 'root'}_${file.name}_${file.size}_${file.lastModified || 0}`;
+        const targetFolderId = targetFolderMap?.get(file) || currentFolderId || 'root';
+        const idempotencyKey = `upl_${selectedAccountId}_${targetFolderId}_${file.name}_${file.size}_${file.lastModified || 0}`;
         const storageKey = `cloudyte_upload_session_${idempotencyKey}`;
         setUploadProgress({ name: file.name, percent: 0, status: 'preparing', sessionId: null });
         updateQueueItem(qItem.id, { status: 'preparing', percent: 0, error: undefined });
@@ -1288,7 +1296,7 @@ export default function App() {
                 mimeType: file.type || 'application/octet-stream',
                 totalBytes: file.size,
                 chunkSize: 2 * 1024 * 1024,
-                folderId: currentFolderId || 'root',
+                folderId: targetFolderId,
                 ...(checksum ? { checksum } : {}),
                 idempotencyKey,
               }),
@@ -1786,27 +1794,93 @@ export default function App() {
     setSelectedFileIds(new Set());
   };
 
-  const handleBulkZipToCloud = async (specificIds?: Set<string>) => {
-    const idsToProcess = specificIds || selectedFileIds;
-    if (idsToProcess.size === 0) return;
-    showToast('Preparing ZIP archive to save here...', 'success');
-    try {
-      const zip = new JSZip();
-      for (const id of idsToProcess) {
-        const file = files.find(f => f.id === id);
-        if (!file || file.type === 'folder' || !selectedAccountId) continue;
-
-        const ticketUrl = await requestDownloadTicketUrl(selectedAccountId, id, { singleUse: true, ttlSeconds: 300 });
-        const blobRes = await fetch(ticketUrl);
-        if (!blobRes.ok) throw new Error(`Failed to download ${file.name}`);
-        const blob = await blobRes.blob();
-        zip.file(file.name, blob);
+  const splitSelectedArchiveTargets = (idsSet: Set<string>) => {
+    const fileIds: string[] = [];
+    const folderIds: string[] = [];
+    for (const id of idsSet) {
+      const item = files.find((f) => f.id === id);
+      if (!item) {
+        if (String(id).startsWith('folder:')) folderIds.push(String(id).slice('folder:'.length));
+        else fileIds.push(String(id));
+        continue;
       }
-      const content = await zip.generateAsync({ type: 'blob' });
-      const zipFile = new File([content], `archive_${Date.now()}.zip`, { type: 'application/zip' });
-      showToast('Uploading ZIP archive to current folder...');
-      await uploadFiles([zipFile] as any);
-      if (!specificIds) setSelectedFileIds(new Set());
+      if (item.type === 'folder' || item.isFolder) {
+        const cleanFolder = String(item.id).startsWith('folder:') ? String(item.id).slice('folder:'.length) : String(item.id);
+        folderIds.push(cleanFolder);
+      } else {
+        fileIds.push(String(item.id));
+      }
+    }
+    return { fileIds, folderIds };
+  };
+
+  const pollArchiveJob = (jobId: string, accountId: string, folderId: string, successLabel: string) => {
+    let attempts = 0;
+    const maxAttempts = 240; // ~10 minutes at 2.5s interval
+    const tick = async () => {
+      attempts++;
+      try {
+        const res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, { headers: getAuthHeaders() });
+        if (res.ok) {
+          const job = await res.json();
+          if (job?.status === 'completed' || job?.status === 'completed_with_errors') {
+            if (selectedAccountId === accountId) {
+              fetchFiles(accountId, folderId, debouncedSearch, isTrashView);
+            }
+            showToast(
+              job.status === 'completed_with_errors' ? `${successLabel} finished with some warnings` : successLabel,
+              job.status === 'completed_with_errors' ? 'error' : 'success'
+            );
+            return;
+          }
+          if (job?.status === 'failed' || job?.status === 'cancelled') {
+            showToast(job?.error || `${successLabel} ${job.status}`, 'error');
+            return;
+          }
+        }
+      } catch { /* retry next poll */ }
+      if (attempts < maxAttempts) {
+        setTimeout(tick, 2500);
+      }
+    };
+    setTimeout(tick, 1800);
+  };
+
+  const handleBulkZipToCloud = async (specificIds?: Set<string>) => {
+    const idsToProcess = specificIds instanceof Set ? specificIds : selectedFileIds;
+    if (idsToProcess.size === 0 || !selectedAccountId) return;
+    const { fileIds, folderIds } = splitSelectedArchiveTargets(idsToProcess);
+    if (fileIds.length === 0 && folderIds.length === 0) return;
+
+    const firstItem = files.find((f) => idsToProcess.has(f.id));
+    const defaultArchiveName = idsToProcess.size === 1 && firstItem?.name
+      ? `${firstItem.name}.zip`
+      : `archive_${Date.now()}.zip`;
+
+    try {
+      const res = await fetch('/api/archive/zip', {
+        method: 'POST',
+        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          accountId: selectedAccountId,
+          fileIds,
+          folderIds,
+          targetFolderId: currentFolderId || 'root',
+          archiveName: defaultArchiveName,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error || 'Failed to queue server ZIP');
+      if (!(specificIds instanceof Set)) setSelectedFileIds(new Set());
+
+      showToast(
+        `Creating ${data?.job?.fileName || 'ZIP'} on server...`,
+        'success',
+        { label: 'View Jobs', onClick: () => { setIsJobsDrawerOpen(true); syncUrl({ page: 'jobs' }); } }
+      );
+      if (data?.job?.id) {
+        pollArchiveJob(data.job.id, selectedAccountId, currentFolderId, 'ZIP archive created in folder');
+      }
     } catch (err: any) {
       showToast('Failed to create ZIP: ' + err.message, 'error');
     }
@@ -1876,26 +1950,47 @@ export default function App() {
     touchEndX.current = null;
   };
 
-  const handleBulkZip = async (specificIds?: Set<string>) => {
-    const idsToProcess = specificIds || selectedFileIds;
-    if (idsToProcess.size === 0) return;
-    showToast('Preparing ZIP archive... this may take a while.', 'success');
-    try {
-      const zip = new JSZip();
-      for (const id of idsToProcess) {
-        const file = files.find(f => f.id === id);
-        if (!file || file.type === 'folder' || !selectedAccountId) continue;
+  const handleBulkZip = async (specificIds?: Set<string> | unknown) => {
+    const idsToProcess = specificIds instanceof Set ? specificIds : selectedFileIds;
+    if (idsToProcess.size === 0 || !selectedAccountId) return;
+    const { fileIds, folderIds } = splitSelectedArchiveTargets(idsToProcess);
+    if (fileIds.length === 0 && folderIds.length === 0) return;
 
-        const ticketUrl = await requestDownloadTicketUrl(selectedAccountId, id, { singleUse: true, ttlSeconds: 300 });
-        const blobRes = await fetch(ticketUrl);
-        if (!blobRes.ok) throw new Error(`Failed to download ${file.name}`);
-        const blob = await blobRes.blob();
-        zip.file(file.name, blob);
+    const firstItem = files.find((f) => idsToProcess.has(f.id));
+    const archiveName = idsToProcess.size === 1 && firstItem?.name
+      ? `${firstItem.name}.zip`
+      : 'archive.zip';
+
+    showToast('Starting server-side ZIP download...', 'success');
+    try {
+      const res = await fetch('/api/archive/zip-ticket', {
+        method: 'POST',
+        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          accountId: selectedAccountId,
+          fileIds,
+          folderIds,
+          archiveName,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      const zipHref = data?.downloadPath || data?.downloadUrl;
+      if (!res.ok || !zipHref) {
+        throw new Error(data?.error || 'Failed to prepare server ZIP download');
       }
-      const content = await zip.generateAsync({ type: 'blob' });
-      saveAs(content, 'archive.zip');
-      showToast('ZIP downloaded successfully');
-      if (!specificIds) setSelectedFileIds(new Set());
+      const link = document.createElement('a');
+      link.href = zipHref;
+      link.rel = 'noopener noreferrer';
+      link.style.display = 'none';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      if (data.skippedEncryptedCount > 0) {
+        showToast(`ZIP download started (${data.skippedEncryptedCount} encrypted file(s) skipped)`);
+      } else {
+        showToast('ZIP download started');
+      }
+      if (!(specificIds instanceof Set)) setSelectedFileIds(new Set());
     } catch (err: any) {
       showToast('Failed to create ZIP: ' + err.message, 'error');
     }
@@ -1906,33 +2001,34 @@ export default function App() {
       showToast('Only ZIP files can be unzipped', 'error');
       return;
     }
+    if (file.isEncrypted) {
+      showToast('Encrypted CYTE1 files cannot be unzipped on server', 'error');
+      return;
+    }
     if (!selectedAccountId) return;
-    showToast('Downloading ZIP for extraction...');
     try {
-      const ticketUrl = await requestDownloadTicketUrl(selectedAccountId, file.id, { singleUse: true, ttlSeconds: 300 });
-      const blobRes = await fetch(ticketUrl);
-      if (!blobRes.ok) throw new Error(`Failed to download ${file.name}`);
-      const blob = await blobRes.blob();
-      
-      const zip = new JSZip();
-      const loadedZip = await zip.loadAsync(blob);
-      
-      const extractedFiles: File[] = [];
-      for (const [filename, zipEntry] of Object.entries(loadedZip.files)) {
-        if (!zipEntry.dir) {
-          const entryBlob = await zipEntry.async('blob');
-          const extractedFile = new File([entryBlob], filename, { type: 'application/octet-stream' });
-          extractedFiles.push(extractedFile);
-        }
+      const res = await fetch('/api/archive/unzip', {
+        method: 'POST',
+        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          accountId: selectedAccountId,
+          fileId: file.id,
+          fileName: file.name,
+          targetFolderId: currentFolderId || 'root',
+          conflictStrategy: 'rename',
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error || 'Failed to start server unzip');
+
+      showToast(
+        `Extracting ${file.name} on server...`,
+        'success',
+        { label: 'View Jobs', onClick: () => { setIsJobsDrawerOpen(true); syncUrl({ page: 'jobs' }); } }
+      );
+      if (data?.job?.id) {
+        pollArchiveJob(data.job.id, selectedAccountId, currentFolderId, `${file.name} extracted`);
       }
-      
-      if (extractedFiles.length === 0) {
-        showToast('ZIP file is empty');
-        return;
-      }
-      
-      showToast(`Extracting and uploading ${extractedFiles.length} file(s)...`);
-      await uploadFiles(extractedFiles);
     } catch (err: any) {
       showToast('Failed to unzip: ' + err.message, 'error');
     }
@@ -2179,8 +2275,14 @@ export default function App() {
     const handlePopState = (event: PopStateEvent) => {
       const route = parseAppLocation();
       if (!isAuthenticated) {
-        setIsRegisterMode(route.authMode === 'register');
-        setLoginError(null);
+        if (route.page === 'temp') {
+          setIsTempDropOpen(true);
+          setTempRoomCode(route.tempRoomCode);
+        } else {
+          setIsTempDropOpen(false);
+          setIsRegisterMode(route.authMode === 'register');
+          setLoginError(null);
+        }
         return;
       }
 
@@ -2210,6 +2312,8 @@ export default function App() {
       setIsSettingsOpen(route.page === 'settings');
       setSettingsTab(route.settingsTab);
       setIsJobsDrawerOpen(route.page === 'jobs');
+      setIsTempDropOpen(route.page === 'temp');
+      setTempRoomCode(route.tempRoomCode);
       setIsAdminPanelOpen(route.page === 'admin');
       setAdminTab(route.adminTab);
       if (route.adminUserId !== selectedAdminUserId) {
@@ -2402,7 +2506,7 @@ export default function App() {
         return;
       }
 
-      if (isSettingsOpen || isJobsDrawerOpen || isAdminPanelOpen || displayedFiles.length === 0) return;
+      if (isSettingsOpen || isJobsDrawerOpen || isAdminPanelOpen || isTempDropOpen || displayedFiles.length === 0) return;
 
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'a') {
         e.preventDefault();
@@ -2477,6 +2581,7 @@ export default function App() {
     isSettingsOpen,
     isJobsDrawerOpen,
     isAdminPanelOpen,
+    isTempDropOpen,
     displayedFiles,
     openPreview,
   ]);
@@ -2516,8 +2621,49 @@ export default function App() {
     );
   }
 
-  // ── Login page ────────────────────────────────────────────────────────────
+  // ── Standalone Public Temp Drop (Zero Auth) or Login page ─────────────────
   if (!isAuthenticated) {
+    if (isTempDropOpen) {
+      return (
+        <>
+          <TempDropView
+            isStandalone
+            isAuthenticated={false}
+            initialRoomCode={tempRoomCode}
+            getAuthHeaders={getAuthHeaders}
+            onRoomCodeChange={(code) => {
+              setTempRoomCode(code);
+              window.history.pushState(null, '', code ? `/drop/${encodeURIComponent(code)}` : '/drop');
+            }}
+            onShowToast={showToast}
+            onNavigateLogin={() => {
+              setIsTempDropOpen(false);
+              setTempRoomCode(null);
+              window.history.pushState(null, '', '/login');
+            }}
+            isDarkMode={isDarkMode}
+            onToggleDarkMode={() => setIsDarkMode(!isDarkMode)}
+          />
+          <AnimatePresence>
+            {toast && (
+              <motion.div
+                initial={{ opacity: 0, y: 18, scale: 0.96 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, y: 12, scale: 0.96 }}
+                className={`fixed bottom-6 left-1/2 -translate-x-1/2 z-[120] px-4 py-2.5 rounded-xl text-xs font-semibold shadow-lg border ${
+                  toast.type === 'error'
+                    ? 'bg-rose-600 text-white border-rose-500'
+                    : 'bg-slate-900 text-white border-slate-700'
+                }`}
+              >
+                {toast.message}
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </>
+      );
+    }
+
     const isRegDisabled = regSettings?.registrationEnabled === false;
     const isWebRegDisabled = regSettings?.webRegistrationEnabled === false;
     const canRegisterOnWeb = regSettings && !isRegDisabled && !isWebRegDisabled;
@@ -2644,19 +2790,33 @@ export default function App() {
                 )}
               </div>
             )}
+
+            <button
+              type="button"
+              onClick={() => {
+                setTempRoomCode(null);
+                setIsTempDropOpen(true);
+                window.history.pushState(null, '', '/drop');
+              }}
+              className="mt-1 text-xs font-medium text-[var(--sub)] hover:text-[var(--tx)] hover:underline"
+            >
+              Open Temp Drop Area (No sign-in required)
+            </button>
           </div>
         </div>
       </div>
     );
   }
 
-  const activeNavTab: 'files' | 'transfers' | 'drives' | 'trash' | 'settings' | 'admin' =
+  const activeNavTab: 'files' | 'transfers' | 'drives' | 'trash' | 'temp' | 'settings' | 'admin' =
     isAdminPanelOpen
       ? 'admin'
       : isSettingsOpen
       ? 'settings'
       : isJobsDrawerOpen
       ? 'transfers'
+      : isTempDropOpen
+      ? 'temp'
       : isDrivesExpanded
       ? 'drives'
       : isTrashView
@@ -2664,13 +2824,13 @@ export default function App() {
       : 'files';
 
   const isMobileSubfolderHeader =
-    !isSettingsOpen && !isJobsDrawerOpen && !isAdminPanelOpen && !isTrashView && path.length > 1;
+    !isSettingsOpen && !isJobsDrawerOpen && !isAdminPanelOpen && !isTempDropOpen && !isTrashView && path.length > 1;
 
 
 
 
   const renderDrivesPanelContent = (isMobileDrawer = false) => (
-    <div className="flex flex-col h-full min-w-0">
+    <div className="flex flex-col h-full min-h-0 min-w-0">
       <div className="px-3 pt-4 pb-2.5 flex items-center justify-between gap-1.5 border-b border-[var(--bd)] shrink-0">
         <div className="flex items-center gap-1.5 min-w-0">
           <h2 className="text-[13px] font-extrabold tracking-tight text-[var(--tx)] truncate">Drives</h2>
@@ -2701,7 +2861,7 @@ export default function App() {
         </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-2 space-y-1.5 no-scrollbar">
+      <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-2 pb-5 space-y-1.5 no-scrollbar">
         {!hasLoadedAccounts ? (
           <div className="space-y-2 pt-0.5">
             {[...Array(3)].map((_, i) => (
@@ -2878,7 +3038,7 @@ export default function App() {
   );
 
   return (
-    <div className={`flex h-screen transition-colors duration-200 bg-[var(--bg)] text-[var(--tx)] font-sans overflow-hidden relative ${isDarkMode ? 'dark' : ''}`}>
+    <div className={`flex h-screen supports-[height:100dvh]:h-[100dvh] min-h-0 transition-colors duration-200 bg-[var(--bg)] text-[var(--tx)] font-sans overflow-hidden relative ${isDarkMode ? 'dark' : ''}`}>
       {/* Mobile Drives Drawer Backdrop & Panel */}
       <AnimatePresence>
         {isDrivesExpanded && (
@@ -2895,7 +3055,7 @@ export default function App() {
               animate={{ x: 0 }}
               exit={{ x: '-100%' }}
               transition={{ type: 'spring', damping: 28, stiffness: 320 }}
-              className="relative z-10 w-[76vw] max-w-[260px] h-full bg-[var(--rail)] border-r border-[var(--bd)] shadow-2xl"
+              className="relative z-10 w-[76vw] max-w-[260px] h-full min-h-0 overflow-hidden bg-[var(--rail)] border-r border-[var(--bd)] shadow-2xl"
             >
               {renderDrivesPanelContent(true)}
             </motion.div>
@@ -2905,13 +3065,13 @@ export default function App() {
 
       {/* Desktop / Tablet Navigation Rail + Extendable Drives Sidebar */}
       <aside
-        className={`hidden md:flex shrink-0 bg-[var(--rail)] border-r border-[var(--bd)] transition-[width] duration-200 ease-out overflow-hidden z-40 ${
+        className={`hidden md:flex shrink-0 h-full min-h-0 bg-[var(--rail)] border-r border-[var(--bd)] transition-[width] duration-200 ease-out overflow-hidden z-40 ${
           isDrivesExpanded ? 'w-[276px]' : 'w-24'
         }`}
       >
         {/* Navigation Rail (96px default, compact 64px when Drives panel is expanded) */}
         <nav
-          className={`shrink-0 py-5 flex flex-col items-center h-full select-none transition-[width,gap] duration-200 ease-out ${
+          className={`shrink-0 py-4 md:py-5 flex flex-col items-center h-full min-h-0 overflow-y-auto overscroll-contain no-scrollbar select-none transition-[width,gap] duration-200 ease-out ${
             isDrivesExpanded ? 'w-[64px] gap-2' : 'w-24 gap-2.5'
           }`}
         >
@@ -2920,11 +3080,12 @@ export default function App() {
               setIsSettingsOpen(false);
               setIsJobsDrawerOpen(false);
               setIsAdminPanelOpen(false);
+              setIsTempDropOpen(false);
               if (isTrashView) toggleTrashView(false);
               else syncUrl({ page: 'drive' });
             }}
             title="Cloudyte"
-            className="flex flex-col items-center gap-1.5 cursor-pointer"
+            className="flex flex-col items-center gap-1.5 cursor-pointer shrink-0"
           >
             <span
               className={`rounded-2xl bg-[var(--primary)] text-[var(--on-primary)] flex items-center justify-center shadow-lg shadow-black/20 transition-all duration-200 ${
@@ -2958,10 +3119,11 @@ export default function App() {
               setIsSettingsOpen(false);
               setIsJobsDrawerOpen(false);
               setIsAdminPanelOpen(false);
+              setIsTempDropOpen(false);
               if (isTrashView) toggleTrashView(false);
               else syncUrl({ page: 'drive' });
             }}
-            className={`flex flex-col items-center justify-center rounded-xl transition-all duration-150 ${
+            className={`shrink-0 flex flex-col items-center justify-center rounded-xl transition-all duration-150 ${
               isDrivesExpanded ? 'w-[54px] py-2 gap-1 text-[10.5px]' : 'w-[74px] py-2.5 gap-1.5 text-[12px]'
             } ${
               activeNavTab === 'files'
@@ -2979,7 +3141,7 @@ export default function App() {
             onClick={() => {
               toggleTrashView();
             }}
-            className={`flex flex-col items-center justify-center rounded-xl transition-all duration-150 ${
+            className={`shrink-0 flex flex-col items-center justify-center rounded-xl transition-all duration-150 ${
               isDrivesExpanded ? 'w-[54px] py-2 gap-1 text-[10.5px]' : 'w-[74px] py-2.5 gap-1.5 text-[12px]'
             } ${
               activeNavTab === 'trash'
@@ -2997,10 +3159,11 @@ export default function App() {
             onClick={() => {
               setIsSettingsOpen(false);
               setIsAdminPanelOpen(false);
+              setIsTempDropOpen(false);
               setIsJobsDrawerOpen(true);
               syncUrl({ page: 'jobs' });
             }}
-            className={`flex flex-col items-center justify-center rounded-xl transition-all duration-150 relative ${
+            className={`shrink-0 flex flex-col items-center justify-center rounded-xl transition-all duration-150 relative ${
               isDrivesExpanded ? 'w-[54px] py-2 gap-1 text-[10.5px]' : 'w-[74px] py-2.5 gap-1.5 text-[12px]'
             } ${
               activeNavTab === 'transfers'
@@ -3014,10 +3177,33 @@ export default function App() {
 
           <button
             type="button"
+            title="Temp Drop Area"
+            onClick={() => {
+              setIsSettingsOpen(false);
+              setIsAdminPanelOpen(false);
+              setIsJobsDrawerOpen(false);
+              setIsDrivesExpanded(false);
+              setIsTempDropOpen(true);
+              syncUrl({ page: 'temp', tempRoomCode });
+            }}
+            className={`shrink-0 flex flex-col items-center justify-center rounded-xl transition-all duration-150 ${
+              isDrivesExpanded ? 'w-[54px] py-2 gap-1 text-[10.5px]' : 'w-[74px] py-2.5 gap-1.5 text-[12px]'
+            } ${
+              activeNavTab === 'temp'
+                ? 'bg-[var(--rail-hover-bg)] text-[var(--rail-hover-fg)] font-bold shadow-xs'
+                : 'text-[var(--sub)] font-semibold hover:bg-[var(--rail-hover-bg)] hover:text-[var(--rail-hover-fg)]'
+            }`}
+          >
+            <Inbox size={isDrivesExpanded ? 19 : 21} />
+            <span className="leading-none">Temp</span>
+          </button>
+
+          <button
+            type="button"
             title="Drives"
             onClick={() => setIsDrivesExpanded(prev => !prev)}
             aria-expanded={isDrivesExpanded}
-            className={`flex flex-col items-center justify-center rounded-xl transition-all duration-150 ${
+            className={`shrink-0 flex flex-col items-center justify-center rounded-xl transition-all duration-150 ${
               isDrivesExpanded ? 'w-[54px] py-2 gap-1 text-[10.5px]' : 'w-[74px] py-2.5 gap-1.5 text-[12px]'
             } ${
               activeNavTab === 'drives'
@@ -3030,18 +3216,19 @@ export default function App() {
           </button>
 
           {/* Bottom Rail Items */}
-          <div className="mt-auto flex flex-col items-center gap-2 w-full">
+          <div className="mt-auto pt-2 shrink-0 flex flex-col items-center gap-2 w-full">
             <button
               type="button"
               title="Settings"
               onClick={() => {
                 setIsJobsDrawerOpen(false);
                 setIsAdminPanelOpen(false);
+                setIsTempDropOpen(false);
                 setSettingsTab('general');
                 setIsSettingsOpen(true);
                 syncUrl({ page: 'settings', settingsTab: 'general' });
               }}
-              className={`flex flex-col items-center justify-center rounded-xl transition-all duration-150 ${
+              className={`shrink-0 flex flex-col items-center justify-center rounded-xl transition-all duration-150 ${
                 isDrivesExpanded ? 'w-[54px] py-2 gap-1 text-[10.5px]' : 'w-[74px] py-2.5 gap-1.5 text-[12px]'
               } ${
                 activeNavTab === 'settings' || activeNavTab === 'admin'
@@ -3057,7 +3244,7 @@ export default function App() {
 
         {/* Extended Width Panel: Connected Drives */}
         {isDrivesExpanded && (
-          <div className="w-[212px] shrink-0 border-l border-[var(--bd)] bg-[var(--rail)] h-full">
+          <div className="w-[212px] shrink-0 border-l border-[var(--bd)] bg-[var(--rail)] h-full min-h-0 overflow-hidden">
             {renderDrivesPanelContent(false)}
           </div>
         )}
@@ -3065,13 +3252,13 @@ export default function App() {
 
       {/* Main Content */}
       <main
-        className="flex-1 flex flex-col min-w-0 bg-[var(--bg)] transition-colors duration-200 relative"
+        className="flex-1 flex flex-col min-w-0 min-h-0 bg-[var(--bg)] transition-colors duration-200 relative"
         onDragEnter={handleDragEnter}
         onDragLeave={handleDragLeave}
         onDragOver={handleDragOver}
         onDrop={handleDrop}
       >
-        {isDragging && !isSettingsOpen && !isJobsDrawerOpen && !isAdminPanelOpen && (
+        {isDragging && !isSettingsOpen && !isJobsDrawerOpen && !isAdminPanelOpen && !isTempDropOpen && (
           <div className="absolute inset-0 z-50 bg-[var(--primary)]/[0.06] ring-2 ring-inset ring-[var(--primary)]/45 backdrop-blur-[1.5px] pointer-events-none flex items-end justify-center pb-10 px-4">
             <div className="bg-[var(--sf)] border border-[var(--primary)]/40 rounded-2xl shadow-xl px-5 py-3.5 flex items-center gap-3.5 max-w-md">
               <span className="w-10 h-10 rounded-xl bg-[var(--primary)]/12 text-[var(--primary)] flex items-center justify-center shrink-0">
@@ -3112,7 +3299,7 @@ export default function App() {
                 {path[path.length - 1]?.name}
               </span>
             </div>
-          ) : !isSettingsOpen && !isJobsDrawerOpen && !isAdminPanelOpen ? (
+          ) : !isSettingsOpen && !isJobsDrawerOpen && !isAdminPanelOpen && !isTempDropOpen ? (
             <button
               type="button"
               onClick={() => setIsDrivesExpanded(true)}
@@ -3130,13 +3317,13 @@ export default function App() {
                 <Cloud size={16} fill="currentColor" />
               </span>
               <span className="text-sm font-semibold text-[var(--tx)]">
-                {isAdminPanelOpen ? 'Admin' : isSettingsOpen ? 'Settings' : 'Transfers'}
+                {isAdminPanelOpen ? 'Admin' : isSettingsOpen ? 'Settings' : isTempDropOpen ? 'Temp Drop' : 'Transfers'}
               </span>
             </div>
           )}
 
           {/* Desktop Active Drive Identity Pill + Compact Search Bar */}
-          {!isSettingsOpen && !isJobsDrawerOpen && !isAdminPanelOpen && (
+          {!isSettingsOpen && !isJobsDrawerOpen && !isAdminPanelOpen && !isTempDropOpen && (
             <div className="hidden md:flex items-center gap-2.5 flex-1 min-w-0 max-w-[740px]">
               {accounts.length > 0 && (
                 <button
@@ -3205,6 +3392,7 @@ export default function App() {
                 onClick={() => {
                   setIsSettingsOpen(false);
                   setIsAdminPanelOpen(false);
+                  setIsTempDropOpen(false);
                   setIsJobsDrawerOpen(true);
                   syncUrl({ page: 'jobs' });
                 }}
@@ -3224,7 +3412,7 @@ export default function App() {
             )}
 
             {/* Mobile Search Toggle */}
-            {!isSettingsOpen && !isJobsDrawerOpen && !isAdminPanelOpen && (
+            {!isSettingsOpen && !isJobsDrawerOpen && !isAdminPanelOpen && !isTempDropOpen && (
               <button
                 type="button"
                 onClick={() => {
@@ -3321,6 +3509,7 @@ export default function App() {
                           setIsMobileFolderMenuOpen(false);
                           setIsJobsDrawerOpen(false);
                           setIsAdminPanelOpen(false);
+                          setIsTempDropOpen(false);
                           setSettingsTab('general');
                           setIsSettingsOpen(true);
                           syncUrl({ page: 'settings', settingsTab: 'general' });
@@ -3525,7 +3714,7 @@ export default function App() {
         )}
 
         {/* Dedicated Page / Browser Container */}
-        <div className="flex-1 overflow-y-auto px-4 md:px-8 pb-32 md:pb-16 relative scrollbar-thin">
+        <div className="flex-1 min-h-0 overflow-y-auto px-4 md:px-8 pb-32 md:pb-16 relative scrollbar-thin">
           {isAdminPanelOpen ? (
             <div className="max-w-6xl mx-auto space-y-6">
               <div className="flex flex-wrap items-center justify-between gap-4">
@@ -4288,6 +4477,22 @@ export default function App() {
               onJobsSynced={setCachedJobs}
               onJobsChanged={() => {
                 if (selectedAccountId) fetchFiles(selectedAccountId, currentFolderId, debouncedSearch, isTrashView);
+              }}
+            />
+          ) : isTempDropOpen ? (
+            <TempDropView
+              isAuthenticated={isAuthenticated}
+              initialRoomCode={tempRoomCode}
+              accounts={accounts}
+              getAuthHeaders={getAuthHeaders}
+              onRoomCodeChange={(code) => {
+                setTempRoomCode(code);
+                syncUrl({ page: 'temp', tempRoomCode: code });
+              }}
+              onShowToast={showToast}
+              onNavigateFiles={() => {
+                setIsTempDropOpen(false);
+                syncUrl({ page: 'drive' });
               }}
             />
           ) : !hasLoadedAccounts || (loading && accounts.length === 0) ? (
@@ -5551,7 +5756,7 @@ export default function App() {
         </div>
 
         {/* Mobile Floating + Speed-Dial Button (Upload & New Folder sub-buttons) */}
-        {!isTrashView && !isSettingsOpen && !isJobsDrawerOpen && !isAdminPanelOpen && accounts.length > 0 && (
+        {!isTrashView && !isSettingsOpen && !isJobsDrawerOpen && !isAdminPanelOpen && !isTempDropOpen && accounts.length > 0 && (
           <div className="md:hidden fixed right-4 bottom-24 z-40 flex flex-col items-end">
             <AnimatePresence>
               {uploadMenuAnchor === 'mobile' && (
@@ -5636,9 +5841,10 @@ export default function App() {
         {/* Mobile Bottom Navigation Bar */}
         <nav className="md:hidden fixed bottom-0 inset-x-0 h-20 bg-[var(--rail)] border-t border-[var(--bd)] flex items-center px-2 z-40">
           {[
-            { id: 'files', label: 'Files', icon: <Folder size={20} fill={activeNavTab === 'files' ? 'currentColor' : 'none'} />, onClick: () => { setIsSettingsOpen(false); setIsJobsDrawerOpen(false); setIsAdminPanelOpen(false); if (isTrashView) toggleTrashView(false); else syncUrl({ page: 'drive' }); } },
+            { id: 'files', label: 'Files', icon: <Folder size={20} fill={activeNavTab === 'files' ? 'currentColor' : 'none'} />, onClick: () => { setIsSettingsOpen(false); setIsJobsDrawerOpen(false); setIsAdminPanelOpen(false); setIsTempDropOpen(false); if (isTrashView) toggleTrashView(false); else syncUrl({ page: 'drive' }); } },
             { id: 'trash', label: 'Trash', icon: <Trash2 size={20} />, onClick: () => { toggleTrashView(); } },
-            { id: 'transfers', label: 'Transfers', icon: <ArrowLeftRight size={20} />, onClick: () => { setIsSettingsOpen(false); setIsAdminPanelOpen(false); setIsJobsDrawerOpen(true); syncUrl({ page: 'jobs' }); } },
+            { id: 'transfers', label: 'Transfers', icon: <ArrowLeftRight size={20} />, onClick: () => { setIsSettingsOpen(false); setIsAdminPanelOpen(false); setIsTempDropOpen(false); setIsJobsDrawerOpen(true); syncUrl({ page: 'jobs' }); } },
+            { id: 'temp', label: 'Temp', icon: <Inbox size={20} />, onClick: () => { setIsSettingsOpen(false); setIsAdminPanelOpen(false); setIsJobsDrawerOpen(false); setIsTempDropOpen(true); syncUrl({ page: 'temp', tempRoomCode }); } },
             { id: 'drives', label: 'Drives', icon: <Cloud size={20} fill={activeNavTab === 'drives' ? 'currentColor' : 'none'} />, onClick: () => setIsDrivesExpanded(true) },
           ].map(item => {
             const isOn = activeNavTab === item.id;
@@ -6720,7 +6926,7 @@ export default function App() {
                 {previewInfoOpen && (
                   <aside
                     onClick={(e) => e.stopPropagation()}
-                    className="w-80 max-w-[85vw] shrink-0 bg-[#0d1322] border-l border-white/10 p-5 overflow-y-auto space-y-5"
+                    className="w-80 max-w-[85vw] h-full min-h-0 shrink-0 bg-[#0d1322] border-l border-white/10 p-5 overflow-y-auto overscroll-contain space-y-5"
                   >
                     <div className="flex items-center justify-between">
                       <h3 className="text-sm font-semibold text-white">File details</h3>

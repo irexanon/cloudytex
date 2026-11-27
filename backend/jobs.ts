@@ -53,6 +53,11 @@ import {
   type PersistedProviderSession,
 } from './provider.ts';
 
+import {
+  executeArchiveZipToCloudJob,
+  executeArchiveUnzipJob,
+} from './archive.ts';
+
 const TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 async function sweepExpiredTrash() {
   const database = db || await connectToMongo();
@@ -1077,10 +1082,11 @@ async function ensureTargetFolderPath(
           {
             $setOnInsert: {
               accountId: targetAccount._id,
+              userId: String(targetAccount.userId || ''),
               name: seg,
               path: accum,
               parent,
-              createdAt: new Date(),
+              createdAt: Math.floor(Date.now() / 1000),
             },
           },
           { upsert: true }
@@ -1330,7 +1336,8 @@ async function executeDriveTransfer(
               clonedDoc.folder = destTgFolder;
               clonedDoc.name = resolution.resolvedName;
               if (clonedDoc.isEncrypted) clonedDoc.opaqueRemoteName = resolution.resolvedName;
-              clonedDoc.shareId = clonedDoc.isEncrypted ? null : nanoid(6);
+              if (clonedDoc.isEncrypted) delete clonedDoc.shareId;
+              else clonedDoc.shareId = nanoid(6);
               clonedDoc.trashed = false;
               delete clonedDoc.trashedAt;
               clonedDoc.updatedAt = Date.now();
@@ -1473,6 +1480,8 @@ async function executeDriveTransfer(
 export type QueueJobType =
   | 'cross_account_transfer'
   | 'drive_transfer'
+  | 'archive_zip_to_cloud'
+  | 'archive_unzip'
   | 'batch_backup'
   | 'batch_restore'
   | 'trash_cleanup'
@@ -1584,6 +1593,8 @@ let activeJobWorkers = 0;
 const SUPPORTED_JOB_TYPES: QueueJobType[] = [
   'cross_account_transfer',
   'drive_transfer',
+  'archive_zip_to_cloud',
+  'archive_unzip',
   'batch_backup',
   'batch_restore',
   'trash_cleanup',
@@ -1640,6 +1651,23 @@ async function runJobWorker() {
           executeDriveTransfer(job, db, shouldCancel)
         );
         if (driveSummary.failedCount > 0) {
+          finalStatus = 'completed_with_errors';
+        }
+      } else if (job.type === 'archive_zip_to_cloud') {
+        await providerLimit(`archive:${p.accountId}`, 1)(() =>
+          executeArchiveZipToCloudJob(job, db, shouldCancel, {
+            collectAccountManifest,
+            resolveNonConflictingFileName,
+          })
+        );
+      } else if (job.type === 'archive_unzip') {
+        const unzipSummary = await providerLimit(`archive:${p.accountId}`, 1)(() =>
+          executeArchiveUnzipJob(job, db, shouldCancel, {
+            ensureTargetFolderPath,
+            resolveNonConflictingFileName,
+          })
+        );
+        if (unzipSummary.failedCount > 0) {
           finalStatus = 'completed_with_errors';
         }
       } else if (job.type === 'batch_backup' || job.type === 'batch_restore') {
@@ -1718,12 +1746,12 @@ async function runJobWorker() {
             status: finalStatus,
             stage: finalStatus,
             progressPct: 100,
-            itemsProcessed: typeof job.itemsProcessed === 'number' && job.type === 'drive_transfer'
+            itemsProcessed: typeof job.itemsProcessed === 'number' && (job.type === 'drive_transfer' || job.type === 'archive_zip_to_cloud' || job.type === 'archive_unzip')
               ? job.itemsProcessed
               : (job.totalItems || 1),
             totalItems: typeof job.totalItems === 'number' ? job.totalItems : 1,
-            ...(typeof job.bytesProcessed === 'number' && job.type === 'drive_transfer' ? { bytesProcessed: job.bytesProcessed } : {}),
-            ...(typeof job.totalBytes === 'number' && job.type === 'drive_transfer' ? { totalBytes: job.totalBytes } : {}),
+            ...(typeof job.bytesProcessed === 'number' && (job.type === 'drive_transfer' || job.type === 'archive_zip_to_cloud' || job.type === 'archive_unzip') ? { bytesProcessed: job.bytesProcessed } : {}),
+            ...(typeof job.totalBytes === 'number' && (job.type === 'drive_transfer' || job.type === 'archive_zip_to_cloud' || job.type === 'archive_unzip') ? { totalBytes: job.totalBytes } : {}),
             ...(typeof job.failedCount === 'number' ? { failedCount: job.failedCount } : {}),
             destinationFileId: job.destinationFileId || null,
             sourceDeleteApproved: Boolean(p.isMove) && finalStatus === 'completed',
@@ -1818,6 +1846,7 @@ export {
   verifySingleBackupItem,
   executeBatchBackupOrRestore,
   collectAccountManifest,
+  ensureTargetFolderPath,
   executeDriveTransfer,
   enqueueTransferJob,
   publicJob,

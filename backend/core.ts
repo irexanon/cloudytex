@@ -88,7 +88,8 @@ const API_HASH = process.env.TELEGRAM_API_HASH;
 // ─── Thumbnail, Dedicated Temp Dir & Resource Protection Configuration ───────
 const THUMB_DIR = process.env.THUMB_DIR || path.join(os.tmpdir(), 'cloudyte-thumbs');
 const TEMP_DIR  = process.env.TEMP_DIR || path.join(os.tmpdir(), 'cloudyte-temp');
-for (const dir of [THUMB_DIR, TEMP_DIR]) {
+const TEMP_DROP_DIR = process.env.TEMP_DROP_DIR || path.join(TEMP_DIR, 'temp-drop-area');
+for (const dir of [THUMB_DIR, TEMP_DIR, TEMP_DROP_DIR]) {
   if (!fs.existsSync(dir)) {
     try { fs.mkdirSync(dir, { recursive: true }); } catch { /* ignore */ }
   }
@@ -659,7 +660,29 @@ async function connectToMongo(maxRetries = 3) {
     try { await db.collection('settings').createIndex({ key: 1 }, { unique: true }); } catch { /* ignore */ }
     try { await db.collection('tg_files').createIndex({ accountId: 1, messageId: 1 }); } catch { /* ignore */ }
     try { await db.collection('tg_files').createIndex({ userId: 1 }); } catch { /* ignore */ }
-    try { await db.collection('tg_files').createIndex({ shareId: 1 }, { unique: true, sparse: true }); } catch { /* ignore */ }
+    try {
+      await db.collection('tg_files').updateMany(
+        { shareId: null },
+        { $unset: { shareId: '' } }
+      );
+    } catch { /* ignore */ }
+    try {
+      const tgFileIndexes = typeof db.collection('tg_files').indexes === 'function'
+        ? await db.collection('tg_files').indexes()
+        : [];
+      const existingShareIdx = Array.isArray(tgFileIndexes)
+        ? tgFileIndexes.find((idx: any) => idx?.name === 'shareId_1')
+        : null;
+      if (existingShareIdx && !existingShareIdx.partialFilterExpression) {
+        await db.collection('tg_files').dropIndex('shareId_1');
+      }
+    } catch { /* ignore */ }
+    try {
+      await db.collection('tg_files').createIndex(
+        { shareId: 1 },
+        { unique: true, partialFilterExpression: { shareId: { $type: 'string' } } }
+      );
+    } catch { /* ignore */ }
     try { await db.collection('tg_files').createIndex({ name: 'text' }); } catch { /* ignore */ }
     try { await db.collection('shares').createIndex({ shareId: 1 }, { unique: true }); } catch { /* ignore */ }
     try { await db.collection('tg_folders').createIndex({ userId: 1 }); } catch { /* ignore */ }
@@ -679,6 +702,11 @@ async function connectToMongo(maxRetries = 3) {
     try { await db.collection('audit_logs').createIndex({ action: 1, createdAt: -1 }); } catch { /* ignore */ }
     try { await db.collection('audit_logs').createIndex({ userId: 1, createdAt: -1 }); } catch { /* ignore */ }
     try { await db.collection('audit_logs').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }); } catch { /* ignore */ }
+    try { await db.collection('temp_rooms').createIndex({ roomCode: 1 }, { unique: true }); } catch { /* ignore */ }
+    try { await db.collection('temp_rooms').createIndex({ ownerUserId: 1, createdAt: -1 }); } catch { /* ignore */ }
+    try { await db.collection('temp_rooms').createIndex({ expiresAt: 1 }); } catch { /* ignore */ }
+    try { await db.collection('temp_files').createIndex({ roomCode: 1, createdAt: -1 }); } catch { /* ignore */ }
+    try { await db.collection('temp_files').createIndex({ expiresAt: 1 }); } catch { /* ignore */ }
 
     await runMigration(db);
     await runEncryptionMigration(db);
@@ -727,6 +755,10 @@ export async function runEncryptionMigration(database: any) {
           opaqueRemoteName: null,
         },
       }
+    );
+    await database.collection('tg_files').updateMany(
+      { shareId: null },
+      { $unset: { shareId: '' } }
     );
   } catch (err) {
     console.error('[Migration] Encryption backfill failed:', err);
@@ -1010,6 +1042,8 @@ function enforceTokenScopeAndConfinement(req: any, res: any): boolean {
     let requiredScope = 'read';
     if (/^\/api\/share/i.test(fullPath) && method !== 'GET' && method !== 'HEAD') {
       requiredScope = 'share';
+    } else if (pathOnly === '/api/archive/zip-ticket' || pathOnly === '/api/download-tickets') {
+      requiredScope = 'read';
     } else if (method === 'DELETE' || /\/(delete|trash\/empty|permanent)/i.test(fullPath)) {
       requiredScope = 'delete';
     } else if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
@@ -1263,6 +1297,37 @@ const requireAuthOrSignedMedia = async (req: any, res: any, next: any) => {
   return requireAuth(req, res, next);
 };
 
+const optionalAuth = async (req: any, _res: any, next: any) => {
+  req.db = db;
+  const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : '';
+  const tokenFromQuery = typeof req.query.token === 'string' ? req.query.token : undefined;
+  if (!authHeader && !tokenFromQuery) return next();
+  let advanced = false;
+  const finishAnonymous = () => {
+    if (advanced) return;
+    advanced = true;
+    delete req.userId;
+    delete req.isAdmin;
+    delete req.user;
+    next();
+  };
+  const noopRes: any = {
+    status: () => noopRes,
+    json: () => { finishAnonymous(); return noopRes; },
+    send: () => { finishAnonymous(); return noopRes; },
+  };
+  try {
+    await requireAuth(req, noopRes, () => {
+      if (!advanced) {
+        advanced = true;
+        next();
+      }
+    });
+  } catch {
+    finishAnonymous();
+  }
+};
+
 
 // ─── OAuth routes (Google + Microsoft) ───────────────────────────────────────
 const baseUrl     = (process.env.APP_URL || '').replace(/\/$/, '');
@@ -1326,6 +1391,7 @@ export {
   API_HASH,
   THUMB_DIR,
   TEMP_DIR,
+  TEMP_DROP_DIR,
   SHUTDOWN_TIMEOUT_MS,
   SLOW_REQUEST_MS,
   PROVIDER_API_TIMEOUT_MS,
@@ -1394,6 +1460,7 @@ export {
   parseDeviceNameFromRequest,
   requireAuth,
   requireAuthOrSignedMedia,
+  optionalAuth,
   baseUrl,
   redirectUri,
   oauth2Client,

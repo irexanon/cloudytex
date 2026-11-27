@@ -761,7 +761,8 @@ async function executeMoveOrCopySingleFile(
       newMeta.date = Math.floor(Date.now() / 1000);
       newMeta.createdAt = now;
       newMeta.updatedAt = now;
-      newMeta.shareId = meta.isEncrypted ? null : nanoid(6);
+      if (meta.isEncrypted) delete newMeta.shareId;
+      else newMeta.shareId = nanoid(6);
       if (!meta.isEncrypted && meta.folder === realTargetId) {
         newMeta.name = newMeta.name.replace(/(\.[^.]+)$|$/, ' - Copy$1');
       }

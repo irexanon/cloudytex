@@ -17,6 +17,7 @@ import { createServer as createViteServer } from 'vite';
 
 import { initBot } from './telegram.ts';
 import { registerAiBridgeRoutes } from './ai-bridge.ts';
+import { registerTempDropRoutes, sweepExpiredTempDrop } from './temp-drop.ts';
 import {
   withSessionLock,
   validateUploadRequest,
@@ -174,6 +175,7 @@ import {
   activeJobWorkers,
   runJobWorker,
 } from './jobs.ts';
+import { registerArchiveRoutes } from './archive.ts';
 
 // ─── Express app setup ────────────────────────────────────────────────────────
 export const app = express();
@@ -188,7 +190,7 @@ app.use((req, res, next) => {
   if (origin && allowedOrigins.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
-    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-Request-ID, Idempotency-Key, X-File-Checksum, X-Chunk-Offset, X-Chunk-Sha256, X-Share-Pin, X-Device-Name');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-Request-ID, Idempotency-Key, X-File-Checksum, X-Chunk-Offset, X-Chunk-Sha256, X-Share-Pin, X-Device-Name, X-Temp-Creator-Token, X-Temp-Passcode');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS');
   }
   if (req.method === 'OPTIONS') return res.sendStatus(204);
@@ -197,7 +199,11 @@ app.use((req, res, next) => {
 // 1. DEPENDENCIES: Add compression before routes (bypass binary/file downloads so Content-Length & byte ranges stay intact)
 app.use(compression({
   filter: (req, res) => {
-    if (req.path.startsWith('/api/download') || req.path.startsWith('/api/public/download')) {
+    if (
+      req.path.startsWith('/api/download') ||
+      req.path.startsWith('/api/public/download') ||
+      (req.path.startsWith('/api/temp-rooms/') && (req.path.endsWith('/download') || req.path.endsWith('/zip')))
+    ) {
       return false;
     }
     if (res.getHeader('Content-Range')) return false;
@@ -2353,6 +2359,7 @@ app.post('/api/folders', requireAuth, async (req: any, res: any) => {
   if (!folderCheck.ok) return apiError(res, folderCheck.error.status, folderCheck.error.code, folderCheck.error.message, req.requestId);
 
   try {
+    let createdFolder: { id: string; name: string } = { id: '', name };
     if (account.accountType === 'tgdrive') {
       const parentPath = folderCheck.folderId === 'root' ? '' : folderCheck.folderId;
       const folderPath = parentPath ? `${parentPath}/${name}` : name;
@@ -2381,6 +2388,7 @@ app.post('/api/folders', requireAuth, async (req: any, res: any) => {
         },
         { upsert: true }
       );
+      createdFolder = { id: folderPath, name };
     } else {
       const safeParent = folderCheck.folderId || 'root';
       if (safeParent !== 'root' && !isSafeProviderItemId(safeParent)) {
@@ -2389,14 +2397,19 @@ app.post('/api/folders', requireAuth, async (req: any, res: any) => {
       if (account.accountType === 'onedrive') {
         const c = await getOneDriveClient(account.tokens || account.credentials, account._id.toString());
         const parentPath = safeParent === 'root' ? '/me/drive/root' : `/me/drive/items/${safeParent}`;
-        await c.api(`${parentPath}/children`).post({ name, folder: {}, '@microsoft.graph.conflictBehavior': 'rename' });
+        const odRes = await c.api(`${parentPath}/children`).post({ name, folder: {}, '@microsoft.graph.conflictBehavior': 'rename' });
+        createdFolder = { id: String(odRes?.id || ''), name: String(odRes?.name || name) };
       } else {
         const drive = await getDriveClient(account.tokens || account.credentials);
-        await drive.files.create({ requestBody: { name, parents: [safeParent], mimeType: 'application/vnd.google-apps.folder' } });
+        const gdRes = await drive.files.create({
+          requestBody: { name, parents: [safeParent], mimeType: 'application/vnd.google-apps.folder' },
+          fields: 'id,name',
+        });
+        createdFolder = { id: String(gdRes?.data?.id || ''), name: String(gdRes?.data?.name || name) };
       }
     }
     invalidateDriveCache(accountId as string);
-    res.json({ success: true });
+    res.json({ success: true, folder: createdFolder });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -3701,7 +3714,8 @@ app.post('/api/files/copy', requireAuth, async (req: any, res: any) => {
       newMeta.date = Math.floor(Date.now() / 1000);
       newMeta.createdAt = now;
       newMeta.updatedAt = now;
-      newMeta.shareId = meta.isEncrypted ? null : nanoid(6);
+      if (meta.isEncrypted) delete newMeta.shareId;
+      else newMeta.shareId = nanoid(6);
       
       if (!meta.isEncrypted && meta.folder === realTargetId) {
         newMeta.name = newMeta.name.replace(/(\.[^.]+)$|$/, ' - Copy$1');
@@ -3733,7 +3747,7 @@ app.post('/api/files/copy', requireAuth, async (req: any, res: any) => {
         clonedMeta.date = Math.floor(Date.now() / 1000);
         clonedMeta.createdAt = now;
         clonedMeta.updatedAt = now;
-        clonedMeta.shareId = null;
+        delete clonedMeta.shareId;
         await database.collection('tg_files').insertOne(clonedMeta);
       }
       invalidateDriveCache(sourceAccountId);
@@ -3763,7 +3777,7 @@ app.post('/api/files/copy', requireAuth, async (req: any, res: any) => {
         clonedMeta.date = Math.floor(Date.now() / 1000);
         clonedMeta.createdAt = now;
         clonedMeta.updatedAt = now;
-        clonedMeta.shareId = null;
+        delete clonedMeta.shareId;
         await database.collection('tg_files').insertOne(clonedMeta);
       }
       invalidateDriveCache(sourceAccountId);
@@ -4704,6 +4718,23 @@ const bot = process.env.CLOUDYTE_TEST_MODE === '1' ? null : initBot({
 });
 
 registerAiBridgeRoutes(app, { getBot: () => bot });
+registerArchiveRoutes(app, { bot, enqueueTransferJob, publicJob, collectAccountManifest, runJobWorker });
+registerTempDropRoutes(app, { uploadLimiter, downloadLimiter });
+
+// Serve standalone Node.js CLI helper for terminal upload/download automation
+app.get(['/api/cli/download', '/cli/cloudyte.mjs'], (req: any, res: any) => {
+  const cliPath = path.resolve(process.cwd(), 'cli', 'cloudyte.mjs');
+  if (!fs.existsSync(cliPath)) {
+    return apiError(res, 404, STANDARD_ERROR_CODES.NOT_FOUND, 'CLI script not found', req.requestId);
+  }
+  res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Cache-Control', 'no-store');
+  if (req.query?.download === '1' || req.path === '/api/cli/download') {
+    res.setHeader('Content-Disposition', 'attachment; filename="cloudyte.mjs"');
+  }
+  res.sendFile(cliPath);
+});
 
 // ─── Vite / Static Middleware ────────────────────────────────────────────────
 if (process.env.CLOUDYTE_TEST_MODE !== '1') {
@@ -4834,6 +4865,7 @@ if (process.env.CLOUDYTE_TEST_MODE !== '1') {
   backgroundIntervals.push(setInterval(() => pruneTempFiles(), 3600000));
   backgroundIntervals.push(setInterval(() => sweepUploadSessions().catch(err => console.error('[UploadSessions] Sweep failed:', err)), 5 * 60 * 1000));
   backgroundIntervals.push(setInterval(() => sweepExpiredTrash().catch(err => console.error('[Trash] Sweep failed:', err)), 60 * 60 * 1000));
+  backgroundIntervals.push(setInterval(() => sweepExpiredTempDrop().catch(err => console.error('[TempDrop] Sweep failed:', err)), 5 * 60 * 1000));
   let lastLoopTick = Date.now();
   backgroundIntervals.push(setInterval(() => {
     const now = Date.now();
@@ -4856,6 +4888,7 @@ export {
   normaliseTgFile,
   sweepUploadSessions,
   sweepExpiredTrash,
+  sweepExpiredTempDrop,
   runJobWorker,
   pruneTempFiles,
   pruneThumbDir,

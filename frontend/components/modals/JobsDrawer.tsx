@@ -38,6 +38,10 @@ function formatJobTypeLabel(rawType: string | undefined, isMove?: boolean): stri
     case 'batch_restore':
     case 'backup_restore':
       return 'Backup restore';
+    case 'archive_zip_to_cloud':
+      return 'Create ZIP archive';
+    case 'archive_unzip':
+      return 'Extract ZIP archive';
     default:
       return String(rawType || 'File transfer')
         .replace(/_/g, ' ')

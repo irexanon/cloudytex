@@ -1,4 +1,4 @@
-export type AppPage = 'drive' | 'settings' | 'jobs' | 'admin';
+export type AppPage = 'drive' | 'settings' | 'jobs' | 'admin' | 'temp';
 export type SettingsTab = 'general' | 'accounts' | 'sessions' | 'tokens' | 'shares';
 export type AdminTab = 'overview' | 'metrics' | 'audit';
 export type OverlayModal = 'link-account' | 'tg-drive' | 'move' | 'copy' | null;
@@ -13,6 +13,7 @@ export interface AppRouteState {
   page: AppPage;
   accountId: string | null;
   folderId: string | null;
+  tempRoomCode: string | null;
   trash: boolean;
   settingsTab: SettingsTab;
   adminTab: AdminTab;
@@ -55,6 +56,7 @@ export function parseAppLocation(
     page: 'drive',
     accountId: params.get('account') || null,
     folderId: null,
+    tempRoomCode: null,
     trash: false,
     settingsTab: 'general',
     adminTab: 'overview',
@@ -99,6 +101,12 @@ export function parseAppLocation(
     return state;
   }
 
+  if (segments[0] === 'drop') {
+    state.page = 'temp';
+    state.tempRoomCode = segments[1] ? segments[1] : null;
+    return state;
+  }
+
   if (segments[0] === 'admin') {
     state.page = 'admin';
     if (segments[1] === 'users' && segments[2]) {
@@ -135,6 +143,8 @@ export function buildAppUrl(route: Partial<AppRouteState>): string {
   } else if (page === 'jobs') {
     pathname = '/transfers';
     if (route.accountId) params.set('account', route.accountId);
+  } else if (page === 'temp') {
+    pathname = route.tempRoomCode ? `/drop/${encodeURIComponent(route.tempRoomCode)}` : '/drop';
   } else if (page === 'admin') {
     if (route.adminUserId) {
       pathname = `/admin/users/${encodeURIComponent(route.adminUserId)}`;
